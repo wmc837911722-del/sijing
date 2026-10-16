@@ -39,14 +39,14 @@ export default function GraphView({ graph, selected, local = false, scope, onOpe
   useEffect(() => { instance.current?.filter(filter); }, [filter, data, cacheKey]);
   useEffect(() => { instance.current?.setTheme(); }, [theme, local, cacheKey]);
   return <div className={`graph-view ${local ? 'local' : ''}`}>
-    {!local && <div className="graph-head"><div><h1>业务关系图谱</h1><p>拖动节点探索关联，滚轮缩放，点击打开笔记。</p></div><label className="search-input"><Search size={15}/><input aria-label="筛选图谱节点" placeholder="筛选节点…" value={filter} onChange={e => setFilter(e.target.value)}/>{filter && <button type="button" className="icon-button graph-clear" aria-label="清除图谱筛选" onClick={() => setFilter('')}><X size={13}/></button>}</label></div>}
+    {!local && <div className="graph-head"><div><h1>业务关系图谱</h1><p>业务规则、流程与主题地图之间的关联。点击节点阅读知识。</p></div><label className="search-input"><Search size={15}/><input aria-label="筛选图谱节点" placeholder="筛选节点…" value={filter} onChange={e => setFilter(e.target.value)}/>{filter && <button type="button" className="icon-button graph-clear" aria-label="清除图谱筛选" onClick={() => setFilter('')}><X size={13}/></button>}</label></div>}
     <div className="graph-canvas-area">
-      <div ref={container} className="graph-canvas" role="img" tabIndex={0} aria-label={local ? '当前笔记的局部关系图谱' : '知识库全局关系图谱'} aria-description="拖动节点或空白处，滚轮缩放。键盘方向键平移，加减键缩放，0 键适应窗口。"/>
-      {!shown.nodes.length && <Empty title={filter ? '没有匹配的节点' : '还没有关联节点'} detail={filter ? '试试其他关键词，或清除筛选。' : '在笔记中使用 [[双向链接]] 连接知识。'}/>}
+      <div ref={container} className="graph-canvas" role="img" tabIndex={0} aria-label={local ? '当前笔记的局部关系图谱' : '业务知识全局关系图谱'} aria-description="拖动节点或空白处，滚轮缩放。键盘方向键平移，加减键缩放，0 键适应窗口。"/>
+      {!shown.nodes.length && <Empty title={filter ? '没有匹配的节点' : '还没有业务知识关联'} detail={filter ? '试试其他关键词，或清除筛选。' : '从代码提炼业务知识并生成主题地图后，关联会显示在这里。'}/>}
       {layoutError && <p className="graph-layout-error" role="status">{layoutError}</p>}
       <div className="graph-controls"><button className="icon-button" aria-label="放大图谱" title="放大 (+)" onClick={() => instance.current?.zoom(1.25)}><Plus size={16}/></button><button className="icon-button" aria-label="缩小图谱" title="缩小 (-)" onClick={() => instance.current?.zoom(.8)}><Minus size={16}/></button><button className="icon-button" aria-label="适应图谱大小" title="适应窗口 (0)" onClick={() => instance.current?.fit()}><Maximize size={15}/></button></div>
       {!local && <div className="graph-legend">{types.map((type, index) => <span key={type}><i className={`graph-shape-${index % 5}`} style={{ background: `var(--graph-node-${index % 5 + 1})` }}/>{noteTypeLabel(type)}</span>)}</div>}
     </div>
-    {!local && <div className="graph-footer"><span><Network size={13}/> {shown.nodes.length} 个节点 · {shown.edges.length} 条关联</span><details><summary>节点列表 · 键盘导航</summary><div className="graph-node-list">{shown.nodes.map(node => <button key={node.id} onClick={() => onOpen(node.id)}>{node.title}</button>)}</div></details></div>}
+    {!local && <div className="graph-footer"><span><Network size={13}/> {shown.nodes.length} 个业务知识节点 · {shown.edges.length} 条关联</span><details><summary>节点列表 · 键盘导航</summary><div className="graph-node-list">{shown.nodes.map(node => <button key={node.id} onClick={() => onOpen(node.id)}>{node.title}</button>)}</div></details></div>}
   </div>;
 }

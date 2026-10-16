@@ -200,7 +200,8 @@ def test_git_changes_publish_real_index_preserve_manual_edits_and_notify(store, 
     (repo_path / "orders.py").write_text("uncommitted change\n", encoding="utf-8")
     await_task(store, store.sync_repository(repo["id"])["task_id"])
     assert len(notifications) == before
-    assert "return 200" in store.repository_context(repo["id"])["files"][0]["content"]
+    context = store.repository_context(repo["id"])
+    assert "return 200" in next(item["content"] for item in context["files"] if item["path"] == "orders.py")
     task_count, activity_count = len(store.tasks()), len(store.activities())
     for _ in range(3):
         store._poll_repository(repo["id"])

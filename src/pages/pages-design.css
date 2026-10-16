@@ -104,6 +104,13 @@
 .repositories-content .repo-model-binding > div { align-items: flex-start; }
 .repositories-content .repo-model-binding strong { font-weight: 600; line-height: 1.7; }
 .repositories-content .repo-model-binding .text-button { flex-shrink: 0; min-height: 23px; text-decoration: underline; text-decoration-color: var(--line-strong); text-underline-offset: 4px; }
+.repositories-content .repo-analysis-status { margin: 0 0 16px; font-size: 12px; line-height: 1.7; }
+.repositories-content .repo-analysis-status > div { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 5px 12px; }
+.repositories-content .repo-analysis-status strong { font-weight: 600; }
+.repositories-content .repo-analysis-status time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.repositories-content .repo-analysis-status p { margin: 5px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.repositories-content .repo-analysis-status.failed strong, .repositories-content .repo-analysis-status.failed > p:first-of-type { color: var(--danger); }
+.repositories-content .repo-analysis-status .repo-analysis-scope { color: var(--text); }
 .repositories-content .repo-auto { padding: 0 2px; margin: auto 0 16px; }
 .repositories-content .repo-card .repo-actions { padding-top: 17px; justify-content: flex-start; gap: 7px; }
 .repositories-content .repo-actions .button:last-child { margin-left: auto; }

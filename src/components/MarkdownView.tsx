@@ -1,4 +1,4 @@
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import { useState } from 'react';
 import { errorMessage } from '../api';
 import remarkGfm from 'remark-gfm';
@@ -64,13 +64,15 @@ function scrollToHeading(heading: string) {
 }
 export function MarkdownView({ content, notes = [], currentPath, onOpen }: { content: string; notes?: NoteSummary[]; currentPath?: string; onOpen?: (path: string) => void }) {
   const [externalError, setExternalError] = useState('');
-  return <div className="markdown">{externalError && <p className="form-error" role="alert">{externalError}</p>}<ReactMarkdown remarkPlugins={plugins} components={{
+  return <div className="markdown">{externalError && <p className="form-error" role="alert">{externalError}</p>}<ReactMarkdown remarkPlugins={plugins} urlTransform={(url, key) => key === 'href' && url.startsWith('source://') ? url : defaultUrlTransform(url)} components={{
     a: ({ href, children }) => {
+      if (href?.startsWith('source://')) return onOpen ? <button type="button" className="wiki-link" title="查看引用的源码" onClick={() => onOpen(href)}>{children}</button> : <span>{children}</span>;
       const wiki = href?.startsWith(WIKI_PREFIX);
       const markdownLink = href && !/^\w+:/.test(href) && (href.split('#')[0].endsWith('.md') || href.startsWith('#'));
       if ((wiki || markdownLink) && onOpen) {
         let target: string;
         try { target = decodeURIComponent(wiki ? href!.slice(WIKI_PREFIX.length) : href!); } catch { target = href || ''; }
+        if (target.startsWith('source://')) return <button type="button" className="wiki-link" title="查看引用的源码" onClick={() => onOpen(target)}>{children}</button>;
         const { note, heading, ambiguous } = resolveNote(target, notes, currentPath);
         if (!note) return <span className="wiki-link unresolved" title={ambiguous ? `同名笔记不唯一，请使用完整路径：${target}` : `未找到笔记：${target}`}>{children}</span>;
         return <button className="wiki-link" title={`${note.path}${heading ? `#${heading}` : ''}`} onClick={() => {

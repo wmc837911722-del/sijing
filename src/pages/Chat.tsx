@@ -14,7 +14,7 @@ type ChatSession = { id: string; title: string; created_at: string; updated_at: 
 type ChatSummary = Pick<ChatSession, 'id' | 'title' | 'created_at' | 'updated_at' | 'pending'>;
 type Selection = { mode: Mode; provider_id: string; repository_id: string; datasource_id: string };
 type Failure = { message: string; question: string; saved: boolean };
-type Props = { settings: Settings | null; repositories: Repository[]; datasources: Datasource[]; notes: NoteSummary[]; notify: Notify; onOpen: (path: string) => void; onReport: () => void; onConfigure: () => void; onRepositories: () => void; refresh: () => void };
+type Props = { settings: Settings | null; repositories: Repository[]; datasources: Datasource[]; notes: NoteSummary[]; businessNoteCount: number; notify: Notify; onOpen: (path: string) => void; onReport: () => void; onConfigure: () => void; onRepositories: () => void; refresh: () => void };
 
 const NEW_CHAT = '__new__';
 const MESSAGE_LIMIT = 8000;
@@ -80,7 +80,7 @@ function QueryCard({ result, title, notify, onReport, refresh }: { result: Query
   </section>;
 }
 
-export default function Chat({ settings, repositories, datasources, notes, notify, onOpen, onReport, onConfigure, onRepositories, refresh }: Props) {
+export default function Chat({ settings, repositories, datasources, notes, businessNoteCount, notify, onOpen, onReport, onConfigure, onRepositories, refresh }: Props) {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [sessions, setSessions] = useState<Record<string, ChatSession>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -288,7 +288,7 @@ export default function Chat({ settings, repositories, datasources, notes, notif
           {loading ? <div className="bm-chat-loading" role="status"><LoaderCircle size={20} className="bm-chat-spin"/>正在加载对话…</div> : !messages.length && !busy && !failure ? <div className="bm-chat-welcome">
             <div className="bm-chat-welcome-brand"><div className="bm-chat-welcome-symbol"><BrandMark size={23}/></div><p className="bm-chat-eyebrow">思径助理</p></div><h2>从一个业务问题开始</h2><p>看懂业务，找到依据。</p>
             <div className="bm-chat-suggestions">{SUGGESTIONS[selection.mode].map(([label, question]) => <button type="button" key={question} onClick={() => { setDraft(question); input.current?.focus(); }}><span>{label}<ArrowRight size={14}/></span><strong>{question}</strong></button>)}</div>
-            <div className="bm-chat-welcome-context"><span><BookOpen size={14}/>{notes.length} 篇业务笔记</span><span><GitBranch size={14}/>{repositories.length} 个仓库</span></div>
+            <div className="bm-chat-welcome-context"><span><BookOpen size={14}/>{businessNoteCount} 篇业务知识</span><span><GitBranch size={14}/>{repositories.length} 个仓库</span></div>
           </div> : null}
           {Boolean(session?.earlier_messages_removed) && <p className="bm-chat-earlier-note">这段对话较长，当前保留最近 {messages.length} 条消息。</p>}
           <div className="bm-chat-log" role="log" aria-label="对话消息" aria-live="polite" aria-relevant="additions">

@@ -5,13 +5,16 @@ relationship to inspect next. Nothing here runs a model or executes note text.
 """
 from __future__ import annotations
 
+from collections import Counter
 from copy import deepcopy
+from math import log
 from pathlib import PurePosixPath
 import posixpath
 import re
 from urllib.parse import unquote
 
 from .core import CoreError
+from .content_layout import is_source_document
 
 
 def _tool(name, description, properties, required=()):
@@ -25,8 +28,9 @@ KNOWLEDGE_TOOLS = [
     _tool("knowledge_list", "List visible Markdown notes under a folder. Choose an entry; no note body is read into context.", {
         "folder": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 50}}),
-    _tool("knowledge_search", "Discover notes by keyword, exact path, title or business term. Returns short match context, not full evidence.", {
-        "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, ("query",)),
+    _tool("knowledge_search", "Discover notes by keyword, exact path, title or business term. Index-only results locate files, not business evidence. Use next_offset for more matches.", {
+        "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+        "offset": {"type": "integer", "minimum": 0}}, ("query",)),
     _tool("knowledge_outline", "Inspect headings and block IDs with character ranges before choosing a section to read. Use next_offset to inspect later entries in large outlines.", {
         "path": _PATH, "offset": {"type": "integer", "minimum": 0},
         "limit": {"type": "integer", "minimum": 1, "maximum": 200}}, ("path",)),
@@ -155,10 +159,10 @@ class KnowledgeNavigator:
         return {"version": version, "folder": folder, "notes": selected, "offset": offset, "total": len(notes),
                 "truncated": more, "next_offset": offset + limit if more else None}
 
-    def search(self, query, limit=8):
+    def search(self, query, limit=8, offset=0):
         if not isinstance(query, str) or not query.strip() or len(query) > 1000:
             raise CoreError(400, "请输入 1–1000 字符的搜索词")
-        limit = self._integer(limit, "limit", 8, 20)
+        limit, offset = self._integer(limit, "limit", 8, 20), self._integer(offset, "offset", 0)
         _, visible, version = self._snapshot()
         folded = query.strip().casefold()
         terms = re.findall(r"[a-z0-9_./-]+|[\u3400-\u9fff]+", folded)
@@ -166,19 +170,41 @@ class KnowledgeNavigator:
             if re.fullmatch(r"[\u3400-\u9fff]{3,}", phrase):
                 terms.extend(phrase[index:index + 2] for index in range(len(phrase) - 1))
         terms = list(dict.fromkeys([folded, *terms]))
-        matches = []
+        documents, frequencies = [], Counter()
         for note in visible.values():
-            title, path, body = note["title"].casefold(), note["path"].casefold(), note["content"].casefold()
-            score = sum((8 if term in title else 0) + (8 if term in path else 0) + (1 if term in body else 0) for term in terms)
-            if not score:
-                continue
-            positions = [body.find(term) for term in terms if term in body]
+            index_only = is_source_document(note)
+            title = note["title"].casefold() if not index_only or note.get("type") == "code" else ""
+            path = note["path"].casefold()
+            body = "" if index_only else re.sub(
+                r"\A---[^\S\r\n]*\r?\n.*?\r?\n---[^\S\r\n]*(?:\r?\n|$)",
+                lambda match: _blank(match[0]), note["content"], count=1, flags=re.S).casefold()
+            weights = {}
+            for term in terms:
+                weight = (8 if term in title else 0) + (8 if term in path else 0) + (1 if term in body else 0)
+                if weight:
+                    weights[term] = weight
+            if weights:
+                frequencies.update(weights.keys())
+                documents.append((note, body, weights, index_only))
+        matches = []
+        for note, body, weights, index_only in documents:
+            # Shared repository or framework terms must not drown out specific business terms.
+            score = sum(weight * log(1 + len(visible) / frequencies[term]) for term, weight in weights.items())
             hit = body.find(folded)
-            start = max(0, (hit if hit >= 0 else min(positions, default=0)) - 120)
-            matches.append((score, {**self._identity(note), "excerpt": note["content"][start:start + 480],
-                                    "is_current": True}))
+            if hit < 0:
+                best = min((term for term in weights if term in body),
+                           key=lambda term: (frequencies[term], -len(term), body.find(term)), default=None)
+                hit = body.find(best) if best is not None else 0
+            start = max(0, hit - 120)
+            excerpt = (f"代码文件索引：仅用于定位源文件，不提供业务结论。\n{note['title']}"[:480]
+                       if index_only else note["content"][start:start + 480])
+            matches.append((score, {**self._identity(note), "excerpt": excerpt,
+                                    "is_current": True, "index_only": index_only}))
         matches.sort(key=lambda pair: (-pair[0], pair[1]["path"]))
-        return {"version": version, "notes": [item for _, item in matches[:limit]], "truncated": len(matches) > limit}
+        more = offset + limit < len(matches)
+        return {"version": version, "notes": [item for _, item in matches[offset:offset + limit]],
+                "offset": offset, "total": len(matches), "truncated": more,
+                "next_offset": offset + limit if more else None}
 
     def _note(self, path, visible):
         if not isinstance(path, str):
@@ -229,7 +255,7 @@ class KnowledgeNavigator:
             start, end = matches[0]["start"], matches[0]["end"]
         selected = content[start:end]
         more = offset + limit < len(selected)
-        return {"version": version, **self._identity(note), "content": selected[offset:offset + limit],
+        return {"version": version, **self._identity(note), "index_only": is_source_document(note), "content": selected[offset:offset + limit],
                 "offset": offset, "total_chars": len(selected), "truncated": more,
                 "next_offset": offset + limit if more else None, "selection_start": start, "selection_end": end,
                 "heading": heading, "is_current": True}

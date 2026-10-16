@@ -100,3 +100,12 @@
   .workspace-content .page-heading h1 { font-size: 26px; }
   .workspace-content { margin-right: 8px; }
 }
+
+/* Keep source material separate from the knowledge and maps derived from it. */
+.knowledge-section { margin: 0 0 12px; }
+.knowledge-section-heading { color: var(--text); font-weight: 600; }
+.knowledge-section-content { padding-left: 8px; }
+.knowledge-section-content .tree-folder { margin-bottom: 4px; }
+.knowledge-section-content .folder-row { min-height: 32px; }
+.section-empty { margin: 4px 8px 12px; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.source-document-count { color: var(--muted); }

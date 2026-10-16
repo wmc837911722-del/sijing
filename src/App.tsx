@@ -6,6 +6,7 @@ import { Busy, ErrorBox, Modal } from './components/UI';
 import Document from './components/Document';
 import GuidedTour from './components/GuidedTour';
 import { BrandMark } from './components/BrandMark';
+import SourceEvidenceView from './components/SourceEvidenceView';
 import './workspace.css';
 const Chat = lazy(() => import('./pages/Chat'));
 const GraphView = lazy(() => import('./components/GraphView'));
@@ -14,6 +15,27 @@ const Query = lazy(() => import('./pages/Query'));
 const Reports = lazy(() => import('./pages/Reports'));
 const SettingsPage = lazy(() => import('./pages/Settings'));
 const EMPTY_GRAPH: Graph = { nodes: [], edges: [] };
+const KNOWLEDGE_SECTIONS = [
+  { id: 'sources', label: '资料', directory: '00-Inbox', detail: '导入的代码与原始资料' },
+  { id: 'wiki', label: '业务知识', directory: '01-Wiki', detail: '从资料提炼的业务规则与流程' },
+  { id: 'maps', label: '业务地图', directory: '02-Areas/业务地图', detail: '按业务主题组织的导航' },
+  { id: 'projects', label: '项目总结', directory: '03-Projects', detail: '分析结论与交付文档' },
+] as const;
+type KnowledgeSectionId = typeof KNOWLEDGE_SECTIONS[number]['id'];
+function isSourceDocument(note: NoteSummary) {
+  return note.type === 'code' || note.type === 'raw' || /^(00-Inbox|代码索引)\//.test(note.path);
+}
+function sectionForNote(note: NoteSummary): KnowledgeSectionId {
+  if (isSourceDocument(note)) return 'sources';
+  if (note.path.startsWith('02-Areas/')) return 'maps';
+  if (note.path.startsWith('03-Projects/')) return 'projects';
+  if (note.path.startsWith('业务地图/') && (note.type === 'overview' || /(?:业务地图|overview)\.md$/.test(note.path))) return 'maps';
+  return 'wiki';
+}
+function readableFolder(path: string, repositories: Map<string, string>) {
+  const relative = path.replace(/^(?:00-Inbox\/代码资料|01-Wiki\/业务知识|02-Areas\/业务地图|03-Projects\/代码业务分析|代码索引|业务地图)(?:\/|$)/, '').replace(/^(?:00-Inbox|01-Wiki|02-Areas|03-Projects)(?:\/|$)/, '');
+  return relative.split('/').filter(Boolean).map(part => repositories.get(part) || part).join(' / ') || '文档';
+}
 const NAV = [
   { view: 'settings' as const, label: '模型配置', icon: Bot },
   { view: 'repositories' as const, label: '仓库', icon: GitBranch },
@@ -34,9 +56,11 @@ export default function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [tabs, setTabs] = useState<string[]>([]);
   const [currentNote, setCurrentNote] = useState<Note | null>(null);
+  const [sourceReference, setSourceReference] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [tag, setTag] = useState('');
-  const [folded, setFolded] = useState<Set<string>>(new Set());
+  const [folded, setFolded] = useState<Set<string>>(() => new Set(['section:sources']));
+  const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set());
   const [sidebar, setSidebar] = useState(true);
   const [wideWorkspace, setWideWorkspace] = useState(() => window.matchMedia('(min-width: 1280px)').matches);
   const [rightbarChoice, setRightbarChoice] = useState<boolean | null>(null);
@@ -74,7 +98,7 @@ export default function App() {
     if (workspaceResult.status === 'fulfilled') { setWorkspace(workspaceResult.value); setError(''); } else setError(errorMessage(workspaceResult.reason));
     if (notesResult.status === 'fulfilled') {
       setNotes(notesResult.value.notes);
-      if (!initialSelection.current && notesResult.value.notes.length) { const first = notesResult.value.notes.find(note => note.type === 'overview' || /概览|总览|欢迎/.test(note.title)) || notesResult.value.notes[0]; setSelected(first.path); setTabs([first.path]); initialSelection.current = true; }
+      if (!initialSelection.current && notesResult.value.notes.length) { const business = notesResult.value.notes.filter(note => !isSourceDocument(note)); const first = business.find(note => sectionForNote(note) === 'maps') || business.find(note => note.type === 'overview' || /概览|总览|欢迎/.test(note.title)) || business[0] || notesResult.value.notes[0]; setSelected(first.path); setTabs([first.path]); initialSelection.current = true; }
     }
     if (graphResult.status === 'fulfilled') setGraph(previous => JSON.stringify(previous) === JSON.stringify(graphResult.value) ? previous : graphResult.value);
     if (settingsResult.status === 'fulfilled') setSettings(settingsResult.value);
@@ -89,6 +113,7 @@ export default function App() {
   const canLeave = () => !dirtyRef.current || window.confirm('当前笔记有未保存的修改。离开将丢弃这些修改，是否继续？');
   const navigate = (next: View) => { if (next !== view && !canLeave()) return false; if (next !== view) { setDirty(false); setCurrentNote(null); } setView(next); return true; };
   const openNote = useCallback((path: string) => {
+    if (path.startsWith('source://')) { setSourceReference(path); return; }
     const target = notes.find(note => note.path === path || note.id === path || note.title === path);
     if (!target) { notify(`知识库中未找到「${path}」`, 'info'); return; }
     if (selected !== target.path && dirtyRef.current && !window.confirm('当前笔记有未保存的修改。离开将丢弃这些修改，是否继续？')) return;
@@ -100,16 +125,30 @@ export default function App() {
     if (selected === path) { setDirty(false); setSelected(rest.at(-1) || null); setCurrentNote(null); }
   };
   const create = async (event: React.FormEvent) => { event.preventDefault(); if (!title.trim()) return; setCreateBusy(true); setCreateError(''); try { const note = await post<Note>('/api/notes', { title: title.trim() }); setCreating(false); setTitle(''); await refresh(); if (canLeave()) { setDirty(false); setSelected(note.path); setTabs(previous => [...previous.filter(p => p !== note.path), note.path]); setView('knowledge'); } notify('新笔记已创建'); } catch (err) { setCreateError(errorMessage(err)); } finally { setCreateBusy(false); } };
-  const changeVault = async () => { if (!canLeave()) return; try { const path = await window.businessmap?.chooseDirectory(); if (!path) return; const next = await post<Workspace>('/api/vault', { path }); initialSelection.current = false; setWorkspace(next); setGraph(EMPTY_GRAPH); setSelected(null); setTabs([]); setCurrentNote(null); setDirty(false); setSearch(''); setSearchResults(null); setTag(''); setFolded(new Set()); await refresh(); notify('已切换知识库'); } catch (err) { notify(errorMessage(err), 'error'); } };
+  const changeVault = async () => { if (!canLeave()) return; try { const path = await window.businessmap?.chooseDirectory(); if (!path) return; const next = await post<Workspace>('/api/vault', { path }); initialSelection.current = false; setWorkspace(next); setGraph(EMPTY_GRAPH); setSelected(null); setTabs([]); setCurrentNote(null); setDirty(false); setSearch(''); setSearchResults(null); setTag(''); setFolded(new Set(['section:sources'])); setExpandedSources(new Set()); await refresh(); notify('已切换知识库'); } catch (err) { notify(errorMessage(err), 'error'); } };
   const [searchResults, setSearchResults] = useState<NoteSummary[] | null>(null);
   useEffect(() => { let cancelled = false; if (!search.trim()) { setSearchResults(null); return; } const timer = setTimeout(() => { void get<{ notes: NoteSummary[] }>(`/api/notes?q=${encodeURIComponent(search)}`).then(data => { if (!cancelled) setSearchResults(data.notes); }).catch(err => { if (!cancelled) notify(errorMessage(err), 'error'); }); }, 200); return () => { cancelled = true; clearTimeout(timer); }; }, [search, notify]);
-  const visibleNotes = (searchResults || notes).filter(note => !tag || note.tags.includes(tag));
-  const grouped = useMemo(() => {
-    const groups = new Map<string, NoteSummary[]>();
-    for (const note of visibleNotes) { const folder = note.path.includes('/') ? note.path.split('/').slice(0, -1).join(' / ') : '知识库'; if (!groups.has(folder)) groups.set(folder, []); groups.get(folder)!.push(note); }
-    return [...groups.entries()];
-  }, [visibleNotes]);
-  const tags = [...new Set(notes.flatMap(note => note.tags))].slice(0, 12);
+  const visibleNotes = useMemo(() => (searchResults || notes).filter(note => !tag || note.tags.includes(tag)), [searchResults, notes, tag]);
+  const sections = useMemo(() => {
+    const repositoryNames = new Map((workspace?.repositories || []).map(repo => [repo.id, repo.name]));
+    const groups = new Map<KnowledgeSectionId, Map<string, NoteSummary[]>>();
+    for (const note of visibleNotes) {
+      const section = sectionForNote(note);
+      if (!groups.has(section)) groups.set(section, new Map());
+      const folder = note.path.includes('/') ? note.path.split('/').slice(0, -1).join('/') : '';
+      const folders = groups.get(section)!;
+      if (!folders.has(folder)) folders.set(folder, []);
+      folders.get(folder)!.push(note);
+    }
+    return KNOWLEDGE_SECTIONS.map(section => ({ ...section,
+      count: [...(groups.get(section.id)?.values() || [])].reduce((count, items) => count + items.length, 0),
+      folders: [...(groups.get(section.id)?.entries() || [])].map(([path, items]) => ({ path, label: readableFolder(path, repositoryNames), notes: items })),
+    }));
+  }, [visibleNotes, workspace?.repositories]);
+  const toggleFolded = (key: string) => setFolded(previous => { const next = new Set(previous); if (next.has(key)) next.delete(key); else next.add(key); return next; });
+  const businessNoteCount = workspace?.stats.business_notes ?? notes.filter(note => !isSourceDocument(note)).length;
+  const sourceDocumentCount = workspace?.stats.source_documents ?? notes.filter(isSourceDocument).length;
+  const tags = [...new Set(notes.filter(note => !isSourceDocument(note)).flatMap(note => note.tags))].slice(0, 12);
   const activeProvider = settings?.providers.find(provider => provider.active);
   const mapView = view === 'knowledge' || view === 'graph';
   const primaryView = mapView ? 'knowledge' : view === 'reports' ? 'query' : view;
@@ -137,12 +176,25 @@ export default function App() {
     <main className="main-workspace workspace-content">
       {error && <div className="global-error"><ErrorBox error={error} retry={() => void refresh()}/></div>}
       <Suspense fallback={<Busy text="正在打开工作台…"/>}>
-        <section className="chat-page-host" hidden={view !== 'chat'} aria-label="AI 问答工作区">{workspace && <Chat key={workspace.vault_path} settings={settings} repositories={workspace.repositories} datasources={datasources} notes={notes} notify={notify} onOpen={openNote} onReport={() => navigate('reports')} onConfigure={() => navigate('settings')} onRepositories={() => navigate('repositories')} refresh={() => void refresh()}/>}</section>
+        <section className="chat-page-host" hidden={view !== 'chat'} aria-label="AI 问答工作区">{workspace && <Chat key={workspace.vault_path} settings={settings} repositories={workspace.repositories} datasources={datasources} notes={notes} businessNoteCount={businessNoteCount} notify={notify} onOpen={openNote} onReport={() => navigate('reports')} onConfigure={() => navigate('settings')} onRepositories={() => navigate('repositories')} refresh={() => void refresh()}/>}</section>
         {view === 'settings' && <SettingsPage settings={settings} refresh={() => void refresh()} notify={notify}/>}
         {view === 'repositories' && <Repositories repositories={workspace?.repositories || []} providers={settings?.providers || []} tasks={tasks} refresh={() => void refresh()} notify={notify}/>}
         {(queryVisited || view === 'query' || view === 'reports') && <div className="database-workspace" hidden={view !== 'query' && view !== 'reports'}><div className="section-tabs" role="group" aria-label="数据库视图"><button className={view === 'query' ? 'active' : ''} onClick={() => navigate('query')}><Database size={15}/>数据源与查询</button><button className={view === 'reports' ? 'active' : ''} onClick={() => navigate('reports')}><FileBarChart2 size={15}/>报表</button></div><section className="query-page-host" hidden={view !== 'query'}>{(queryVisited || view === 'query') && <Query datasources={datasources} refresh={() => void refresh()} notify={notify} onReport={() => navigate('reports')}/>}</section>{view === 'reports' && <Reports/>}</div>}
         {mapView && <div className={`map-layout ${sidebar ? '' : 'without-directory'} ${rightbar ? '' : 'without-context'}`}>
-    {sidebar && <aside className="knowledge-sidebar"><div className="vault-heading"><div className="vault-icon"><Braces size={17}/></div><div><strong>{workspace?.name || '业务知识库'}</strong><span>{workspace?.demo ? '示例知识库' : '本地 Markdown Vault'}</span></div><button className="icon-button" title="切换知识库" aria-label="切换知识库" onClick={() => void changeVault()}><ChevronDown size={14}/></button></div><label className="knowledge-search"><Search size={14}/><input ref={searchRef} placeholder="搜索知识库…" aria-label="搜索知识库" value={search} onChange={e => setSearch(e.target.value)}/>{search ? <button className="icon-button" aria-label="清空搜索" onClick={() => setSearch('')}><X size={12}/></button> : <kbd>{window.businessmap?.platform === 'darwin' ? '⌘ K' : 'Ctrl K'}</kbd>}</label><div className="explorer-caption"><span>{search ? `搜索结果 · ${visibleNotes.length}` : '知识目录'}</span><button className="icon-button" title="新建笔记" aria-label="新建笔记" onClick={() => { setCreating(true); setCreateError(''); }}><FilePlus2 size={15}/></button></div><div className="file-tree">{loading ? <Busy text="读取知识库…"/> : grouped.length ? grouped.map(([folder, children]) => <div className="tree-folder" key={folder}><button className="folder-row" onClick={() => setFolded(previous => { const next = new Set(previous); if (next.has(folder)) next.delete(folder); else next.add(folder); return next; })} aria-expanded={!folded.has(folder)}>{folded.has(folder) ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}<FolderClosed size={14}/><span>{folder}</span><small>{children.length}</small></button>{!folded.has(folder) && <div className="folder-children">{children.map(note => <button key={note.id} className={`file-row ${selected === note.path && view === 'knowledge' ? 'active' : ''}`} title={note.path} onClick={() => openNote(note.path)}><FileText size={14}/><span>{note.title}</span>{selected === note.path && view === 'knowledge' && <span className="active-file-dot"/>}</button>)}</div>}</div>) : <p className="sidebar-empty">{search ? '没有匹配的笔记' : '还没有笔记，点击上方按钮新建。'}</p>}</div>{tags.length > 0 && <div className="sidebar-tags"><div className="section-kicker">标签{tag && <button className="text-button" onClick={() => setTag('')}>清除</button>}</div><div>{tags.map(item => <button key={item} className={tag === item ? 'active' : ''} onClick={() => setTag(tag === item ? '' : item)}><Hash size={11}/>{item}</button>)}</div></div>}<div className="vault-summary"><div><span className="connection-dot"/><span>{workspace?.stats.notes || 0} 篇知识</span><span>·</span><span>{workspace?.stats.links || 0} 条关联</span></div><button onClick={() => navigate('repositories')}><GitBranch size={13}/>{workspace?.stats.repositories || 0} 个代码仓库<ArrowUpRight size={12}/></button></div></aside>}
+    {sidebar && <aside className="knowledge-sidebar"><div className="vault-heading"><div className="vault-icon"><Braces size={17}/></div><div><strong>{workspace?.name || '业务知识库'}</strong><span>{workspace?.demo ? '示例知识库' : '本地 Markdown Vault'}</span></div><button className="icon-button" title="切换知识库" aria-label="切换知识库" onClick={() => void changeVault()}><ChevronDown size={14}/></button></div><label className="knowledge-search"><Search size={14}/><input ref={searchRef} placeholder="搜索知识库…" aria-label="搜索知识库" value={search} onChange={e => setSearch(e.target.value)}/>{search ? <button className="icon-button" aria-label="清空搜索" onClick={() => setSearch('')}><X size={12}/></button> : <kbd>{window.businessmap?.platform === 'darwin' ? '⌘ K' : 'Ctrl K'}</kbd>}</label><div className="explorer-caption"><span>{search ? `搜索结果 · ${visibleNotes.length}` : '知识目录'}</span><button className="icon-button" title="新建笔记" aria-label="新建笔记" onClick={() => { setCreating(true); setCreateError(''); }}><FilePlus2 size={15}/></button></div><div className="file-tree">{loading ? <Busy text="读取知识库…"/> : !visibleNotes.length && search ? <p className="sidebar-empty">没有匹配的文档</p> : sections.filter(section => !search || section.count > 0).map(section => {
+          const sectionCollapsed = !search && folded.has(`section:${section.id}`);
+          return <section className="knowledge-section" key={section.id} aria-label={section.label}>
+            <button className="folder-row knowledge-section-heading" title={`${section.directory} · ${section.detail}`} onClick={() => toggleFolded(`section:${section.id}`)} aria-expanded={!sectionCollapsed}>
+              {sectionCollapsed ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}<FolderClosed size={14}/><span>{section.label}</span><small>{section.count}</small>
+            </button>
+            {!sectionCollapsed && <div className="knowledge-section-content">{section.folders.length ? section.folders.map(folder => {
+              const folderCollapsed = !search && (section.id === 'sources' ? !expandedSources.has(folder.path) : folded.has(`folder:${folder.path}`));
+              return <div className="tree-folder" key={folder.path}><button className="folder-row" title={folder.path || section.directory} onClick={() => section.id === 'sources' ? setExpandedSources(previous => { const next = new Set(previous); if (next.has(folder.path)) next.delete(folder.path); else next.add(folder.path); return next; }) : toggleFolded(`folder:${folder.path}`)} aria-expanded={!folderCollapsed}>
+                {folderCollapsed ? <ChevronRight size={12}/> : <ChevronDown size={12}/>}<FolderClosed size={14}/><span>{folder.label}</span><small>{folder.notes.length}</small>
+              </button>{!folderCollapsed && <div className="folder-children">{folder.notes.map(note => <button key={note.id} className={`file-row ${selected === note.path && view === 'knowledge' ? 'active' : ''}`} title={note.path} onClick={() => openNote(note.path)}><FileText size={14}/><span>{note.title}</span>{selected === note.path && view === 'knowledge' && <span className="active-file-dot"/>}</button>)}</div>}</div>;
+            }) : <p className="section-empty">{section.detail}</p>}</div>}
+          </section>;
+        })}</div>{tags.length > 0 && <div className="sidebar-tags"><div className="section-kicker">标签{tag && <button className="text-button" onClick={() => setTag('')}>清除</button>}</div><div>{tags.map(item => <button key={item} className={tag === item ? 'active' : ''} onClick={() => setTag(tag === item ? '' : item)}><Hash size={11}/>{item}</button>)}</div></div>}<div className="vault-summary"><div><span className="connection-dot"/><span>{businessNoteCount} 篇业务知识</span><span>·</span><span>{workspace?.stats.links || 0} 条关联</span></div><div className="source-document-count"><FileText size={12}/><span>{sourceDocumentCount} 份资料</span></div><button onClick={() => navigate('repositories')}><GitBranch size={13}/>{workspace?.stats.repositories || 0} 个代码仓库<ArrowUpRight size={12}/></button></div></aside>}
           <section className="map-main">
             <div className="section-tabs" role="group" aria-label="业务地图视图"><button className={view === 'knowledge' ? 'active' : ''} onClick={() => navigate('knowledge')}><BookOpen size={15}/>文档</button><button className={view === 'graph' ? 'active' : ''} onClick={() => navigate('graph')}><Network size={15}/>关系图谱</button><div className="tab-spacer"/><button className="map-folder-button" onClick={() => { void window.businessmap?.openVault().catch(err => notify(errorMessage(err), 'error')); }}><FolderOpen size={15}/>打开目录</button></div>
             {view === 'knowledge' && <><div className="workspace-tabs" role="tablist" aria-label="打开的笔记">{view === 'knowledge' ? tabs.map(path => { const note = notes.find(item => item.path === path); return <div className={`workspace-tab ${selected === path ? 'active' : ''}`} key={path}><button role="tab" aria-selected={selected === path} onClick={() => openNote(path)}><FileText size={13}/><span>{note?.title || path.split('/').at(-1)}</span>{selected === path && dirty && <i/>}</button><button className="tab-close" aria-label={`关闭 ${note?.title || path}`} onClick={() => closeTab(path)}><X size={12}/></button></div>; }) : <div className="workspace-tab active"><span className="page-tab-label">{currentLabel}</span></div>}<button className="icon-button new-tab" aria-label="新建笔记标签" title="新建笔记" onClick={() => { setCreating(true); setCreateError(''); }}><Plus size={15}/></button><div className="tab-spacer"/>{workspace?.demo && <span className="demo-indicator">示例工作区</span>}</div><Document path={selected} notes={notes} onOpen={openNote} onNote={setCurrentNote} onDirty={setDirty} notify={notify} onSaved={() => void refresh()}/></>}
@@ -155,5 +207,6 @@ export default function App() {
     <footer className="statusbar"><div><span className={`connection-dot ${error ? 'offline' : ''}`}/>{error ? '服务未连接' : '本地服务已连接'}<span className="status-divider"/><ShieldCheck size={12}/><span>数据库只读</span></div><div>{hasRunningTasks && <span><LoaderCircle className="spin" size={12}/>后台任务进行中</span>}<span>{activeProvider ? `${activeProvider.name} · ${activeProvider.model}` : '未连接模型 · 原文检索可用'}</span><span className="status-divider"/><span>思径 0.3.0</span></div></footer>
     {toast && <div className={`toast ${toast.kind}`} role={toast.kind === 'error' ? 'alert' : 'status'}>{toast.kind === 'success' ? <Check size={16}/> : <CircleHelp size={16}/>}<span>{toast.message}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setToast(null)}><X size={14}/></button></div>}
     {creating && <Modal title="新建知识笔记" busy={createBusy} onClose={() => { if (!createBusy) setCreating(false); }}><form className="form-stack" onSubmit={create}><label>笔记名称<input autoFocus required value={title} onChange={e => setTitle(e.target.value)} placeholder="例如：订单关闭规则"/></label><p className="form-hint">新建 Markdown 笔记，使用 [[双向链接]] 将它连接到业务地图。</p>{createError && <p className="form-error" role="alert">{createError}</p>}<div className="modal-actions"><button type="button" className="button" disabled={createBusy} onClick={() => setCreating(false)}>取消</button><button className="button primary" disabled={createBusy || !title.trim()}>{createBusy ? '创建中…' : '创建笔记'}</button></div></form></Modal>}
+    {sourceReference && <SourceEvidenceView key={sourceReference} reference={sourceReference} onClose={() => setSourceReference(null)}/>}
   </div>;
 }

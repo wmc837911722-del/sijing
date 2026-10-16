@@ -452,12 +452,18 @@ class Store:
 
     def graph(self) -> dict:
         self.refresh()
+        from .content_layout import is_source_document
         with self._lock:
+            visible = {path: note for path, note in self._cache.items() if not is_source_document(note)}
             return {
-                "nodes": [{key: note[key] for key in ("id", "title", "type", "tags")} for note in self._cache.values()],
-                "edges": [{"source": name, "target": dest} for name, note in self._cache.items()
-                          for dest in self._links(name, note["content"])],
+                "nodes": [{key: note[key] for key in ("id", "title", "type", "tags")} for note in visible.values()],
+                "edges": [{"source": name, "target": dest} for name, note in visible.items()
+                          for dest in self._links(name, note["content"]) if dest in visible],
             }
+
+    def migrate_content_layout(self) -> dict:
+        from .layout_migration import migrate_content_layout
+        return migrate_content_layout(self)
 
     def open_vault(self, path: str) -> dict:
         if not Path(path).expanduser().is_absolute():
@@ -544,9 +550,14 @@ class Store:
     def workspace(self) -> dict:
         graph = self.graph()
         repos = self.repositories()
+        from .content_layout import is_source_document
+        with self._lock:
+            note_count = len(self._cache)
+            source_count = sum(is_source_document(note) for note in self._cache.values())
         return {"name": "业务知识库", "vault_path": str(self.vault), "version": self.version,
                 "demo": self.config_get("demo_vault_path") == str(self.vault),
-                "stats": {"notes": len(graph["nodes"]), "links": len(graph["edges"]), "repositories": len(repos)},
+                "stats": {"notes": note_count, "business_notes": note_count - source_count,
+                          "source_documents": source_count, "links": len(graph["edges"]), "repositories": len(repos)},
                 "repositories": repos, "recent_activity": self.activities()[:8]}
 
     def tasks(self) -> list[dict]:
@@ -786,6 +797,7 @@ class Store:
 
     def _publish_code_index(self, repo: dict, commit: str, files: list[dict], total: int,
                             task_id: str | None = None) -> None:
+        from .content_layout import source_note_path
         vault = Path(repo["vault_path"]).resolve()
         with self._lock:
             if self.vault != vault:
@@ -819,7 +831,7 @@ class Store:
         for index, item in enumerate(files, 1):
             source = item["path"]
             old = existing.get(source)
-            note_path = f"代码索引/{repo['id']}/{hashlib.sha256(source.encode()).hexdigest()[:16]}.md"
+            note_path = source_note_path(repo["id"], hashlib.sha256(source.encode()).hexdigest()[:16] + ".md")
             links.append(f"- [[{note_path[:-3]}|{source}]]")
             meta = yaml.safe_dump({"title": source, "type": "code", "tags": ["代码索引", "非AI分析"],
                                    "source_path": source, "source_commit": commit, "repository_id": repo["id"]},
@@ -833,7 +845,7 @@ class Store:
                     previous = target.read_text(encoding="utf-8-sig") if target.exists() else None
                     if previous is not None and (not old or revision(previous) != old["revision"]):
                         preserved.append(source)
-                        proposal = f"代码索引/{repo['id']}/更新建议/{hashlib.sha256(source.encode()).hexdigest()[:16]}-{commit[:8]}.md"
+                        proposal = source_note_path(repo["id"], f"更新建议/{hashlib.sha256(source.encode()).hexdigest()[:16]}-{commit[:8]}.md")
                         if not self._path(proposal, vault=vault).exists():
                             self._write_note(proposal, content + f"\n原笔记包含人工修改，未覆盖：[[{note_path[:-3]}]]。\n", vault=vault)
                             written += 1
@@ -847,7 +859,7 @@ class Store:
                 self.update_task(task_id, 35 + 55 * index // len(files),
                                  f"已处理 {index} / {len(files)} 个源文件，写入 {written} 篇笔记（未调用 AI）")
         # Each commit has an immutable summary so manual edits are never overwritten.
-        summary_path = f"代码索引/{repo['id']}/版本-{commit[:12]}.md"
+        summary_path = source_note_path(repo["id"], f"版本-{commit[:12]}.md")
         with self._lock:
             if self.vault != vault:
                 raise CoreError(409, "知识库已切换，请重新发起仓库同步")
@@ -863,19 +875,47 @@ class Store:
         if not repo.get("commit"):
             raise CoreError(409, "仓库尚未完成接入")
         files = self._source_files(repo, repo["commit"])
-        result, used, shortened = [], 0, False
+        # Sample across modules instead of letting an alphabetically early
+        # module consume the entire analysis budget. Full source navigation
+        # remains available independently of this bounded overview sample.
+        groups: dict[str, list[dict]] = {}
         for item in files:
+            module = item["path"].split("/", 1)[0] if "/" in item["path"] else "."
+            groups.setdefault(module, []).append(item)
+        def priority(item):
+            path = item["path"].casefold()
+            name = PurePosixPath(path).stem
+            test = any(part in {"test", "tests", "__tests__"} for part in PurePosixPath(path).parts)
+            business = any(word in name for word in ("service", "rule", "state", "policy", "permission", "entity"))
+            return (test, not business, item["size"], path)
+        for entries in groups.values():
+            entries.sort(key=priority)
+        ordered = []
+        for index in range(30):
+            for module in sorted(groups):
+                if index < len(groups[module]):
+                    ordered.append(groups[module][index])
+                if len(ordered) == 30:
+                    break
+            if len(ordered) == 30:
+                break
+        per_file_limit = min(10_000, 60_000 // max(1, len(ordered)))
+        result, used, shortened = [], 0, False
+        for item in ordered:
             if used >= 60_000 or len(result) >= 30:
                 break
             # Reading tracked blobs avoids untracked secrets and does not run code.
             content = self._git(["show", f"{repo['commit']}:{item['path']}"], Path(repo["path"]))
             if "\x00" in content:
                 continue
-            limit = min(10_000, 60_000 - used)
-            shortened = shortened or len(content) > limit
+            limit = min(per_file_limit, 60_000 - used)
+            file_truncated = len(content) > limit
+            shortened = shortened or file_truncated
             content = content[:limit]
             content = re.sub(r"(?i)((?:api[_-]?key|password|secret|token)\s*[:=]\s*)['\"][^'\"\r\n]+['\"]", r"\1\"[REDACTED]\"", content)
-            result.append({"path": item["path"], "content": content})
+            result.append({"path": item["path"], "content": content, "truncated": file_truncated})
             used += len(content)
         return {"repository": repo, "commit": repo["commit"], "files": result,
+                "total_files": len(files), "total_modules": len(groups),
+                "sampled_modules": sorted({item["path"].split("/", 1)[0] if "/" in item["path"] else "." for item in result}),
                 "truncated": shortened or len(result) < len(files) or used >= 60_000}

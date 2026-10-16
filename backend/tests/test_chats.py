@@ -135,11 +135,12 @@ def test_repository_selection_scopes_real_notes_and_code_index(store, monkeypatc
         return finished("有依据的答复", [note["path"] for note in receipts if "content" in note])
     monkeypatch.setattr(tools.providers, "tool_turn", turn)
     response = tools.chat("订单", repository_id=first)
-    assert len(response["sources"]) == 3
+    assert len(response["sources"]) == 1  # Code inventories are locators, not business evidence.
     assert all(f"/{first}/" in source["path"] for source in response["sources"])
-    assert "first-only-evidence" in captured[0] and "older-unchanged-blob" in captured[0]
+    assert "first-only-evidence" in captured[0] and "older-unchanged-blob" not in captured[0]
     assert "second-only-evidence" not in captured[0] and "manual-outside-repository" not in captured[0]
     assert "未确认建议" not in captured[0] and "历史版本" not in captured[0]
+    assert "older-unchanged-blob" in tools.search("fixture", repository_id=first)[0]["content"]
     unrestricted = tools.chat("订单")
     assert any(f"/{second}/" in source["path"] for source in unrestricted["sources"])
     assert any(source["path"] == "手工/订单.md" for source in unrestricted["sources"])

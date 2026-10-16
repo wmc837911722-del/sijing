@@ -135,7 +135,7 @@ def test_import_writes_at_most_500_notes_without_repeated_vault_scans(store, tmp
         assert f"source_path: {source_path}" in content
         assert hashlib.sha256(content.encode()).hexdigest() == saved_revision
         assert blob == blobs[source_path]
-    summaries = list((store.vault / "代码索引" / repo["id"]).glob("版本-*.md"))
+    summaries = list((store.vault / "00-Inbox" / "代码资料" / repo["id"]).glob("版本-*.md"))
     assert len(summaries) == 1
     assert "已索引 500 / 505" in summaries[0].read_text(encoding="utf-8")
     assert len(list(store.vault.rglob("*.md"))) == 501
@@ -149,7 +149,7 @@ def test_tasks_remain_readable_between_index_writes(store, tmp_path, monkeypatch
     first_write = threading.Event()
 
     def replace(path, target):
-        if path.suffix == ".tmp" and "代码索引" in path.parts:
+        if path.suffix == ".tmp" and "代码资料" in path.parts:
             first_write.set()
             time.sleep(0.04)
         return original_replace(path, target)
@@ -209,7 +209,9 @@ def test_import_cannot_follow_an_index_directory_symlink_outside_the_vault(store
     source, _ = repository(tmp_path, 1)
     outside = tmp_path / "outside"
     outside.mkdir()
-    (store.vault / "代码索引").symlink_to(outside, target_is_directory=True)
+    material = store.vault / "00-Inbox" / "代码资料"
+    material.parent.mkdir(parents=True)
+    material.symlink_to(outside, target_is_directory=True)
     store.add_repository(str(source))
     task = completed_task(store, expected_status="failed")
     assert "知识库之外" in task["error"]
@@ -230,7 +232,7 @@ def test_import_aborts_before_publish_if_another_process_changes_the_selected_va
     def write_text(path, *args, **kwargs):
         nonlocal switched
         result = original_write(path, *args, **kwargs)
-        if not switched and path.suffix == ".tmp" and "代码索引" in path.parts:
+        if not switched and path.suffix == ".tmp" and "代码资料" in path.parts:
             switched = True
             other.config_set("vault_path", str(selected))
         return result

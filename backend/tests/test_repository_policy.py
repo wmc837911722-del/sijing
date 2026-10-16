@@ -31,8 +31,10 @@ def repository(tools, name="company"):
     tools.store._write_repo({"id": repo_id, "name": name, "vault_path": str(tools.store.vault),
                             "commit": "a" * 40, "status": "ready", "auto_sync": False,
                             "url": "fixture", "path": "fixture"})
-    path = f"代码索引/{repo_id}/fixture.md"
-    tools.store.save_note(path, f"# 订单 {name}\n{name}-private-evidence\n")
+    # This is business evidence. File inventories are now discovery-only and
+    # deliberately cannot supply factual business answers.
+    path = f"01-Wiki/业务知识/{repo_id}/手工证据.md"
+    tools.store.save_note(path, f"---\nrepository_id: {repo_id}\n---\n# 订单 {name}\n{name}-private-evidence\n")
     return repo_id
 
 
@@ -51,7 +53,7 @@ def network(monkeypatch):
         requests.append({"url": str(request.url), **payload})
         if "代码业务分析器" in payload["messages"][0]["content"]:
             result = {"notes": [{"key": "rules", "title": "订单规则", "content": "# 订单规则\n允许退款。",
-                                  "sources": [{"path": "rules.py", "line_start": 1, "line_end": 1}]}]}
+                                  "sources": [{"path": "rules.py", "line_start": 1, "line_end": 1, "quote": "allow_refund = True"}]}]}
             text = json.dumps(result)
         else:
             tool_names = {tool["function"]["name"] for tool in payload["tools"]}
@@ -92,7 +94,7 @@ def test_analysis_requires_explicit_binding_and_uses_bound_destination_after_def
     assert not requests
     assert tools.bind_model(repo, company["id"])["status"] == "ready"
     tools.providers.activate(other["id"])
-    assert tools.analyze(repo)["notes_created"] == 1
+    assert tools.analyze(repo)["notes_created"] == 3
     assert requests[0]["url"] == company["base_url"] + "/chat/completions"
     assert requests[0]["model"] == company["model"]
     assert tools.store.config_get("active_provider_id") == other["id"]
