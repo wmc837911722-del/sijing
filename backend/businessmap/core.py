@@ -279,15 +279,16 @@ class Store:
                 (4, 1, 20.0, "completed", "2026-09-28T09:00:00+08:00"),
             ])
 
-    def _path(self, path: str) -> Path:
+    def _path(self, path: str, *, vault: Path | None = None) -> Path:
         pure = PurePosixPath(path)
         if (not path or len(path) > 1024 or pure.as_posix() != path
                 or "\\" in path or re.search(r'[<>:"|?*\x00-\x1f]', path) or pure.is_absolute()
                 or any(part in {"..", "."} or part.startswith(".") for part in pure.parts)
                 or pure.suffix.lower() != ".md"):
             raise CoreError(400, "笔记路径必须是知识库内的相对 .md 路径")
-        target = self.vault.joinpath(*pure.parts)
-        if not target.resolve().is_relative_to(self.vault.resolve()):
+        vault = self.vault if vault is None else vault
+        target = vault.joinpath(*pure.parts)
+        if not target.resolve().is_relative_to(vault.resolve()):
             raise CoreError(400, "笔记路径不能指向知识库之外")
         return target
 
@@ -321,12 +322,13 @@ class Store:
 
     def refresh(self) -> None:
         with self._lock:
+            vault = self.vault
             signature = {}
-            for target in self.vault.rglob("*.md"):
-                relative = target.relative_to(self.vault)
+            for target in vault.rglob("*.md"):
+                relative = target.relative_to(vault)
                 if any(part.startswith(".") for part in relative.parts) or target.is_symlink():
                     continue
-                if not target.resolve().is_relative_to(self.vault.resolve()):
+                if not target.resolve().is_relative_to(vault):
                     continue
                 try:
                     stat = target.stat()
@@ -340,6 +342,10 @@ class Store:
                         self._cache[name] = self._summarize(name, content, stat.st_mtime)
                 except (OSError, UnicodeError):
                     continue
+            # A separate process can select another vault while this scan runs.
+            # The getter clears the old cache before rejecting stale results.
+            if self.vault != vault:
+                raise CoreError(409, "知识库已切换，请重新读取")
             for name in self._cache.keys() - signature.keys():
                 self._cache.pop(name, None)
             if signature != self._signature:
@@ -392,11 +398,16 @@ class Store:
                                  if name != path and path in self._links(name, other["content"])]
             return note
 
-    def save_note(self, path: str, content: str, revision: str | None = None) -> dict:
+    def _write_note(self, path: str, content: str, revision: str | None = None,
+                    *, vault: Path | None = None) -> str:
+        """Write with the same revision guard, without rebuilding read indexes."""
         if len(content.encode("utf-8")) > self.MAX_NOTE_BYTES:
             raise CoreError(413, "笔记过大（上限 2 MB）")
         with self._lock:
-            target = self._path(path)
+            selected = self.vault
+            if vault is not None and selected != vault:
+                raise CoreError(409, "知识库已切换，请重新发起仓库同步")
+            target = self._path(path, vault=selected)
             if target.exists():
                 current = target.read_text(encoding="utf-8-sig")
                 if revision is None or globals()["revision"](current) != revision:
@@ -408,12 +419,21 @@ class Store:
             temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
             try:
                 temporary.write_text(content, encoding="utf-8", newline="")
-                if target.exists() and globals()["revision"](target.read_text(encoding="utf-8-sig")) != revision:
+                if self.vault != selected:
+                    raise CoreError(409, "知识库已切换，请重新读取后保存")
+                current_revision = (globals()["revision"](target.read_text(encoding="utf-8-sig"))
+                                    if target.exists() else None)
+                if current_revision != revision:
                     raise CoreError(409, "保存期间笔记发生外部变化，请重新读取")
                 temporary.replace(target)
             finally:
                 temporary.unlink(missing_ok=True)
             self._signature.pop(path, None)
+            return globals()["revision"](content)
+
+    def save_note(self, path: str, content: str, revision: str | None = None) -> dict:
+        with self._lock:
+            self._write_note(path, content, revision)
             self.refresh()
             return self.read_note(path)
 
@@ -748,7 +768,7 @@ class Store:
                 current = {item["path"]: item["blob"] for item in files}
                 changed_paths = sorted(name for name in previous.keys() | current.keys() if previous.get(name) != current.get(name))
                 self.update_task(task_id, 35, "正在更新代码文件索引（未调用 AI）")
-                self._publish_code_index(repo, commit, files, len(all_files))
+                self._publish_code_index(repo, commit, files, len(all_files), task_id)
                 self.activity("代码索引已更新", f"{repo['name']} · {commit[:8]} · {len(files)} 个源文件；未进行 AI 业务分析", "success")
             repo.update(branch=branch, commit=commit, status="ready", last_sync=now(), last_error=None)
             self._write_repo(repo)
@@ -764,17 +784,25 @@ class Store:
             self._write_repo(repo)
             raise
 
-    def _publish_code_index(self, repo: dict, commit: str, files: list[dict], total: int) -> None:
+    def _publish_code_index(self, repo: dict, commit: str, files: list[dict], total: int,
+                            task_id: str | None = None) -> None:
+        vault = Path(repo["vault_path"]).resolve()
         with self._lock:
+            if self.vault != vault:
+                raise CoreError(409, "知识库已切换，请重新发起仓库同步")
             with self._db() as db:
                 existing = {row[0]: {"note_path": row[1], "blob": row[2], "revision": row[3]}
                             for row in db.execute("SELECT source_path,note_path,blob,revision FROM managed_notes WHERE repository_id=?", (repo["id"],))}
-            new_paths = {item["path"] for item in files}
-            preserved = []
-            for old, info in existing.items():
-                if old in new_paths:
-                    continue
-                target = self._path(info["note_path"])
+        new_paths = {item["path"] for item in files}
+        preserved = []
+        written = 0
+        for old, info in existing.items():
+            if old in new_paths:
+                continue
+            with self._lock:
+                if self.vault != vault:
+                    raise CoreError(409, "知识库已切换，请重新发起仓库同步")
+                target = self._path(info["note_path"], vault=vault)
                 if target.exists():
                     content = target.read_text(encoding="utf-8-sig")
                     if revision(content) == info["revision"]:
@@ -783,40 +811,51 @@ class Store:
                         preserved.append(old)
                         marker = "\n\n> 系统提示：源文件已删除、重命名或不再属于当前索引范围；本笔记因包含人工修改而保留。\n"
                         if marker not in content:
-                            self.save_note(info["note_path"], content + marker, revision(content))
+                            self._write_note(info["note_path"], content + marker, revision(content), vault=vault)
+                            written += 1
                 with self._db() as db:
                     db.execute("DELETE FROM managed_notes WHERE repository_id=? AND source_path=?", (repo["id"], old))
-            links = []
-            for item in files:
-                source = item["path"]
-                old = existing.get(source)
-                note_path = f"代码索引/{repo['id']}/{hashlib.sha256(source.encode()).hexdigest()[:16]}.md"
-                links.append(f"- [[{note_path[:-3]}|{source}]]")
-                target = self._path(note_path)
-                if old and old["blob"] == item["blob"] and target.exists():
-                    continue
-                meta = yaml.safe_dump({"title": source, "type": "code", "tags": ["代码索引", "非AI分析"],
-                                       "source_path": source, "source_commit": commit, "repository_id": repo["id"]},
-                                      allow_unicode=True, sort_keys=False).strip()
-                content = f"---\n{meta}\n---\n# {source}\n\n> 自动生成的代码文件索引，**不是 AI 业务分析结论**。\n\n- 仓库：{repo['name']}\n- 源文件：`{source}`\n- 提交：`{commit}`\n- 文件大小：{item['size']} 字节\n\n请在仓库面板主动发起 AI 分析，或人工补充业务含义。\n"
-                previous = target.read_text(encoding="utf-8-sig") if target.exists() else None
-                if previous is not None and (not old or revision(previous) != old["revision"]):
-                    preserved.append(source)
-                    proposal = f"代码索引/{repo['id']}/更新建议/{hashlib.sha256(source.encode()).hexdigest()[:16]}-{commit[:8]}.md"
-                    if not self._path(proposal).exists():
-                        self.save_note(proposal, content + f"\n原笔记包含人工修改，未覆盖：[[{note_path[:-3]}]]。\n")
-                    continue
-                saved = self.save_note(note_path, content, revision(previous) if previous is not None else None)
-                with self._db() as db:
-                    db.execute("INSERT OR REPLACE INTO managed_notes VALUES (?,?,?,?,?)",
-                               (repo["id"], source, note_path, item["blob"], saved["revision"]))
-            # Each commit has an immutable summary so manual edits are never overwritten.
-            summary_path = f"代码索引/{repo['id']}/版本-{commit[:12]}.md"
-            if not self._path(summary_path).exists():
+        links = []
+        for index, item in enumerate(files, 1):
+            source = item["path"]
+            old = existing.get(source)
+            note_path = f"代码索引/{repo['id']}/{hashlib.sha256(source.encode()).hexdigest()[:16]}.md"
+            links.append(f"- [[{note_path[:-3]}|{source}]]")
+            meta = yaml.safe_dump({"title": source, "type": "code", "tags": ["代码索引", "非AI分析"],
+                                   "source_path": source, "source_commit": commit, "repository_id": repo["id"]},
+                                  allow_unicode=True, sort_keys=False).strip()
+            content = f"---\n{meta}\n---\n# {source}\n\n> 自动生成的代码文件索引，**不是 AI 业务分析结论**。\n\n- 仓库：{repo['name']}\n- 源文件：`{source}`\n- 提交：`{commit}`\n- 文件大小：{item['size']} 字节\n\n请在仓库面板主动发起 AI 分析，或人工补充业务含义。\n"
+            with self._lock:
+                if self.vault != vault:
+                    raise CoreError(409, "知识库已切换，请重新发起仓库同步")
+                target = self._path(note_path, vault=vault)
+                if not (old and old["blob"] == item["blob"] and target.exists()):
+                    previous = target.read_text(encoding="utf-8-sig") if target.exists() else None
+                    if previous is not None and (not old or revision(previous) != old["revision"]):
+                        preserved.append(source)
+                        proposal = f"代码索引/{repo['id']}/更新建议/{hashlib.sha256(source.encode()).hexdigest()[:16]}-{commit[:8]}.md"
+                        if not self._path(proposal, vault=vault).exists():
+                            self._write_note(proposal, content + f"\n原笔记包含人工修改，未覆盖：[[{note_path[:-3]}]]。\n", vault=vault)
+                            written += 1
+                    else:
+                        saved_revision = self._write_note(note_path, content, revision(previous) if previous is not None else None, vault=vault)
+                        written += 1
+                        with self._db() as db:
+                            db.execute("INSERT OR REPLACE INTO managed_notes VALUES (?,?,?,?,?)",
+                                       (repo["id"], source, note_path, item["blob"], saved_revision))
+            if task_id and (index % 10 == 0 or index == len(files)):
+                self.update_task(task_id, 35 + 55 * index // len(files),
+                                 f"已处理 {index} / {len(files)} 个源文件，写入 {written} 篇笔记（未调用 AI）")
+        # Each commit has an immutable summary so manual edits are never overwritten.
+        summary_path = f"代码索引/{repo['id']}/版本-{commit[:12]}.md"
+        with self._lock:
+            if self.vault != vault:
+                raise CoreError(409, "知识库已切换，请重新发起仓库同步")
+            if not self._path(summary_path, vault=vault).exists():
                 text = f"# {repo['name']} · 代码索引 {commit[:8]}\n\n> 非 AI 分析：这里只记录 Git 提交中的文件清单，不推断业务规则。\n\n版本：`{commit}`\n\n已索引 {len(files)} / {total} 个符合条件的源文件。排除隐藏、敏感命名、依赖目录和大文件。\n\n" + "\n".join(links)
                 if preserved:
                     text += "\n\n## 保留人工编辑\n\n以下笔记包含人工修改，未覆盖；变化内容另存更新建议或保留删除提示：\n" + "\n".join(f"- `{name}`" for name in preserved)
-                self.save_note(summary_path, text + "\n")
+                self._write_note(summary_path, text + "\n", vault=vault)
             self.refresh()
 
     def repository_context(self, repo_id: str) -> dict:

@@ -301,9 +301,14 @@ def test_stable_evidence_precedes_history_and_deepseek_cache_usage(store, monkey
 
 
 def test_real_git_commit_callback_updates_map_then_preserves_human_edits(tmp_path, monkeypatch):
+    from itertools import count
+    from uuid import UUID
     from fastapi.testclient import TestClient
     from businessmap.app import create_app
 
+    # IDs are metadata, not evidence that the new business value was published.
+    ids = count(1)
+    monkeypatch.setattr("businessmap.core.uuid.uuid4", lambda: UUID(f"20000000-0000-4000-8000-{next(ids):012x}"))
     source = tmp_path / "git-source"
     source.mkdir()
     def git(*args):
@@ -348,10 +353,10 @@ def test_real_git_commit_callback_updates_map_then_preserves_human_edits(tmp_pat
         assert initial.status_code == 200 and initial.json()["notes_created"] == 1
         assert client.get("/api/workspace").json()["repositories"][0]["ai_auto_sync"] is True
         path = f"业务地图/{repo_id}/rules.md"
-        assert "100" in store.read_note(path)["content"]
+        assert "代码定义的退款上限为 100。" in store.read_note(path)["content"]
         commit(200)
         client.post(f"/api/repositories/{repo_id}/sync")
-        wait_for(lambda: "200" in store.read_note(path)["content"], store)
+        wait_for(lambda: "代码定义的退款上限为 200。" in store.read_note(path)["content"], store)
         assert len(calls) == 2
         note = store.read_note(path)
         human = store.save_note(path, note["content"] + "\n人工确认：例外需审批。\n", note["revision"])
