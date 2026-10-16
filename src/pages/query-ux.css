@@ -1,0 +1,12 @@
+.query-source-bar select { min-width: 0; }
+.query-results .section-heading { flex-wrap: wrap; }
+.query-result-source { margin: -2px 0 12px; color: var(--muted); font-size: 12px; }
+.query-result-source summary { cursor: pointer; overflow-wrap: anywhere; }
+.query-result-source pre { max-height: 180px; overflow: auto; padding: 12px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 5px; color: var(--text); }
+.query-running-note { padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; }
+.query-page .sql-editor:focus-visible { box-shadow: inset 0 0 0 2px var(--line-strong); }
+@media (max-height: 760px) {
+  .query-page .sql-editor { min-height: 140px; height: 160px; }
+}
+.query-form-fields { border: 0; padding: 0; margin: 0; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.query-form-fields label { display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: var(--text); }

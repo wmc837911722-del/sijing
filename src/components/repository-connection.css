@@ -1,0 +1,33 @@
+.modal:has(.repository-form) { overflow: hidden; }
+.modal:has(.repository-form) .modal-surface { display: flex; flex-direction: column; max-height: calc(100vh - 82px); }
+.modal:has(.repository-form) .modal-surface > header { flex-shrink: 0; }
+.repository-form { padding: 0; gap: 0; min-height: 0; overflow: hidden; }
+.repository-form-scroll { padding: 23px 26px; overflow: auto; min-height: 0; overscroll-behavior: contain; }
+.repository-form-footer { flex-shrink: 0; padding: 16px 26px 20px; border-top: 1px solid var(--line); background: var(--surface); }
+.repository-form-footer .form-error { margin-bottom: 12px; max-height: 95px; overflow: auto; }
+.repository-form-footer > .form-hint { margin-bottom: 10px; }
+.repository-form-footer .modal-actions { padding-top: 0; flex-wrap: wrap; }
+.repository-test-button { margin-right: auto; }
+.repository-advanced { border: 1px solid var(--line); border-radius: 12px; font-size: 12px; background: var(--panel-2); }
+.repository-advanced > summary { padding: 14px 15px; cursor: pointer; font-weight: 500; }
+.repository-advanced > .form-fields { padding: 3px 15px 16px; }
+.repository-advanced > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; border-radius: 11px; }
+.repository-form .repository-checkbox { display: flex; align-items: center; gap: 8px; }
+.repository-checkbox input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.repository-notice, .repository-test-success { margin: 0; padding: 12px 14px; border: 1px solid var(--line); background: var(--panel-2); border-radius: 11px; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.repository-test-success { display: flex; align-items: flex-start; gap: 8px; }
+.repository-test-success svg { flex-shrink: 0; margin-top: 3px; }
+.repo-model-binding { border-top: 1px solid var(--line); padding-top: 12px; margin-bottom: 14px; font-size: 12px; }
+.repo-model-binding > div { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.repo-model-binding strong { font-weight: 500; overflow-wrap: anywhere; }
+.repo-model-binding p { color: var(--muted); font-size: 12px; margin: 7px 0 0; line-height: 1.7; overflow-wrap: anywhere; }
+.repo-card .repo-actions { flex-wrap: wrap; }
+.repo-card .repo-error { margin: 12px 0; }
+.repo-card .repo-connection-status { display: flex; flex-wrap: wrap; gap: 8px; color: var(--muted); font-size: 12px; margin-bottom: 13px; }
+.repo-provider-preview { border: 1px solid var(--line); border-radius: 12px; padding: 15px 16px; background: var(--panel-2); font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.repo-provider-preview strong { display: block; font-weight: 500; }
+.repo-provider-preview p { margin: 4px 0 0; color: var(--muted); }
+@media (max-height: 760px) {
+  .repository-form-scroll { padding: 19px 23px; }
+  .repository-form-footer { padding: 13px 23px 16px; }
+}

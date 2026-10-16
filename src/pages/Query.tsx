@@ -1,0 +1,63 @@
+import { useEffect, useRef, useState } from 'react';
+import { Database, Play, Plus, ShieldCheck, Table2, BarChart3, FolderOpen, FlaskConical, ChevronDown } from 'lucide-react';
+import { errorMessage, get, post } from '../api';
+import type { Datasource, Notify, QueryResult, Report } from '../types';
+import { Busy, Empty, ErrorBox, Modal, ResultsTable } from '../components/UI';
+import './query-ux.css';
+type Schema = { tables: { name: string; columns: { name: string; type: string }[] }[] };
+type QueryDraft = { sql: string; executedSql: string | null; result: QueryResult | null; error: string };
+const DEMO_SQL = 'SELECT\n  channel,\n  COUNT(*) AS order_count,\n  SUM(amount) AS total_amount\nFROM orders\nGROUP BY channel\nORDER BY total_amount DESC\nLIMIT 100;';
+const emptyDraft = (demo = false): QueryDraft => ({ sql: demo ? DEMO_SQL : '', executedSql: null, result: null, error: '' });
+
+export default function Query({ datasources, refresh, notify, onReport }: { datasources: Datasource[]; refresh: () => void; notify: Notify; onReport: () => void }) {
+  const [sourceId, setSourceId] = useState('');
+  const selected = sourceId ? datasources.find(source => source.id === sourceId) : datasources[0];
+  const [drafts, setDrafts] = useState<Record<string, QueryDraft>>({});
+  const { sql, executedSql, result, error } = selected ? drafts[selected.id] || emptyDraft(selected.demo) : emptyDraft();
+  const [schema, setSchema] = useState<Schema | null>(null);
+  const [schemaError, setSchemaError] = useState('');
+  const [busy, setBusy] = useState('');
+  const busyRef = useRef('');
+  const [querySourceId, setQuerySourceId] = useState<string | null>(null);
+  const queryBusy = busy === 'query' && querySourceId === selected?.id;
+  const [form, setForm] = useState<{ name: string; kind: Datasource['kind']; path: string; host: string; port: string; database: string; username: string; password: string; allowed: string } | null>(null);
+  const [formError, setFormError] = useState('');
+  const [reportResult, setReportResult] = useState<QueryResult | null>(null);
+  const [reportError, setReportError] = useState('');
+  const [reportTitle, setReportTitle] = useState('业务数据分析');
+  const [chart, setChart] = useState<Report['chart_type']>('bar');
+  const updateDraft = (id: string, changes: Partial<QueryDraft>, demo = false) => {
+    setDrafts(previous => ({ ...previous, [id]: { ...(previous[id] || emptyDraft(demo)), ...changes } }));
+  };
+  const setSql = (value: string) => { if (selected) updateDraft(selected.id, { sql: value }, selected.demo); };
+  const start = (operation: string) => {
+    if (busyRef.current) return false;
+    busyRef.current = operation;
+    setBusy(operation);
+    return true;
+  };
+  const finish = () => { busyRef.current = ''; setBusy(''); };
+  useEffect(() => { if (!selected) return; let cancelled = false; setSchema(null); setSchemaError(''); void get<Schema>(`/api/datasources/${selected.id}/schema`).then(data => { if (!cancelled) setSchema(data); }).catch(err => { if (!cancelled) setSchemaError(errorMessage(err)); }); return () => { cancelled = true; }; }, [selected?.id]);
+  const run = async () => {
+    if (!selected || !sql.trim() || !start('query')) return;
+    const source = selected;
+    setQuerySourceId(source.id);
+    updateDraft(source.id, { sql, error: '', result: null }, source.demo);
+    try { updateDraft(source.id, { result: await post<QueryResult>('/api/query', { datasource_id: source.id, sql }), executedSql: sql }, source.demo); }
+    catch (err) { updateDraft(source.id, { error: errorMessage(err) }, source.demo); }
+    finally { finish(); setQuerySourceId(null); }
+  };
+  const test = async () => { if (!selected || !start('test')) return; try { const response = await post<{ ok: boolean; message: string }>(`/api/datasources/${selected.id}/test`); notify(response.message, response.ok ? 'success' : 'error'); refresh(); } catch (err) { notify(errorMessage(err), 'error'); } finally { finish(); } };
+  const add = async (event: React.FormEvent) => { event.preventDefault(); if (!form || !start('add')) return; setFormError(''); try { const source = await post<Datasource>('/api/datasources', { name: form.name.trim(), kind: form.kind, ...(form.kind === 'sqlite' ? { path: form.path.trim() } : { host: form.host.trim(), port: Number(form.port), database: form.database.trim(), username: form.username.trim(), password: form.password || undefined }), allowed_tables: form.allowed.trim() ? form.allowed.split(',').map(s => s.trim()).filter(Boolean) : undefined }); setSourceId(source.id); setForm(null); refresh(); notify('数据源配置已保存'); } catch (err) { setFormError(errorMessage(err)); } finally { finish(); } };
+  const createReport = async (event: React.FormEvent) => { event.preventDefault(); if (!reportResult || !start('report')) return; setReportError(''); try { await post<Report>('/api/reports', { result_id: reportResult.id, title: reportTitle.trim(), chart_type: chart }); setReportResult(null); notify('报表已生成'); onReport(); } catch (err) { setReportError(errorMessage(err)); } finally { finish(); } };
+  return <div className="query-page"><div className="query-main"><header className="page-heading query-heading"><div><div className="eyebrow">READ-ONLY EXPLORER</div><h1>数据库</h1><p>连接业务数据，让每个结论都可以验证。</p></div><span className="badge green"><ShieldCheck size={12}/>只读执行</span></header><div className="query-source-bar" data-tour="database-source"><Database size={16}/><select aria-label="当前数据源" value={selected?.id || ''} onChange={e => setSourceId(e.target.value)}>{!selected && <option value="">{datasources.length ? '正在更新数据源…' : '尚未配置数据源'}</option>}{datasources.map(source => <option key={source.id} value={source.id}>{source.name}{source.demo ? ' · 示例数据' : ''}</option>)}</select><button className="icon-button" aria-label="测试数据源连接" title="测试连接" disabled={!selected || Boolean(busy)} onClick={() => void test()}><FlaskConical size={16}/></button><button className="button compact" disabled={Boolean(busy)} onClick={() => { setFormError(''); setForm({ name: '', kind: 'sqlite', path: '', host: 'localhost', port: '5432', database: '', username: '', password: '', allowed: '' }); }}><Plus size={14}/>添加数据源</button></div>
+    <div className="sql-editor-panel"><div className="panel-caption"><span><CodeLabel/>查询编辑器</span><small>{selected?.demo ? '示例 SQL · 可修改后执行' : 'SQL 草稿按数据源保留'}</small></div><textarea className="sql-editor" aria-label="SQL 查询编辑器" value={sql} spellCheck={false} disabled={!selected} placeholder="输入只读 SELECT 查询…" onChange={e => setSql(e.target.value)} onKeyDown={e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); void run(); } }}/><div className="sql-actions"><span>Ctrl / ⌘ + Enter 执行</span><button className="button primary" disabled={!selected || !sql.trim() || Boolean(busy)} onClick={() => void run()}>{queryBusy ? <span className="small-spinner"/> : <Play size={14}/>} {queryBusy ? '执行中…' : '执行查询'}</button></div></div>
+    {busy === 'query' && !queryBusy && <p className="form-hint query-running-note" role="status">正在查询「{datasources.find(source => source.id === querySourceId)?.name || '原数据源'}」，完成后可切回查看结果。</p>}
+    {error && <ErrorBox error={error} retry={busy ? undefined : () => void run()}/>}
+    <div className="query-results"><div className="section-heading"><h2><Table2 size={16}/>查询结果{result && <span className="badge">{result.row_count} 行</span>}</h2>{result && <div className="results-actions"><small>{Math.round(result.elapsed_ms)} ms{result.truncated ? ' · 已截断' : ''}</small><button className="button compact" disabled={Boolean(busy)} onClick={() => { setReportError(''); setReportResult(result); }}><BarChart3 size={13}/>生成报表</button></div>}</div>{queryBusy ? <Busy text="正在执行只读查询…"/> : result ? <><details className="query-result-source"><summary>查询依据 · {selected?.name}</summary><pre>{result.sql}</pre></details>{sql.trim() !== executedSql?.trim() && <p className="form-hint">SQL 草稿已修改，下方仍是上次执行的结果。生成报表会保存该结果及其原 SQL。</p>}<ResultsTable result={result}/>{result.truncated && <p className="form-hint">结果达到返回行数或大小上限，当前仅显示部分数据；请缩小查询范围或使用聚合。</p>}</> : <Empty title="结果会显示在这里" detail="执行一条只读 SQL，查看表格并生成报表。"/>}</div></div>
+    <aside className="schema-panel"><div className="panel-caption"><span>数据结构</span><span>{schema?.tables.length || 0} 张表</span></div>{schemaError ? <ErrorBox error={schemaError}/> : !selected ? <p className="form-hint">请添加一个数据源。</p> : !schema ? <Busy/> : schema.tables.map(table => <details className="schema-table" key={table.name} open><summary><ChevronDown size={12}/><Table2 size={13}/>{table.name}</summary>{table.columns.map(column => <div className="schema-column" key={column.name}><span>{column.name}</span><small>{column.type}</small></div>)}</details>)}<div className="schema-note"><ShieldCheck size={17}/><p>生产环境请使用仅有 SELECT 权限的数据库账号。</p></div></aside>
+    {form && <Modal title="添加只读数据源" busy={Boolean(busy)} onClose={() => { if (!busyRef.current) setForm(null); }}><form className="form-stack" onSubmit={add}><fieldset className="query-form-fields" disabled={Boolean(busy)}><div className="form-columns"><label>名称<input autoFocus required maxLength={160} disabled={Boolean(busy)} value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} placeholder="例如：业务只读库"/></label><label>数据库类型<select disabled={Boolean(busy)} value={form.kind} onChange={e => setForm({ ...form, kind: e.target.value as Datasource['kind'], port: e.target.value === 'mysql' ? '3306' : '5432' })}><option value="sqlite">SQLite</option><option value="postgresql">PostgreSQL</option><option value="mysql">MySQL</option></select></label></div>{form.kind === 'sqlite' ? <label>数据库文件<div className="input-action"><input required value={form.path} onChange={e => setForm({ ...form, path: e.target.value })} placeholder="选择 .sqlite / .db 文件"/><button type="button" className="icon-button" aria-label="选择数据库文件" title="选择文件" onClick={() => { void window.businessmap?.chooseFile().then(path => { if (path) setForm(previous => previous ? { ...previous, path } : null); }).catch(err => setFormError(errorMessage(err))); }}><FolderOpen size={17}/></button></div></label> : <><div className="form-columns"><label>主机<input required value={form.host} onChange={e => setForm({ ...form, host: e.target.value })}/></label><label>端口<input required type="number" min={1} max={65535} value={form.port} onChange={e => setForm({ ...form, port: e.target.value })}/></label></div><label>数据库名<input required value={form.database} onChange={e => setForm({ ...form, database: e.target.value })}/></label><div className="form-columns"><label>只读用户名<input required value={form.username} onChange={e => setForm({ ...form, username: e.target.value })} autoComplete="off"/></label><label>密码<input type="password" value={form.password} onChange={e => setForm({ ...form, password: e.target.value })} autoComplete="new-password"/></label></div></>}<label>允许访问的表 <span className="muted">（可选，逗号分隔）</span><input value={form.allowed} onChange={e => setForm({ ...form, allowed: e.target.value })} placeholder="orders, refunds"/></label></fieldset><p className="form-hint">平台会校验 SQL 并使用数据库只读保护。远程数据库还需配置只读账号。</p>{formError && <p className="form-error" role="alert">{formError}</p>}<div className="modal-actions"><button type="button" className="button" onClick={() => setForm(null)} disabled={Boolean(busy)}>取消</button><button className="button primary" disabled={Boolean(busy) || !form.name.trim()}>{busy === 'add' ? '保存中…' : '添加数据源'}</button></div></form></Modal>}
+    {reportResult && <Modal title="生成业务报表" busy={Boolean(busy)} onClose={() => { if (!busyRef.current) setReportResult(null); }}><form className="form-stack" onSubmit={createReport}><label>报表标题<input autoFocus required maxLength={160} disabled={Boolean(busy)} value={reportTitle} onChange={e => setReportTitle(e.target.value)}/></label><label>呈现方式<select disabled={Boolean(busy)} value={chart} onChange={e => setChart(e.target.value as Report['chart_type'])}><option value="bar">柱状图与数据表</option><option value="line">趋势图与数据表</option><option value="table">数据表</option></select></label><p className="form-hint">保存本次查询的 {reportResult.row_count} 行结果快照和原 SQL。{reportResult.truncated ? '此查询已截断，报表将保留当前部分数据。' : '数字列用于绘图，原始数据始终保留。'}</p>{reportError && <p className="form-error" role="alert">{reportError} 配置和查询结果已保留，可重试保存。</p>}<div className="modal-actions"><button type="button" className="button" disabled={Boolean(busy)} onClick={() => setReportResult(null)}>取消</button><button className="button primary" disabled={Boolean(busy) || !reportTitle.trim()}>{busy === 'report' ? '生成中…' : reportError ? '重试保存' : '生成报表'}</button></div></form></Modal>}
+  </div>;
+}
+function CodeLabel() { return <span className="code-label">SQL</span>; }

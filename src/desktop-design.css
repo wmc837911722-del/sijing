@@ -1,0 +1,150 @@
+/* Shared desktop materials and controls. Layout lives in workspace.css;
+   feature styles consume the same tokens without external assets or fonts. */
+body { background: var(--chrome); }
+button, a, input, textarea, select, summary { -webkit-tap-highlight-color: transparent; }
+button { transition: background var(--motion-fast) var(--ease-out), color var(--motion-fast), border-color var(--motion-fast), box-shadow var(--motion-fast); }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible,
+textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+button:disabled { opacity: .45; box-shadow: none; }
+svg { stroke-width: 1.65; }
+input, select, textarea { border-radius: var(--radius-sm); }
+code, pre, .sql-editor, .cm-editor { font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace; font-variant-ligatures: none; }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background-color: color-mix(in srgb, var(--muted) 34%, transparent); border: 3px solid transparent; border-radius: 8px; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+
+/* A consistent control hierarchy, including controls inside native dialogs. */
+.workspace-shell .button, .button {
+  min-height: 36px; padding: 8px 14px; gap: 7px; border-radius: var(--radius-sm);
+  border-color: var(--line); background: var(--surface); font-size: 12px; font-weight: 500;
+  box-shadow: var(--shadow-sm), inset 0 1px 0 var(--control-highlight);
+}
+.workspace-shell .button.compact { min-height: 32px; padding: 6px 11px; }
+.button:hover:not(:disabled) { background: var(--panel-2); border-color: color-mix(in srgb, var(--line-strong) 35%, transparent); }
+.button:active:not(:disabled) { background: var(--raised); box-shadow: inset 0 1px 3px var(--shadow); }
+.workspace-shell .button.primary, .button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); box-shadow: 0 1px 2px var(--shadow); }
+.button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+.workspace-shell .button.accent { background: var(--accent-soft); color: var(--text); border-color: transparent; }
+.icon-button { width: 32px; height: 32px; border-radius: var(--radius-sm); }
+.icon-button:hover:not(:disabled) { background: var(--accent-soft); }
+.icon-button.selected { background: var(--active-surface); box-shadow: var(--shadow-sm); border: 1px solid var(--line); }
+.badge, .badge.green, .badge.amber, .demo-indicator, .type-label {
+  font-size: 11px; line-height: 1.5; font-weight: 500; padding: 4px 9px;
+  border-radius: 7px; border-color: var(--line); background: var(--panel-2); color: var(--muted);
+}
+.connection-dot { width: 5px; height: 5px; box-shadow: none; opacity: .8; }
+.toggle { width: 34px; height: 20px; padding: 2px; border-color: var(--line); background: var(--raised); }
+.toggle i { width: 14px; height: 14px; background: var(--text); box-shadow: 0 1px 3px #00000020; }
+.toggle.on i { transform: translateX(14px); }
+
+.modal { width: 500px; border-radius: 20px; border-color: var(--line); background: var(--surface); box-shadow: var(--shadow-lg); }
+.modal.wide { width: 680px; }
+.modal[open] { animation: desktop-sheet-in 180ms var(--ease-out) both; }
+.modal::backdrop { background: var(--overlay); backdrop-filter: blur(7px); }
+.modal-surface > header { position: sticky; top: 0; z-index: 2; padding: 22px 26px 18px; border-bottom-color: var(--line-soft); background: var(--surface); }
+.modal-surface > header h2 { font-size: 17px; font-weight: 600; letter-spacing: -.35px; }
+.modal-surface > header .icon-button { background: var(--panel-2); border-radius: 50%; width: 28px; height: 28px; }
+.form-stack { padding: 22px 26px 24px; gap: 20px; }
+.form-stack label { font-size: 12px; font-weight: 500; }
+.form-stack input, .form-stack select { background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-sm); min-height: 38px; box-shadow: inset 0 1px 1px #00000002; }
+.form-stack input:focus, .form-stack select:focus { background: var(--input); border-color: var(--line-strong); }
+.form-stack .input-action { background: var(--panel-2); border-radius: var(--radius-sm); }
+.form-stack .input-action input { background: transparent; box-shadow: none; }
+.form-hint { font-weight: 400; color: var(--muted); }
+.form-error, .error-box { border-radius: var(--radius-sm); border-color: var(--line-strong); background: var(--panel-2); }
+.modal-actions { padding-top: 8px; gap: 8px; }
+.toast, .toast.info, .toast.error { bottom: 40px; padding: 12px 14px 12px 18px; background: var(--material); border-color: var(--line); border-radius: var(--radius-md); box-shadow: var(--shadow-md); backdrop-filter: blur(16px); font-size: 13px; }
+.empty-state { min-height: 260px; padding: 36px 24px; }
+.empty-symbol { width: 56px; height: 56px; border-radius: 16px; border-color: var(--line); color: var(--text); background: var(--panel-2); box-shadow: inset 0 1px 0 var(--control-highlight); }
+.empty-state h3 { font-size: 16px; font-weight: 600; letter-spacing: -.2px; }
+.empty-state p { max-width: 360px; font-size: 13px; line-height: 1.8; }
+
+/* The knowledge workspace is a quiet reading surface, with tools at its edges. */
+.map-layout > .knowledge-sidebar, .map-layout > .right-panel { background: var(--sidebar); border-color: var(--line); }
+.map-layout .vault-heading { gap: 8px; padding: 22px 14px 18px; }
+.map-layout .vault-icon { width: 30px; height: 32px; border-radius: 9px; background: var(--surface); box-shadow: var(--shadow-sm); }
+.map-layout .vault-heading strong { font-size: 12px; }
+.map-layout .vault-heading span { font-size: 10px; }
+.knowledge-search { height: 34px; padding: 0 9px; border-radius: 9px; background: var(--surface); margin: 0 12px 20px; }
+.knowledge-search input { font-size: 12px; }
+.knowledge-search kbd { padding: 0 3px; font-size: 10px; background: transparent; border: 0; }
+.explorer-caption { letter-spacing: .15px; font-size: 11px; margin: 0 16px 9px; }
+.folder-row { padding: 7px 5px; font-size: 12px; border-radius: 6px; }
+.folder-children { border-left-color: var(--line); margin-left: 8px; padding-left: 6px; }
+.file-row { border-radius: 7px; min-height: 34px; padding: 7px 8px; gap: 7px; }
+.file-row.active { background: var(--active-surface); box-shadow: var(--shadow-sm); font-weight: 500; }
+.active-file-dot { width: 3px; height: 3px; }
+.sidebar-tags { padding: 15px 14px; }
+.sidebar-tags button:not(.text-button) { border-radius: 6px; background: var(--surface); padding: 3px 6px; font-size: 11px; }
+.vault-summary { padding: 13px 15px; font-size: 11px; }
+.vault-summary > button { font-size: 11px; width: 100%; }
+.vault-summary > button svg:last-child { margin-left: auto; }
+.map-main { background: var(--surface); }
+.map-main .workspace-tabs { padding: 6px 10px; gap: 4px; height: 42px; min-height: 42px; background: var(--sidebar); border-bottom: 1px solid var(--line); }
+.workspace-tab { min-width: 112px; max-width: 185px; border: 1px solid transparent; border-radius: 7px; }
+.workspace-tab.active { border-color: var(--line); background: var(--surface); box-shadow: var(--shadow-sm); }
+.workspace-tab.active:before { display: none; }
+.workspace-tab > button:first-child { padding: 0 9px; font-size: 11px; gap: 6px; }
+.workspace-tab .tab-close { margin-right: 3px; padding: 4px; border-radius: 4px; }
+.workspace-tabs .new-tab { margin: 0; width: 26px; height: 26px; }
+.workspace-tabs .demo-indicator { font-size: 10px; padding: 2px 6px; margin: 0 4px; border: 0; background: none; }
+.document-toolbar { min-height: 50px; padding: 10px 22px; border-bottom-color: var(--line-soft); }
+.document-toolbar .toolbar-actions { gap: 4px; }
+.document-toolbar .toolbar-actions .icon-button { width: 28px; height: 28px; }
+.breadcrumb { font-size: 11px; }
+.map-main .note-article { max-width: 820px; padding: 36px clamp(24px, 3.2vw, 52px) 26px; }
+.note-topline { gap: 8px; margin-bottom: 14px; }
+.note-meta { font-size: 11px; gap: 12px; margin-bottom: 26px; }
+.map-main .markdown { font-size: 14px; line-height: 1.95; }
+.map-main .markdown h1 { font-size: 29px; line-height: 1.45; letter-spacing: -.7px; margin-bottom: 24px; font-weight: 650; }
+.map-main .markdown h2 { font-size: 19px; letter-spacing: -.3px; margin-top: 34px; border-bottom-color: var(--line-soft); }
+.map-main .markdown h3 { font-size: 15px; }
+.markdown blockquote { border-left: 2px solid var(--line-strong); background: var(--panel-2); border-radius: 0 9px 9px 0; padding: 14px 18px; }
+.markdown pre { border-radius: 10px; background: var(--code-bg); border-color: var(--line); }
+.markdown table { width: max-content; max-width: 100%; border-radius: 9px; font-size: 12px; }
+.markdown th { background: var(--panel-2); font-weight: 600; }
+.markdown th, .markdown td { padding: 10px 13px; border-color: var(--line); }
+.wiki-link { border-radius: 4px; padding: 1px 4px; border-bottom-color: var(--line); }
+.related-section { margin-top: 36px; padding-top: 24px; border-top-color: var(--line); }
+.related-note { padding: 14px; border-radius: 10px; background: var(--panel-2); border-color: var(--line); }
+.related-note:hover { background: var(--surface); box-shadow: var(--shadow-sm); }
+.document-bottom { height: 29px; padding: 0 18px; font-size: 10px; background: var(--surface); }
+.map-context-heading { min-height: 55px; padding: 14px 16px; font-size: 11px; font-weight: 500; }
+.context-section { padding: 20px 16px; }
+.context-section h3 { font-size: 11px; letter-spacing: .1px; margin-bottom: 14px; }
+.outline-item { border-left: 0; border-radius: 6px; padding-top: 7px; padding-bottom: 7px; }
+.backlink-card, .source-card { background: var(--surface); border-radius: 9px; border-color: var(--line); padding: 12px; }
+.backlink-card:hover { box-shadow: var(--shadow-sm); }
+.backlink-card p, .context-empty, .context-tip { font-size: 11px; line-height: 1.9; }
+.count-pill { border-radius: 5px; font-size: 10px; padding: 1px 6px; }
+
+.map-main .graph-head { padding: 28px 28px 22px; gap: 16px; }
+.graph-head h1 { font-size: 25px; letter-spacing: -.65px; }
+.graph-head p { font-size: 12px; }
+.graph-head .search-input { border-radius: 9px; background: var(--panel-2); }
+.graph-view .graph-controls { z-index: 6; border-radius: 10px; padding: 4px; background: var(--material); border-color: var(--line); box-shadow: var(--shadow-md); backdrop-filter: blur(12px); }
+.graph-view .graph-controls .icon-button { width: 30px; height: 30px; border-radius: 6px; }
+.graph-view.local { border-radius: 10px; background: var(--surface); border-color: var(--line); }
+.graph-view .graph-legend { bottom: 21px; gap: 10px; }
+.graph-legend span { font-size: 11px; }
+.graph-footer { font-size: 11px; border-color: var(--line); background: var(--surface); }
+.tour-launcher { border-color: var(--line); border-radius: 9px; background: var(--surface); }
+.tour-card { border-radius: 18px; background: var(--surface); border-color: var(--line); box-shadow: var(--shadow-lg); }
+.tour-result { border-radius: 10px; }
+.tour-card h2 { font-weight: 650; }
+
+@keyframes desktop-sheet-in { from { opacity: 0; transform: translateY(5px) scale(.99); } to { opacity: 1; transform: none; } }
+@media (max-width: 1200px) {
+  .map-main .note-article { padding: 28px 24px; }
+  .map-main .markdown h1 { font-size: 26px; }
+  .map-main .graph-head { padding: 22px 22px 16px; }
+  .map-layout .vault-heading { padding-left: 11px; padding-right: 10px; }
+  .map-layout .vault-icon { display: none; }
+  .context-section { padding: 18px 13px; }
+  .document-toolbar { padding-left: 16px; padding-right: 14px; }
+}
+@media (prefers-reduced-transparency: reduce) {
+  .modal::backdrop { backdrop-filter: none; }
+  .toast, .graph-view .graph-controls { backdrop-filter: none; background: var(--surface); }
+}
+@media (prefers-reduced-motion: reduce) { .modal[open] { animation: none; } }

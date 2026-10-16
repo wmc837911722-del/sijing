@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <rect width="1600" height="1000" fill="#f3f3f5"/>
+  <g font-family="Segoe UI,Microsoft YaHei UI,Microsoft YaHei,sans-serif">
+    <text x="104" y="93" fill="#777780" font-size="19" letter-spacing="3">SIJING / BRAND DIRECTION 01</text>
+    <text x="104" y="203" fill="#222226" font-size="76" font-weight="600">思径</text>
+    <text x="284" y="201" fill="#777780" font-size="42" font-weight="400">Sijing</text>
+    <text x="104" y="260" fill="#66666e" font-size="26">看懂业务，找到依据。</text>
+    <rect x="104" y="326" width="680" height="528" rx="32" fill="#e9e9ed"/>
+    <rect x="816" y="326" width="680" height="528" rx="32" fill="#202023"/>
+    <svg x="273" y="377" width="342" height="342" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#28282c" stroke="#45454a" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#f7f7f9" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#f7f7f9"/></svg>
+    <svg x="985" y="377" width="342" height="342" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#f5f5f7" stroke="#e0e0e5" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#29292e" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#29292e"/></svg>
+    <text x="444" y="774" text-anchor="middle" fill="#333338" font-size="24" font-weight="500">石墨</text>
+    <text x="1156" y="774" text-anchor="middle" fill="#f0f0f3" font-size="24" font-weight="500">银白</text>
+    <text x="444" y="811" text-anchor="middle" fill="#74747c" font-size="16">一条思路，有迹可循</text>
+    <text x="1156" y="811" text-anchor="middle" fill="#a3a3ad" font-size="16">同一轮廓，适配浅深界面</text>
+    <text x="104" y="930" fill="#72727b" font-size="18">代码 · 业务地图 · 问答 · 只读数据</text>
+    <g transform="translate(1220 892)">
+      <svg x="0" y="18" width="24" height="24" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#28282c" stroke="#45454a" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#f7f7f9" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#f7f7f9"/></svg>
+      <svg x="52" y="10" width="32" height="32" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#28282c" stroke="#45454a" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#f7f7f9" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#f7f7f9"/></svg>
+      <svg x="112" y="-6" width="48" height="48" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#28282c" stroke="#45454a" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#f7f7f9" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#f7f7f9"/></svg>
+      <svg x="188" y="-22" width="64" height="64" viewBox="0 0 1024 1024"><rect x="48" y="48" width="928" height="928" rx="220" fill="#28282c" stroke="#45454a" stroke-width="2"/><path d="M708 272H458C365 272 310 324 310 394C310 461 359 499 443 514L586 540C665 554 713 589 713 648C713 714 659 752 570 752H422" fill="none" stroke="#f7f7f9" stroke-width="76" stroke-linecap="round" stroke-linejoin="round"/><circle cx="308" cy="752" r="40" fill="#f7f7f9"/></svg>
+    </g>
+  </g>
+</svg>

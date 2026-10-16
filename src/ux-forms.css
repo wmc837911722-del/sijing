@@ -1,0 +1,21 @@
+.form-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.form-fields:disabled input,
+.form-fields:disabled select,
+.form-fields:disabled textarea { cursor: wait; color: var(--muted); }
+.modal[aria-busy='true'] .modal-surface > header { color: var(--muted); }
+.repo-card { min-width: 0; }
+.repo-card h3 { overflow-wrap: anywhere; }
+.repo-meta > span { min-width: 0; }
+.repo-meta > .repo-branch { flex: 1; }
+.repo-branch > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-meta > .repo-commit { flex-shrink: 0; white-space: nowrap; }
+.task-row small { overflow-wrap: anywhere; }
+.task-row > .muted { white-space: nowrap; flex-shrink: 0; }
