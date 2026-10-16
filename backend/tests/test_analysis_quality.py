@@ -496,7 +496,10 @@ def test_overview_filters_only_prose_links_without_changing_metadata_or_verified
     model(monkeypatch, response)
     tools.analyze(repo["id"])
     overview = tools.store.read_note(paths["overview"])["content"]
-    assert literal in overview
+    assert literal not in overview  # The map navigates topics; source opens on demand.
+    current_commit = tools.store.get_repository(repo["id"])["commit"]
+    evidence = tools.source_evidence(f"source://{repo['id']}/{current_commit}/{PATH}#L2-L2")
+    assert literal in evidence["content"]
     assert literal in tools.store.read_note(paths["rules"])["content"]
     assert yaml.safe_load(overview.split("---", 2)[1])["title"] == "[[原始标题]]"
     assert "主题实体待确认。" in overview

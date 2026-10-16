@@ -472,7 +472,7 @@ class ToolsService:
                         "source_paths": list(dict.fromkeys(s["path"] for s in checked))}
                 refs = []
                 for source in checked:
-                    refs.append(render_excerpt(source, context["commit"], repo_id))
+                    refs.append(render_excerpt(source, context["commit"], repo_id, include_excerpt=note["key"] != "overview"))
                 header = "---\n" + yaml.safe_dump(meta, allow_unicode=True, sort_keys=False) + "---\n\n"
                 rendered = header + content.strip() + "\n\n## 代码依据\n\n" + "\n".join(refs)
                 rendered += "\n\n> 证据边界：以上仅核实代码原文与位置；接口、签名及注释不证明具体实现，业务含义仍需人工核验。"

@@ -176,14 +176,14 @@ def verify_sources(sources, files, note_key=None):
     return checked
 
 
-def render_excerpt(source, commit, repository_id):
+def render_excerpt(source, commit, repository_id, include_excerpt=True):
     excerpt = source["excerpt"]
     fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", excerpt)), default=3))
     reference = (f"source://{quote(repository_id, safe='')}/{commit}/{quote(source['path'], safe='/')}"
                  f"#L{source['line_start']}-L{source['line_end']}")
     label = source["path"].replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-    return (f"- [{label}]({reference}) · L{source['line_start']}–L{source['line_end']} · commit `{commit}`\n\n"
-            f"{fence}text\n{excerpt}\n{fence}")
+    link = f"- [{label}]({reference}) · L{source['line_start']}–L{source['line_end']} · commit `{commit}`"
+    return link + (f"\n\n{fence}text\n{excerpt}\n{fence}" if include_excerpt else "")
 
 
 @contextmanager
