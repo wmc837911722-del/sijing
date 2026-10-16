@@ -253,3 +253,67 @@ def test_import_aborts_before_publish_if_another_process_changes_the_selected_va
             assert db.execute("SELECT count(*) FROM managed_notes").fetchone()[0] == 0
     finally:
         other.close()
+
+
+def test_note_read_does_not_scan_all_notes_for_every_dangling_link(store):
+    vault = store.vault
+    (vault / "target.md").write_text("# Target\nBusiness rule.\n", encoding="utf-8")
+    (vault / "backlink.md").write_text("# Backlink\n[[Target]]\n", encoding="utf-8")
+    for index in range(600):
+        (vault / f"note-{index}.md").write_text(f"# Note {index}\n", encoding="utf-8")
+    raw = vault / "00-Inbox" / "代码资料" / "repo"
+    raw.mkdir(parents=True)
+    for version in range(6):
+        (raw / f"版本-{version}.md").write_text(
+            "# Historical source list\n" + "\n".join(f"[[missing/{version}-{index}]]" for index in range(400)),
+            encoding="utf-8")
+    store.refresh()
+
+    class MeasuredNotes(dict):
+        visited = 0
+
+        def items(self):
+            for entry in super().items():
+                self.visited += 1
+                yield entry
+
+    measured = MeasuredNotes(store._cache)
+    store._cache = measured
+    started = time.monotonic()
+    note = store.read_note("target.md")
+    elapsed = time.monotonic() - started
+    assert note["links"] == []
+    assert [item["path"] for item in note["backlinks"]] == ["backlink.md"]
+    print(f"608-note read with 2400 dangling links: {elapsed:.3f}s, {measured.visited} scanned note entries")
+    assert measured.visited <= len(measured) * 3, "Each unresolved link scanned the entire vault again"
+
+
+def test_link_lookup_preserves_priority_ambiguity_and_tracks_external_changes(store, tmp_path):
+    vault = store.vault
+    (vault / "folder").mkdir()
+    (vault / "other").mkdir()
+    (vault / "root.md").write_text("# Root\n", encoding="utf-8")
+    (vault / "folder" / "relative.md").write_text("# Relative\n", encoding="utf-8")
+    (vault / "other" / "root.md").write_text("# Root\n", encoding="utf-8")
+    (vault / "folder" / "hub.md").write_text("# Hub\n[[root]] [[relative]] [[#section]] [[Alias]]\n", encoding="utf-8")
+    (vault / "other" / "unique.md").write_text("# Alias\n", encoding="utf-8")
+    hub = store.read_note("folder/hub.md")
+    assert {note["path"] for note in hub["links"]} == {"root.md", "folder/relative.md", "folder/hub.md", "other/unique.md"}
+    (vault / "other" / "duplicate.md").write_text("# Alias\n", encoding="utf-8")
+    assert "other/unique.md" not in {note["path"] for note in store.read_note("folder/hub.md")["links"]}
+    (vault / "other" / "duplicate.md").write_text("# Different alias\n", encoding="utf-8")
+    (vault / "other" / "unique.md").rename(vault / "other" / "renamed.md")
+    links = {note["path"] for note in store.read_note("folder/hub.md")["links"]}
+    assert "other/renamed.md" in links and "other/unique.md" not in links
+    assert store.read_note("other/renamed.md")["backlinks"][0]["path"] == "folder/hub.md"
+    selected = tmp_path / "selected-vault"
+    selected.mkdir()
+    (selected / "hub.md").write_text("# New hub\n[[Alias]]\n", encoding="utf-8")
+    other = Store(store.data_dir)
+    try:
+        other.open_vault(str(selected))
+        assert store.read_note("hub.md")["links"] == []
+        (selected / "new.md").write_text("# Alias\n", encoding="utf-8")
+        assert [note["path"] for note in store.read_note("hub.md")["links"]] == ["new.md"]
+    finally:
+        other.close()

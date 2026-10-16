@@ -128,13 +128,17 @@ def test_analysis_failure_is_persisted_safely_and_success_clears_it(analysis, mo
         tools.analyze(repo["id"])
     state = tools.store.config_get(f"ai_analysis_status:{repo['id']}")
     assert state["status"] == "failed" and state["category"] == "citation"
+    assert state["error_details"]["reason_code"] == "quote_not_found"
+    assert state["error_details"]["file_index"] == 1
+    assert state["error_details"]["source_index"] == 1
+    assert state["error_details"]["note_key"] == "rules"
     assert "PRIVATE" not in json.dumps(state) and "secret" not in json.dumps(state)
     assert CODE not in json.dumps(state)
     assert len(requests) == 1
     model(monkeypatch, answer())
     tools.analyze(repo["id"])
     restored = tools.store.config_get(f"ai_analysis_status:{repo['id']}")
-    assert restored["status"] == "completed" and "category" not in restored
+    assert restored["status"] == "completed" and "category" not in restored and "error_details" not in restored
     assert restored["scope"]["files"] == 1
 
 
@@ -149,6 +153,44 @@ def test_missing_quote_and_ambiguous_quote_fail_closed(analysis, monkeypatch):
     with pytest.raises(ToolError):
         tools.analyze(repo["id"])
     assert_no_business_output(tools, repo["id"])
+
+
+def test_model_can_cite_only_a_current_request_evidence_id(analysis, monkeypatch):
+    tools, repo = analysis
+    def reply(payload):
+        supplied = json.loads(payload["messages"][-1]["content"])
+        evidence = supplied["files"][0]["evidence"]
+        assert sum(len(item["quote"]) for item in evidence) <= 300
+        assert evidence[0]["quote"] in CODE
+        response = answer()
+        response["notes"][0]["sources"] = [{"evidence_id": evidence[0]["evidence_id"]}]
+        return response
+    requests = model(monkeypatch, reply)
+    tools.analyze(repo["id"])
+    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
+    assert "return amount > 0;" in note and "L3–L3" in note
+    assert len(requests) == 1
+
+
+def test_unknown_evidence_id_is_rejected_with_safe_reason(analysis, monkeypatch):
+    tools, repo = analysis
+    response = answer()
+    response["notes"][0]["sources"] = [{"evidence_id": "not-in-this-request"}]
+    model(monkeypatch, response)
+    with pytest.raises(ToolError):
+        tools.analyze(repo["id"])
+    state = tools.store.config_get(f"ai_analysis_status:{repo['id']}")
+    assert state["error_details"]["reason_code"] == "unknown_evidence_id"
+    assert_no_business_output(tools, repo["id"])
+
+
+def test_native_evidence_id_retains_its_known_position_for_repeated_same_line_text():
+    from businessmap.analysis_output import prepare_file, verify_sources
+    content = ("return amount > 0; " * 60).rstrip() + "\n"
+    supplied, _ = prepare_file({"path": PATH, "content": content}, 6000, 37000)
+    candidate = supplied["evidence"][0]
+    checked = verify_sources([{"evidence_id": candidate["evidence_id"]}], [supplied])
+    assert checked == [{"path": PATH, "line_start": 1, "line_end": 1, "excerpt": content.rstrip("\n")}]
 
 
 def test_failed_provider_records_safe_summary_and_does_not_retry(analysis, monkeypatch):

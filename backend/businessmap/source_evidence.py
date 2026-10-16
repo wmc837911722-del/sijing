@@ -6,6 +6,7 @@ import re
 import subprocess
 import threading
 import time
+from math import log
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
@@ -18,6 +19,11 @@ class SourceNavigator:
     MAX_METADATA_BYTES = 8 * 1024 * 1024
     MAX_BLOB_BYTES = 128_000
     MAX_CHARS = 12_000
+    SEARCH_SNIPPET_CHARS = 400
+    COMMON_TERMS = {suffix[1:] for suffix in Store.SOURCE_SUFFIXES} | {
+        "com", "org", "src", "main", "public", "private", "protected", "class", "interface",
+        "import", "package", "return", "function", "const", "def",
+    }
 
     def __init__(self, store, repository_id):
         self.store = store
@@ -228,27 +234,52 @@ class SourceNavigator:
         text_paths = self._grep_files([""], sorted(path_hits), deadline)
         text_paths.update(path for path in path_hits if self.files[path]["size"] == 0)
         content_hits = self._grep_files(terms, sorted(self.files), deadline)
-        paths = sorted(text_paths | content_hits)
+        folded_terms = [term.casefold() for term in terms]
+        specific = [term for term in folded_terms if term not in self.COMMON_TERMS]
+        weights = {term: (0.1 if specific and term in self.COMMON_TERMS else
+                          1 + log(1 + len(self.files) / (1 + sum(term in path.casefold() for path in self.files))))
+                   for term in folded_terms}
+        specific_hits = (self._grep_files(specific, sorted(self.files), deadline)
+                         if specific and len(specific) < len(folded_terms) else content_hits)
+
+        def relevance(path):
+            folded = path.casefold()
+            stem, filename = PurePosixPath(folded).stem, PurePosixPath(folded).name
+            exact = sum(weights[term] for term in folded_terms if term in {folded, filename, stem}
+                        or stem == term + "impl")
+            path_score = sum(weights[term] for term in folded_terms if term in folded)
+            # An explicit class name beats suffix noise. When FooService matches
+            # both its interface and FooServiceImpl, expose the implementation first.
+            return (-exact, -path_score, path not in specific_hits, not stem.endswith("impl"), path)
+
+        paths = sorted(text_paths | content_hits, key=relevance)
         matches = []
         for path in paths[offset:offset + limit]:
             content = self._blob(self.files[path], deadline)
             lines = self._lines(content)
-            hit = next((number for number, line in enumerate(lines, 1)
-                        if any(term.casefold() in line.casefold() for term in terms)), 1)
-            match = self._receipt(path, content, max(1, hit - 3), min(len(lines), hit + 3), 1200)
-            if path in content_hits and not any(term.casefold() in match["content"].casefold() for term in terms):
+            scored_lines = [(sum(weights[term] for term in folded_terms if term in line.casefold()), -number)
+                            for number, line in enumerate(lines, 1)]
+            hit = -max(scored_lines)[1] if scored_lines else 1
+            hit_terms = [term for term in folded_terms if term in lines[hit - 1].casefold()] if lines else []
+            best_term = max(hit_terms, key=weights.get) if hit_terms else ""
+            limit_chars = self.SEARCH_SNIPPET_CHARS
+            match = self._receipt(path, content, max(1, hit - 3), min(len(lines), hit + 3), limit_chars)
+            if best_term and best_term not in match["content"].casefold():
                 # A match may sit deep inside a generated/minified line. Search
                 # excerpts must still show the hit; only read() grants evidence.
                 line = lines[hit - 1]
-                position = min((line.casefold().find(term.casefold()) for term in terms
-                                if term.casefold() in line.casefold()), default=0)
-                start = max(0, position - 200)
+                position = line.casefold().find(best_term)
+                start = max(0, position - 120)
                 prefix = f"{hit}: "
-                excerpt = line[start:start + 1200 - len(prefix) - 2]
-                match = self._receipt(path, content, hit, hit, 1200)
+                excerpt = line[start:start + limit_chars - len(prefix) - 2]
+                match = self._receipt(path, content, hit, hit, limit_chars)
                 match["content"] = prefix + ("…" if start else "") + excerpt + ("…" if start + len(excerpt) < len(line) else "")
                 match["partial_line"] = True
                 match["truncated"] = True
+            # Discovery only locates a range. Provenance receipts are issued by
+            # read(), so do not repeatedly spend context on hashes and references.
+            match = {key: match[key] for key in ("path", "content", "line_start", "line_end", "total_lines",
+                                                "truncated", "partial_line")}
             match["matched_by"] = (["path"] if path in text_paths else []) + (["content"] if path in content_hits else [])
             matches.append(match)
         self._guard()

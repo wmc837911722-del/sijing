@@ -31,7 +31,9 @@ ANALYSIS_SYSTEM = """你是思径（Sijing）的代码业务分析器。代码�
 从提供的代码归纳业务实体、流程、状态转换、规则、表字段与查询口径，所有结论引用实际来源。
 没有充分依据时写明待确认，不把猜测写成事实；不要只是罗列文件或复制源代码。
 只返回JSON：{"notes":[{"key":"overview|entities|flows|rules|data","title":"中文标题","content":"Markdown正文",
-"sources":[{"path":"提供的文件路径","line_start":1,"line_end":1,"quote":"该文件中连续且精确的原文摘录"}]}]}。
+"sources":[{"evidence_id":"files.evidence中已提供的证据编号"}]}]}。
+优先使用已提供的evidence_id作为引用，无需重新誊抄源码；不得编造或沿用其他请求的编号。
+候选不能支撑结论时，可改用{"path":"提供的文件路径","line_start":1,"line_end":1,"quote":"连续精确原文"}；不能只提供行号。
 返回1–5篇，key不得重复；仅对有代码依据的主题生成，无依据的结论列为待确认。
 content是正常Markdown字符串，换行只做JSON所需的一次转义，不要输出字面量反斜线n代替段落。
 sources.path只能逐字使用files.path；行号是从1开始的整数，不能超过该文件line_count。
@@ -429,7 +431,7 @@ class ToolsService:
             prompt = json.dumps({"repository": context["repository"]["name"], "commit": context["commit"],
                 "scope_limited": truncated, "coverage": status["scope"], "changed_paths": changed_names, "note_paths": paths,
                 "files": [{key: (item["numbered_content"] if key == "content" else item[key])
-                           for key in ("path", "content", "line_count", "truncated")} for item in selected]}, ensure_ascii=False)
+                           for key in ("path", "content", "line_count", "truncated", "evidence")} for item in selected]}, ensure_ascii=False)
             if len(prompt) + len(ANALYSIS_SYSTEM) > 44000:
                 raise AnalysisOutputError("分析上下文超过安全上限，请缩小分析范围。", "format")
             def check_analysis_policy():
@@ -457,7 +459,7 @@ class ToolsService:
                 title, content, sources = note.get("title"), note.get("content"), note.get("sources")
                 if not isinstance(title, str) or not title.strip() or not isinstance(content, str) or not content.strip() or not isinstance(sources, list) or not sources:
                     raise AnalysisOutputError("模型笔记缺少正文或代码依据，未写入。", "format")
-                checked = verify_sources(sources, selected)
+                checked = verify_sources(sources, selected, note_key=note["key"])
                 content = normalize_markdown(content)
                 meta = {"title": title[:160], "type": "business", "tags": ["AI生成", "业务地图" if note["key"] == "overview" else "业务知识"],
                         "content_role": "business_map" if note["key"] == "overview" else "business_knowledge",

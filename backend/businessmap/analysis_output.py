@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import re
 from urllib.parse import quote
@@ -11,9 +12,10 @@ from .providers import ToolError
 
 
 class AnalysisOutputError(ToolError):
-    def __init__(self, message, category="citation"):
+    def __init__(self, message, category="citation", details=None):
         super().__init__(message, 502)
         self.category = category
+        self.details = details
 
 
 def _source_lines(content):
@@ -24,13 +26,27 @@ def _source_lines(content):
     return [line.removesuffix("\r") for line in lines]
 
 
+def _evidence(path, lines):
+    meaningful = [(index, line.strip()) for index, line in enumerate(lines, 1)
+                  if line.strip() and not line.lstrip().startswith(("//", "#", "*", "/*", "import ", "package ", "from "))
+                  and line.strip() not in {"{", "}", "};"}]
+    if not meaningful:
+        return []
+    first, text = next(((index, line) for index, line in meaningful
+                        if re.search(r"\b(return|if|raise|throw|case|assert)\b", line)), meaningful[0])
+    snippet = text[:300]
+    identifier = hashlib.sha256(f"{path}\0{first}\0{snippet}".encode()).hexdigest()[:24]
+    return [{"evidence_id": "e_" + identifier, "path": path, "line_start": first, "line_end": first, "quote": snippet}]
+
+
 def prepare_file(item, limit, wire_budget):
     content = item["content"][:limit]
     while content:
         lines = _source_lines(content)
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(lines, 1))
         exposed = {"path": item["path"], "content": numbered, "line_count": len(lines),
-                   "truncated": len(content) < len(item["content"]) or bool(item.get("truncated", False))}
+                   "truncated": len(content) < len(item["content"]) or bool(item.get("truncated", False)),
+                   "evidence": _evidence(item["path"], lines)}
         size = len(json.dumps(exposed, ensure_ascii=False))
         if size <= wire_budget:
             return {**exposed, "content": content, "numbered_content": numbered}, size
@@ -75,30 +91,60 @@ def normalize_markdown(text):
     return "".join(pieces)
 
 
-def verify_sources(sources, files):
+def verify_sources(sources, files, note_key=None):
     available = {item["path"]: item["content"] for item in files}
+    file_indices = {item["path"]: index for index, item in enumerate(files, 1)}
+    candidates = {candidate["evidence_id"]: candidate for item in files for candidate in item.get("evidence", [])}
     checked = []
-    for source in sources:
+    for source_index, source in enumerate(sources, 1):
+        if isinstance(source, dict) and "evidence_id" in source:
+            identifier = source["evidence_id"]
+            candidate = candidates.get(identifier) if isinstance(identifier, str) else None
+            if candidate is None:
+                raise AnalysisOutputError("模型引用了本次请求未提供的证据编号，未写入。", details={
+                    "reason_code": "unknown_evidence_id", "note_key": note_key, "source_index": source_index})
+            if any(key in source and (type(source[key]) is not type(candidate[key]) or source[key] != candidate[key])
+                   for key in ("path", "line_start", "line_end", "quote")):
+                raise AnalysisOutputError("模型证据编号与引用坐标不一致，未写入。", details={
+                    "reason_code": "inconsistent_evidence_id", "note_key": note_key, "source_index": source_index})
+            lines = _source_lines(available[candidate["path"]])
+            first, last = candidate["line_start"], candidate["line_end"]
+            checked.append({"path": candidate["path"], "line_start": first, "line_end": last,
+                            "excerpt": "\n".join(lines[first - 1:last])})
+            continue
         path = source.get("path") if isinstance(source, dict) else None
+        quote = source.get("quote") if isinstance(source, dict) else None
+        details = {"source_index": source_index}
+        if note_key in {"overview", "entities", "flows", "rules", "data"}:
+            details["note_key"] = note_key
+        if isinstance(path, str) and path in file_indices:
+            details["file_index"] = file_indices[path]
+        if isinstance(quote, str):
+            details.update(quote_chars=len(quote), quote_lines=len(quote.splitlines()), literal_newline="\\n" in quote)
+
+        def reject(reason_code, message):
+            raise AnalysisOutputError(message, details={**details, "reason_code": reason_code})
+
         if not isinstance(path, str) or path not in available:
-            raise AnalysisOutputError("模型引用了未提供的代码文件，未写入。")
+            reject("unprovided_path", "模型引用了未提供的代码文件，未写入。")
         content = available[path]
         start, end = source.get("line_start", 1), source.get("line_end", 1)
         lines = _source_lines(content)
         if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(lines):
-            raise AnalysisOutputError("模型引用行号无效，未写入。")
-        quote = source.get("quote")
+            reject("invalid_line_range", "模型引用行号无效，未写入。")
         if not isinstance(quote, str) or not quote.strip() or len(quote) > 2000:
-            raise AnalysisOutputError("模型引用缺少有效的原文摘录，未写入。")
+            reject("quote_too_long" if isinstance(quote, str) and len(quote) > 2000 else "missing_quote",
+                   "模型引用缺少有效的原文摘录，未写入。")
         matches = []
         for match in re.finditer(re.escape(quote), content):
             first = content.count("\n", 0, match.start()) + 1
             last = first + quote.count("\n") - int(quote.endswith("\n"))
             matches.append((first, last))
+        found = bool(matches)
         if len(matches) > 1:
             matches = [(first, last) for first, last in matches if start <= first <= last <= end]
         if len(matches) != 1:
-            raise AnalysisOutputError("模型引用摘录无法在已提供代码中唯一核实，未写入。")
+            reject("ambiguous_quote" if found else "quote_not_found", "模型引用摘录无法在已提供代码中唯一核实，未写入。")
         first, last = matches[0]
         excerpt = "\n".join(lines[first - 1:last])
         checked.append({"path": path, "line_start": first, "line_end": last, "excerpt": excerpt})
@@ -133,6 +179,13 @@ def analysis_status(store, repo_id):
                      "model": "模型调用未获得有效分析结果，请检查连接、额度或模型后重试。",
                      "internal": "分析未完成，请稍后重试或检查本地服务。"}
         state.update(status="failed", category=category, summary=summaries.get(category, summaries["internal"]), updated_at=now())
+        if isinstance(error, AnalysisOutputError) and error.details:
+            reasons = {"unprovided_path": "引用文件不在已提供范围", "invalid_line_range": "引用行号格式或范围无效",
+                       "quote_too_long": "引用摘录超过2000字符", "missing_quote": "缺少有效原文摘录",
+                       "unknown_evidence_id": "引用证据编号不在本次请求范围", "inconsistent_evidence_id": "证据编号与引用坐标不一致",
+                       "ambiguous_quote": "原文摘录有多个匹配且行号无法消歧", "quote_not_found": "摘录与已提供原文不匹配"}
+            state["error_details"] = error.details
+            state["summary"] = "代码引用未通过核验：" + reasons[error.details["reason_code"]] + "；现有笔记保留。"
         store.config_set(key, state)
         raise
     else:

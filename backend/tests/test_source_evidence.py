@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -68,7 +69,7 @@ def test_search_reaches_real_content_beyond_first_500_and_returns_matching_lines
     assert match["path"] == "src/StarCardService.java"
     assert "82:   void deductStar() { // 保星卡扣星规则" in match["content"]
     assert match["line_start"] > 70
-    assert match["untrusted"] is True
+    assert result["untrusted"] is True
     assert match["matched_by"] == ["content"]
     assert list(store.vault.rglob("*.md")) == []
 
@@ -196,7 +197,7 @@ def test_search_long_matching_line_still_exposes_the_actual_match(source_store):
     assert result["total"] == 1
     match = result["matches"][0]
     assert "扣星策略" in match["content"]
-    assert len(match["content"]) <= 1200
+    assert len(match["content"]) <= 400
     assert match["line_start"] <= 5 <= match["line_end"]
 
 
@@ -255,4 +256,98 @@ def test_empty_tracked_file_has_a_valid_reference_without_invented_content(sourc
     assert result["content"] == "" and result["total_lines"] == 0
     assert result["reference"].endswith("#L1-L1")
     assert result["next_line"] is None
-    assert nav.search("empty")["matches"][0]["reference"] == result["reference"]
+    match = nav.search("empty")["matches"][0]
+    assert match["path"] == result["path"] and match["line_start"] == match["line_end"] == 1
+    assert "reference" not in match
+
+
+def discovery_repository(source_store):
+    source, store, repo = source_store
+    for index in range(16):
+        path = source / f"a-common/Noise{index:02d}.java"
+        path.parent.mkdir(exist_ok=True)
+        path.write_text("public class Noise { // " + "通用框架说明。" * 100 + "\n}\n", encoding="utf-8")
+    files = {
+        "b-api/McpAccessService.java": "public interface McpAccessService {\n  void settle();\n}\n",
+        "z-service/McpAccessServiceImpl.java": "public class McpAccessServiceImpl implements McpAccessService {\n  String settle() { return \"保星卡免扣星\"; }\n}\n",
+        "a-wrapper/LegacyMcpAccessServiceWrapper.java": "public class LegacyMcpAccessServiceWrapper {}\n",
+        "a-wrapper/OtherMcpAccessServiceImpl.java": "public class OtherMcpAccessServiceImpl {}\n",
+    }
+    for name, content in files.items():
+        path = source / name
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    git(source, "add", ".")
+    git(source, "commit", "-m", "Real discovery payload and implementation ranking")
+    repo["commit"] = git(source, "rev-parse", "HEAD")
+    store._write_repo(repo)
+    return SourceNavigator(store, repo["id"])
+
+
+def test_discovery_is_compact_and_does_not_issue_read_receipts(source_store):
+    nav = discovery_repository(source_store)
+    result = nav.search("java")
+    assert len(result["matches"]) == 8
+    wire_bytes = len(json.dumps(result, ensure_ascii=False).encode())
+    print(f"8-result discovery page: {wire_bytes} UTF-8 bytes")
+    assert wire_bytes <= 12_000
+    for match in result["matches"]:
+        assert len(match["content"]) <= 400
+        assert {"path", "content", "line_start", "line_end", "matched_by"} <= match.keys()
+        assert not {"reference", "blob", "revision", "repository_id", "commit"} & match.keys()
+    read = nav.read("z-service/McpAccessServiceImpl.java", 1, 3)
+    assert read["reference"].endswith("/z-service/McpAccessServiceImpl.java#L1-L3")
+    assert read["blob"] == read["revision"] and "保星卡免扣星" in read["content"]
+
+
+def test_discovery_prioritizes_specific_implementation_paths_over_java_and_suffix_noise(source_store):
+    nav = discovery_repository(source_store)
+    result = nav.search("McpAccessService java")
+    paths = [item["path"] for item in result["matches"]]
+    assert paths[:2] == ["z-service/McpAccessServiceImpl.java", "b-api/McpAccessService.java"]
+    assert nav.search("McpAccessServiceImpl")["matches"][0]["path"] == "z-service/McpAccessServiceImpl.java"
+    assert "class McpAccessServiceImpl" in result["matches"][0]["content"]
+
+
+def test_real_discovery_pages_leave_exploration_budget_for_reading_implementation(source_store, monkeypatch):
+    import keyring
+    from businessmap.tools_api import ToolsService
+    from businessmap.exploration import SOURCE_TOOLS
+    monkeypatch.setattr(keyring, "get_keyring", lambda: (_ for _ in ()).throw(RuntimeError("locked")))
+    discovery_repository(source_store)
+    _, store, repo = source_store
+    tools = ToolsService(store)
+    provider = tools.providers.save({"name": "Fixture", "kind": "openai-compatible",
+                                     "base_url": "http://127.0.0.1:1/v1", "model": "fixture"})
+    tools.bind_model(repo["id"], provider["id"])
+    reference = f"source://{repo['id']}/{repo['commit']}/z-service/McpAccessServiceImpl.java#L1-L3"
+    steps = [("repository_search", {"query": "java"}),
+             ("repository_search", {"query": "public"}),
+             ("repository_search", {"query": "McpAccessService"}),
+             ("repository_read", {"path": "z-service/McpAccessServiceImpl.java", "line_start": 1, "line_end": 3}),
+             ("finish_answer", {"answer": "实现代码明确返回保星卡免扣星。", "kind": "answer", "citations": [reference]})]
+    requests = []
+    def turn(system, messages, schemas, **kwargs):
+        index = len(requests)
+        assert index < len(steps)
+        names = {tool["function"]["name"] for tool in schemas}
+        if index <= 3:
+            assert "repository_read" in names, "Discovery payload consumed the budget before the implementation read"
+        requests.append({"messages": messages, "wire_bytes": len(json.dumps(messages, ensure_ascii=False).encode())})
+        name, arguments = steps[index]
+        call_id = f"call-{index}"
+        return {"text": "", "tool_calls": [{"id": call_id, "name": name, "arguments": arguments}],
+                "assistant_message": {"role": "assistant", "content": "", "tool_calls": [{"id": call_id, "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}]},
+                "usage": {"input_tokens": (4500, 5000, 6500, 7000, 7000)[index], "output_tokens": 100}}
+    monkeypatch.setattr(tools.providers, "tool_turn", turn)
+    result = tools.chat("McpAccessService的扣星逻辑如何实现？", repository_id=repo["id"])
+    print(f"Exploration transcript bytes before each model turn: {[request['wire_bytes'] for request in requests]}")
+    assert len(requests) == 5 and result["completion"] == "complete"
+    assert result["sources"][0]["kind"] == "code" and result["sources"][0]["path"] == reference
+    first_pages = [json.loads(item["content"]) for item in requests[2]["messages"]
+                   if item["role"] == "tool"][:2]
+    assert len(first_pages) == 2 and all(len(page["matches"]) == 8 for page in first_pages)
+    assert "保星卡免扣星" in json.dumps(requests[-1]["messages"], ensure_ascii=False)
+    search_schema = next(tool for tool in SOURCE_TOOLS if tool["function"]["name"] == "repository_search")
+    assert search_schema["function"]["parameters"]["properties"]["query"]["maxLength"] == 500

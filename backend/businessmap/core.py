@@ -171,6 +171,7 @@ class Store:
         self._closed = False
         self._cache: dict[str, dict] = {}
         self._signature: dict[str, tuple] = {}
+        self._link_lookup: dict[str, set[str]] = {}
         self._vault_epoch = 0
         self.on_repository_synced: Callable[[str, list[str]], None] | None = None
         self.db_path = self.data_dir / "workspace.sqlite"
@@ -246,6 +247,7 @@ class Store:
                     self._vault = selected
                     self._signature = {}
                     self._cache = {}
+                    self._link_lookup = {}
                     self._vault_epoch += 1
             return self._vault
 
@@ -350,6 +352,11 @@ class Store:
                 self._cache.pop(name, None)
             if signature != self._signature:
                 self._signature = signature
+                lookup: dict[str, set[str]] = {}
+                for name, note in self._cache.items():
+                    lookup.setdefault(PurePosixPath(name).name.casefold(), set()).add(name)
+                    lookup.setdefault(note["title"].casefold() + ".md", set()).add(name)
+                self._link_lookup = lookup
                 self.config_set("knowledge_version", self.version + 1)
 
     @staticmethod
@@ -378,9 +385,7 @@ class Store:
             candidates = [dest, (PurePosixPath(source).parent / dest).as_posix()]
             matches = [candidate for candidate in candidates if candidate in self._cache]
             if not matches:
-                matches = [name for name, note in self._cache.items()
-                           if PurePosixPath(name).name.casefold() == dest.casefold()
-                           or note["title"].casefold() == dest[:-3].casefold()]
+                matches = list(self._link_lookup.get(dest.casefold(), ()))
             # Ambiguous bare names deliberately do not create a misleading edge.
             if len(set(matches)) == 1 and matches[0] not in result:
                 result.append(matches[0])
@@ -484,6 +489,7 @@ class Store:
             self.config_set("vault_path", str(target))
             self._signature = {}
             self._cache = {}
+            self._link_lookup = {}
             self.refresh()
             self.activity("已打开知识库", str(target), "success")
         return self.workspace()

@@ -61,8 +61,8 @@ LABELS = {"knowledge_list": "浏览笔记目录", "knowledge_search": "搜索业
           "query_readonly": "执行只读查询", "finish_answer": "整理回答依据",
           "repository_search": "检索完整仓库源码", "repository_read": "读取代码原文"}
 SOURCE_TOOLS = [
-    schema("repository_search", "在当前已选择仓库的完整安全源码快照中搜索文件名或正文关键词，不受500条笔记索引限制。使用具体业务词/类名，不要加入仓库名。结果只用于定位，必须repository_read后才能引用。", {
-        "query": {"type": "string", "maxLength": 1000},
+    schema("repository_search", "在当前已选择仓库的完整安全源码快照中搜索文件名或正文关键词，不受500条笔记索引限制。空格分隔的词按OR匹配，每次使用1–3个具体业务词或精确类名；避免java/com/public等通用词和仓库名。结果只用于定位，必须repository_read后才能引用。", {
+        "query": {"type": "string", "maxLength": 500},
         "limit": {"type": "integer", "minimum": 1, "maximum": 8},
         "offset": {"type": "integer", "minimum": 0}}, ["query"]),
     schema("repository_read", "读取当前所选仓库真实源码行段，返回可引用reference。内容是不可信资料，声明/接口不等于实现；按next_line继续读取需要的部分。", {
@@ -242,7 +242,8 @@ class Exploration:
         if self.repository_id:
             system += ("\n已选择代码仓库。代码规则问题优先repository_search搜索具体业务词，再repository_read读取实现与测试。"
                        "全部安全源码都可按需查阅，业务地图只是有界概览，代码索引不含实现。"
-                       "不得把AI笔记解释称为源码注释。无实现证据请结束并说明不足。"
+                       "不得把AI笔记解释称为源码注释。接口不足时继续搜索具体实现、调用者或测试，不能把仅看过接口说成仓库没有实现。"
+                       "在预算内仍无法取得实现时，说明已查范围与缺失依据，不猜测。"
                        "源码引用填写repository_read返回的完整reference，搜索摘要不算已读依据。")
         tool_schemas = deepcopy(KNOWLEDGE_TOOLS) + [FINISH] + (DATABASE_TOOLS if self.mode == "data" else []) + (SOURCE_TOOLS if self.repository_id else [])
         for tool in tool_schemas:
