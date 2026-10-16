@@ -111,6 +111,28 @@
 .repositories-content .repo-analysis-status p { margin: 5px 0 0; color: var(--muted); overflow-wrap: anywhere; }
 .repositories-content .repo-analysis-status.failed strong, .repositories-content .repo-analysis-status.failed > p:first-of-type { color: var(--danger); }
 .repositories-content .repo-analysis-status .repo-analysis-scope { color: var(--text); }
+.repositories-content .full-analysis-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.repositories-content .project-full-analysis { margin-top: 16px; }
+.repositories-content .full-analysis-coverage { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
+.repositories-content .full-analysis-coverage > div { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.repositories-content .full-analysis-coverage dt { color: var(--muted); font-size: 11px; }
+.repositories-content .full-analysis-coverage dd { margin: 4px 0 0; color: var(--text); font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.repositories-content .full-analysis-coverage dd span { font-size: 12px; font-weight: 400; color: var(--muted); }
+.repositories-content .project-full-analysis > progress { width: 100%; height: 6px; accent-color: var(--accent); }
+.repositories-content .full-analysis-modules, .repositories-content .analysis-preview { margin-top: 12px; }
+.repositories-content .full-analysis-modules summary, .repositories-content .analysis-preview summary { cursor: pointer; color: var(--text); }
+.repositories-content .full-analysis-modules ul { list-style: none; margin: 8px 0 0; padding: 0; max-height: 320px; overflow-y: auto; }
+.repositories-content .full-analysis-modules li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-top: 1px solid var(--line); content-visibility: auto; contain-intrinsic-size: auto 52px; }
+.repositories-content .full-analysis-modules li > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.repositories-content .full-analysis-modules li small { display: block; color: var(--muted); }
+.repositories-content .analysis-module-state { flex-shrink: 0; color: var(--muted); }
+.repositories-content .analysis-module-state.failed { color: var(--danger); }
+.repositories-content .analysis-module-state.running { color: var(--accent); }
+@media (max-width: 580px) {
+  .repositories-content .full-analysis-coverage { grid-template-columns: 1fr; gap: 6px; }
+  .repositories-content .full-analysis-coverage > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .repositories-content .full-analysis-coverage dd { margin: 0; }
+}
 .repositories-content .repo-auto { padding: 0 2px; margin: auto 0 16px; }
 .repositories-content .repo-card .repo-actions { padding-top: 17px; justify-content: flex-start; gap: 7px; }
 .repositories-content .repo-actions .button:last-child { margin-left: auto; }

@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
-import { GitBranch, GitCommitHorizontal, GitFork, Plus, RefreshCw, Sparkles, CheckCircle2, AlertCircle, Clock3, Settings2, FolderOpen } from 'lucide-react';
+import { GitBranch, GitCommitHorizontal, GitFork, Plus, RefreshCw, Sparkles, CheckCircle2, AlertCircle, Clock3, Settings2, FolderOpen, Pause } from 'lucide-react';
 import { errorMessage, formatTime, get, post, request } from '../api';
-import type { AnalysisStatus, BusinessProject, Notify, Provider, Repository, RepositoryModelPolicy, Task } from '../types';
+import type { AnalysisStatus, BusinessProject, FullAnalysisStatus, Notify, Provider, Repository, RepositoryModelPolicy, Task } from '../types';
 import { Empty, Modal } from '../components/UI';
 import CandidateReview from '../components/CandidateReview';
 import ProjectConnectionForm from '../components/ProjectConnectionForm';
 import RepositoryConnectionForm, { type RepositoryConnectionDraft } from '../components/RepositoryConnectionForm';
+import ProjectAnalysisProgress from '../components/ProjectAnalysisProgress';
 
 const policyDescriptions = {
   unbound: '尚未绑定模型。请先选择允许接收代码的模型。',
@@ -45,8 +46,11 @@ export default function Repositories({ projects, repositories, providers, tasks,
   const [bindingError, setBindingError] = useState('');
   const [analysisStatuses, setAnalysisStatuses] = useState<Record<string, AnalysisStatus>>({});
   const [projectStatuses, setProjectStatuses] = useState<Record<string, AnalysisStatus>>({});
+  const [fullAnalysisStatuses, setFullAnalysisStatuses] = useState<Record<string, FullAnalysisStatus>>({});
+  const [fullAnalysisErrors, setFullAnalysisErrors] = useState<Record<string, string>>({});
   const [analysisError, setAnalysisError] = useState('');
   const [analysisVersion, setAnalysisVersion] = useState(0);
+  const projectIdsKey = JSON.stringify(projects.map(project => project.id).sort());
   const projectByRepository = useMemo(() => new Map(projects.flatMap(project => project.repository_ids.map(id => [id, project] as const))), [projects]);
   const repositoryById = useMemo(() => new Map(repositories.map(repo => [repo.id, repo])), [repositories]);
   const unassigned = repositories.filter(repo => !projectByRepository.has(repo.id));
@@ -61,13 +65,33 @@ export default function Repositories({ projects, repositories, providers, tasks,
   }, [repositories, projects, providers, policyVersion]);
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([
-      get<{ statuses: Record<string, AnalysisStatus> }>('/api/analysis-status'),
-      Promise.all(projects.map(async project => [project.id, await get<AnalysisStatus>(`/api/projects/${project.id}/analysis-status`)] as const)),
-    ]).then(([result, projectResults]) => { if (!cancelled) { setAnalysisStatuses(result.statuses); setProjectStatuses(Object.fromEntries(projectResults)); setAnalysisError(''); } })
+    void get<{ statuses: Record<string, AnalysisStatus> }>('/api/analysis-status')
+      .then(result => { if (!cancelled) { setAnalysisStatuses(result.statuses); setAnalysisError(''); } })
       .catch(err => { if (!cancelled) setAnalysisError(errorMessage(err)); });
     return () => { cancelled = true; };
-  }, [repositories, projects, tasks, analysisVersion]);
+  }, [repositories, tasks, analysisVersion]);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const projectIds = JSON.parse(projectIdsKey) as string[];
+    const poll = async () => {
+      const results = await Promise.all(projectIds.map(async id => {
+        const [full, preview] = await Promise.allSettled([
+          get<FullAnalysisStatus>(`/api/projects/${id}/full-analysis`),
+          get<AnalysisStatus>(`/api/projects/${id}/analysis-status`),
+        ]);
+        return { id, full, preview };
+      }));
+      if (cancelled) return;
+      setFullAnalysisStatuses(previous => Object.fromEntries(results.flatMap(({ id, full }) => full.status === 'fulfilled' ? [[id, full.value]] : previous[id] ? [[id, previous[id]]] : [])));
+      setFullAnalysisErrors(Object.fromEntries(results.flatMap(({ id, full }) => full.status === 'rejected' ? [[id, errorMessage(full.reason)]] : [])));
+      setProjectStatuses(Object.fromEntries(results.flatMap(({ id, preview }) => preview.status === 'fulfilled' ? [[id, preview.value]] : [])));
+      const running = results.some(({ full }) => full.status === 'fulfilled' && ['planning', 'running'].includes(full.value.status));
+      timer = setTimeout(() => void poll(), running ? 3000 : 10000);
+    };
+    void poll();
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, [projectIdsKey, analysisVersion]);
   const operate = async (id: string, action: 'sync' | 'analyze', kind: Binding['kind'] = 'repository') => {
     setBusy(`${id}-${action}`);
     try {
@@ -82,6 +106,14 @@ export default function Repositories({ projects, repositories, providers, tasks,
     try { await post(`/api/repositories/${repo.id}/auto-analysis`, { enabled: !repo.ai_auto_sync }); notify(repo.ai_auto_sync ? '已暂停自动 AI 更新' : '已启用自动 AI 更新'); refresh(); }
     catch (err) { notify(errorMessage(err), 'error'); }
     finally { setBusy(null); }
+  };
+  const pauseFullAnalysis = async (id: string, paused: boolean) => {
+    setBusy(`${id}-pause`);
+    try {
+      await post(`/api/projects/${id}/full-analysis/pause`, { paused });
+      notify(paused ? '已请求暂停，正在进行的模型调用完成后停止新批次。' : '已提交继续完整分析，将复用同一版本已完成的批次。');
+    } catch (err) { notify(errorMessage(err), 'error'); }
+    finally { setBusy(null); setAnalysisVersion(version => version + 1); refresh(); }
   };
   const openBinding = (target: Binding) => { setBinding(target); setProviderId((target.kind === 'project' ? projectPolicies : policies)[target.id]?.provider_id || ''); setBindingError(''); };
   const bindModel = async (event: FormEvent) => {
@@ -129,19 +161,22 @@ export default function Repositories({ projects, repositories, providers, tasks,
   };
   return <div className="page-scroll"><div className="page-content repositories-content">
     <header className="page-heading"><div><h1>项目与仓库</h1><p>一个业务项目，连接前端、后端与各端代码，共同生成业务地图。</p></div><div className="project-heading-actions"><button data-tour="repository-add" className="button primary" onClick={() => setImportProject(true)}><Plus size={16}/>接入业务项目</button></div></header>
-    <div className="info-strip"><GitBranch size={17}/><span>接入时分别填写前端和后端仓库，同一个项目可以继续加入小程序、管理端等代码。项目统一生成业务知识、地图与总结。</span></div>
+    <div className="info-strip"><GitBranch size={17}/><span>接入时分别填写前端和后端仓库，同一个项目可以继续加入小程序、管理端等代码。完整分析会清点全部可分析源码，逐模块处理后统一生成业务知识、地图与总结。</span></div>
     {policyError && <p className="form-error" role="alert">无法读取模型绑定：{policyError} <button className="text-button" onClick={() => setPolicyVersion(version => version + 1)}>重试</button></p>}
     {analysisError && <p className="form-error" role="alert">无法更新分析状态：{analysisError} <button className="text-button" onClick={() => setAnalysisVersion(version => version + 1)}>重试</button></p>}
     {projects.map(project => {
       const members = project.repository_ids.map(id => repositoryById.get(id)).filter((repo): repo is Repository => Boolean(repo));
       const policy = projectPolicies[project.id];
-      const analyzing = busy === `${project.id}-analyze` || projectStatuses[project.id]?.status === 'running';
+      const fullAnalysis = fullAnalysisStatuses[project.id];
+      const analyzing = busy === `${project.id}-analyze` || (!fullAnalysis?.stale && ['planning', 'running'].includes(fullAnalysis?.status || ''));
+      const canResume = fullAnalysis && !fullAnalysis.stale && (['paused', 'failed', 'cancelled'].includes(fullAnalysis.status) || fullAnalysis.publication_complete === false);
       const ready = members.length > 0 && members.length === project.repository_ids.length && members.every(repo => repo.status === 'ready');
       return <section className="business-project section-block" key={project.id} aria-label={`${project.name} 项目`}>
         <div className="project-section-heading"><div><h2><FolderOpen size={19}/>{project.name}<span className="badge">{members.length} 个仓库</span></h2>{project.description && <p>{project.description}</p>}</div><button className="button compact" onClick={() => editProject(project)} disabled={Boolean(busy)}><Settings2 size={14}/>编辑项目</button></div>
-        <div className="project-analysis-controls"><div className="repo-model-binding"><div><strong>{policy?.status === 'ready' ? `${policy.provider_name || '已绑定模型'} · ${policy.model}` : '项目分析模型'}</strong><button className="text-button" disabled={Boolean(busy) || !members.length} onClick={() => openBinding({ kind: 'project', id: project.id, name: project.name, count: members.length })}>{policy?.status === 'ready' ? '更改绑定' : '绑定项目模型'}</button></div><p>{policy?.status === 'ready' ? `${policy.base_url} · 适用于项目全部 ${members.length} 个仓库` : policy ? policyDescriptions[policy.status] : '正在读取模型绑定…'}</p></div><button className="button primary" disabled={Boolean(busy) || analyzing || !ready || policy?.status !== 'ready'} title={!members.length ? '请先在编辑项目中加入仓库' : !ready ? '等待全部成员仓库同步完成' : policy?.status !== 'ready' ? '先绑定允许接收项目全部仓库代码的模型' : '联合分析项目各端代码'} onClick={() => void operate(project.id, 'analyze', 'project')}>{analyzing ? <span className="small-spinner"/> : <Sparkles size={15}/>} {analyzing ? '正在分析项目…' : '分析整个项目'}</button></div>
+        <div className="project-analysis-controls"><div className="repo-model-binding"><div><strong>{policy?.status === 'ready' ? `${policy.provider_name || '已绑定模型'} · ${policy.model}` : '项目分析模型'}</strong><button className="text-button" disabled={Boolean(busy) || !members.length || analyzing} onClick={() => openBinding({ kind: 'project', id: project.id, name: project.name, count: members.length })}>{policy?.status === 'ready' ? '更改绑定' : '绑定项目模型'}</button></div><p>{policy?.status === 'ready' ? `${policy.base_url} · 适用于项目全部 ${members.length} 个仓库` : policy ? policyDescriptions[policy.status] : '正在读取模型绑定…'}</p></div><div className="full-analysis-actions"><button className="button primary" disabled={Boolean(busy) || analyzing || !ready || policy?.status !== 'ready'} title={!members.length ? '请先在编辑项目中加入仓库' : !ready ? '等待全部成员仓库同步完成' : policy?.status !== 'ready' ? '先绑定允许接收项目全部仓库代码的模型' : '逐批分析各端全部可分析源码，并复用同版本已完成批次'} onClick={() => fullAnalysis?.status === 'paused' && !fullAnalysis.stale ? void pauseFullAnalysis(project.id, false) : void operate(project.id, 'analyze', 'project')}>{analyzing ? <span className="small-spinner"/> : <Sparkles size={15}/>} {analyzing ? '正在完整分析…' : fullAnalysis?.stale ? '重新完整分析' : canResume ? '继续完整分析' : '完整分析项目'}</button>{analyzing && <button className="button" disabled={Boolean(busy)} onClick={() => void pauseFullAnalysis(project.id, true)}><Pause size={14}/>{busy === `${project.id}-pause` ? '正在请求暂停…' : '暂停分析'}</button>}</div></div>
         {!members.length && <p className="repository-notice">项目还没有仓库。编辑项目加入前端、后端等仓库后，才能分析。</p>}
-        <AnalysisState name={project.name} analysis={projectStatuses[project.id]} running={analyzing}/>
+        <ProjectAnalysisProgress name={project.name} analysis={fullAnalysis} preview={projectStatuses[project.id]} error={fullAnalysisErrors[project.id]} submitting={busy === `${project.id}-analyze`}/>
+        {fullAnalysisErrors[project.id] && <button className="text-button" onClick={() => setAnalysisVersion(version => version + 1)}>重新读取完整分析状态</button>}
         <div className="project-repositories">{(['frontend', 'backend'] as const).map(role => <div className="project-role-group" key={role}><h3>{role === 'frontend' ? '前端仓库' : '后端仓库'}</h3><div className="repo-grid">{members.filter(repo => (project.repository_roles?.[repo.id] || 'frontend') === role).map(repo => renderRepository(repo, true))}</div>{!members.some(repo => (project.repository_roles?.[repo.id] || 'frontend') === role) && <p className="form-hint">尚未加入{role === 'frontend' ? '前端' : '后端'}仓库，请编辑项目补充。</p>}</div>)}</div>
       </section>;
     })}

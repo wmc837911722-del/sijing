@@ -208,10 +208,34 @@ class ProjectAnalysis:
                         and task["status"] in {"queued", "running"}):
                     return {"task_id": task["id"], "summary": "业务项目联合分析已在队列中。"}
             task = self.store.create_task("project-analysis", {"project_id": project_id, "project_revision": snapshot["project"]["revision"]})
-            self.store.run_task(task["id"], lambda task_id: self.analyze(project_id, task_id=task_id, expected_snapshot=snapshot))
-        return {"task_id": task["id"], "summary": "已排队联合分析前后端业务；将按各仓库固定版本进行有界分析。"}
+            def run(task_id):
+                result = self.analyze(project_id, task_id=task_id, expected_snapshot=snapshot)
+                status = result.get("status") if isinstance(result, dict) else None
+                # The generic executor treats a normal return as job success.
+                # A resumable analysis may return a failed/paused result, so
+                # translate its domain outcome before the executor finishes.
+                if status in {"failed", "blocked"}:
+                    raise ToolError("业务项目完整分析未完成；有效断点已保留，请查看完整分析状态后继续。", 422)
+                if status == "paused":
+                    message = "完整分析已暂停；有效断点已保存，未完成批次可稍后继续。"
+                elif status == "cancelled":
+                    message = "完整分析已取消；有效断点与已有文档已保留。"
+                elif status == "completed" and result.get("publication_complete") is False:
+                    message = "代码分析完成，文档待合并；人工修改已保留，请处理更新建议。"
+                elif status == "completed" and result.get("publication_complete") is True:
+                    message = "业务项目完整分析及文档保存完成。"
+                else:
+                    raise ToolError("完整分析未返回可确认的结束状态；请查看完整分析状态。", 502)
+                self.store.update_task(task_id, 100, message)
+                return result
+            self.store.run_task(task["id"], run)
+        return {"task_id": task["id"], "summary": "已排队联合分析前后端业务；将按各仓库固定版本逐批完整分析所有安全源码。"}
 
     def analyze(self, project_id, task_id=None, expected_snapshot=None):
+        from .full_analysis import FullProjectAnalysis
+        return FullProjectAnalysis(self.service).analyze(project_id, task_id=task_id, expected_snapshot=expected_snapshot)
+
+    def analyze_sampled(self, project_id, task_id=None, expected_snapshot=None):
         from .content_layout import project_business_paths, project_summary_path
         from .tools_api import ANALYSIS_SYSTEM, _ANALYSIS_LOCK
         snapshot = expected_snapshot or self.snapshot(project_id)

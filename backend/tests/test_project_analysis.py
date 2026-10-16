@@ -55,7 +55,7 @@ def fake_model(monkeypatch, tools, callback=None):
 def test_analysis_preserves_repository_identity_for_same_paths(project_tools, monkeypatch):
     analysis, tools, project, provider = project_tools
     requests = fake_model(monkeypatch, tools)
-    result = analysis.analyze(project["id"])
+    result = analysis.analyze_sampled(project["id"])
     assert result["notes_created"] == 3
     assert {item["path"] for item in requests[0][1]["files"]} == {"front/src/rules.py", "back/src/rules.py"}
     from businessmap.content_layout import project_business_paths, project_summary_path
@@ -81,7 +81,7 @@ def test_round_robin_budget_includes_each_member_before_large_repo_consumes_it(p
                 "files": [{"path": f"src/rule-{i}.py", "content": (f"{repo_id}_rule = True\n" * 400)} for i in range(30)]}
     monkeypatch.setattr(tools.store, "repository_context", context)
     requests = fake_model(monkeypatch, tools)
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     system, payload = requests[0]
     assert len(json.dumps(payload, ensure_ascii=False)) + len(system) <= 44000
     assert [item["path"].split("/", 1)[0] for item in payload["files"][:2]] == ["front", "back"]
@@ -105,7 +105,7 @@ def test_changed_snapshot_never_publishes_model_result(project_tools, monkeypatc
             tools.providers.save({**{key: provider[key] for key in ("id", "name", "kind", "base_url", "model")}, "model": "changed"})
     fake_model(monkeypatch, tools, mutate)
     with pytest.raises((ToolError, CoreError)) as error:
-        analysis.analyze(project["id"])
+        analysis.analyze_sampled(project["id"])
     assert error.value.status_code == 409
     assert not list((tmp_path / "vault" / "02-Areas").rglob("*.md"))
     assert not list((tmp_path / "vault" / "01-Wiki").rglob("*.md"))
@@ -118,7 +118,7 @@ def test_member_model_binding_must_share_exact_destination(project_tools, monkey
     assert analysis.model_policy(project["id"])["status"] == "changed"
     requests = fake_model(monkeypatch, tools)
     with pytest.raises(ToolError):
-        analysis.analyze(project["id"])
+        analysis.analyze_sampled(project["id"])
     assert not requests
 
 
@@ -127,11 +127,11 @@ def test_human_edit_and_concurrent_creation_preserved_with_separate_candidate(pr
     from businessmap.content_layout import project_business_paths
     path = project_business_paths(project["id"])["rules"]
     fake_model(monkeypatch, tools)
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     note = tools.store.read_note(path)
     human = note["content"] + "\n人工确认：退款另行审批。\n"
     tools.store.save_note(path, human, note["revision"])
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     assert tools.store.read_note(path)["content"] == human
     candidates = tools.store.config_get("project_analysis_candidates", [])
     assert any(item["path"] == path and item["project_id"] == project["id"] for item in candidates)
@@ -144,10 +144,10 @@ def test_replaced_candidate_is_cas_rejected_before_write(project_tools, monkeypa
     from businessmap.content_layout import project_business_paths
     path = project_business_paths(project["id"])["rules"]
     fake_model(monkeypatch, tools)
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     saved = tools.store.read_note(path)
     human = tools.store.save_note(path, saved["content"] + "\n人工保持。\n", saved["revision"])
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     candidate = next(item for item in analysis.candidates() if item["key"] == "rules")
     snapshot = analysis.snapshot
     def replace_while_reading_candidate(project_id):
@@ -168,7 +168,7 @@ def test_map_and_summary_link_sources_while_cards_keep_exact_code(project_tools,
     analysis, tools, project, provider = project_tools
     from businessmap.content_layout import project_business_paths, project_summary_path
     fake_model(monkeypatch, tools)
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     paths = project_business_paths(project["id"])
     card = tools.store.read_note(paths["rules"])["content"]
     assert "```text\nfront_payment = True\n```" in card
@@ -184,10 +184,10 @@ def test_candidate_application_uses_current_note_revision_and_preserves_other_va
     from businessmap.content_layout import project_business_paths
     path = project_business_paths(project["id"])["rules"]
     fake_model(monkeypatch, tools)
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     original = tools.store.read_note(path)
     edited = tools.store.save_note(path, original["content"] + "\n人工修改。\n", original["revision"])
-    analysis.analyze(project["id"])
+    analysis.analyze_sampled(project["id"])
     candidate = next(item for item in analysis.candidates() if item["key"] == "rules")
     other = {"id": "other-vault-candidate", "vault_path": "/other/vault"}
     tools.store.config_update("project_analysis_candidates", lambda old: [*old, other], [])
@@ -219,7 +219,7 @@ def test_repository_not_ready_rejected_before_model(project_tools, monkeypatch):
     tools.store.update_repository("back", {"status": "syncing"})
     requests = fake_model(monkeypatch, tools)
     with pytest.raises(ToolError):
-        analysis.analyze(project["id"])
+        analysis.analyze_sampled(project["id"])
     assert not requests
 
 
@@ -232,3 +232,49 @@ def test_partial_or_untyped_project_cannot_claim_joint_analysis(project_tools, m
         analysis.queue(project["id"])
     assert error.value.status_code == 409 and not requests
     assert not [task for task in tools.store.tasks() if task["kind"] == "project-analysis"]
+
+
+def queued_terminal_task(analysis, tools, project, monkeypatch, outcome):
+    """Run the real task executor and wait for its committed terminal record."""
+    import threading
+    terminal = threading.Event()
+    write = tools.store._write_task
+    def observed(task):
+        write(task)
+        if task['status'] in {'completed', 'failed'}:
+            terminal.set()
+    monkeypatch.setattr(tools.store, '_write_task', observed)
+    monkeypatch.setattr(analysis, 'analyze', lambda *args, **kwargs: outcome)
+    queued = analysis.queue(project['id'])
+    assert terminal.wait(5), 'background task did not reach a terminal state'
+    return tools.store._read_task(queued['task_id'])
+
+
+@pytest.mark.parametrize('status', ['failed', 'blocked'])
+def test_full_analysis_failure_is_a_failed_background_task_with_safe_error(project_tools, monkeypatch, status):
+    analysis, tools, project, _ = project_tools
+    task = queued_terminal_task(analysis, tools, project, monkeypatch,
+                                {'status': status, 'summary': 'PRIVATE MODEL RESPONSE', 'error': 'PRIVATE PROVIDER BODY'})
+    assert task['status'] == 'failed'
+    assert '完整分析' in task['error'] and 'PRIVATE' not in task['error']
+    assert task['progress'] < 100
+
+
+@pytest.mark.parametrize(('outcome', 'message'), [
+    ({'status': 'paused'}, '已暂停'),
+    ({'status': 'cancelled'}, '已取消'),
+    ({'status': 'completed', 'publication_complete': False}, '文档待合并'),
+    ({'status': 'completed', 'publication_complete': True}, '完整分析及文档保存完成'),
+])
+def test_queued_background_completion_message_reflects_actual_analysis_result(project_tools, monkeypatch, outcome, message):
+    analysis, tools, project, _ = project_tools
+    task = queued_terminal_task(analysis, tools, project, monkeypatch, outcome)
+    assert task['status'] == 'completed' and message in task['message']
+    assert 'error' not in task or not task['error']
+
+
+@pytest.mark.parametrize('outcome', [None, {'status': 'running'}, {'status': 'ready'}])
+def test_unconfirmed_analysis_result_cannot_mark_background_task_completed(project_tools, monkeypatch, outcome):
+    analysis, tools, project, _ = project_tools
+    task = queued_terminal_task(analysis, tools, project, monkeypatch, outcome)
+    assert task['status'] == 'failed' and task['progress'] < 100

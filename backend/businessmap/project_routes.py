@@ -50,6 +50,11 @@ class ProjectModelBody(BaseModel):
     provider_id: str = Field(min_length=1, max_length=160)
 
 
+class FullAnalysisPauseBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    paused: bool
+
+
 class ProjectRoute(APIRoute):
     def get_route_handler(self):
         original = super().get_route_handler()
@@ -99,5 +104,20 @@ def create_project_router(service):
     @router.post("/{project_id}/analyze")
     def analyze(project_id: str):
         return analysis.queue(project_id)
+
+    @router.get("/{project_id}/full-analysis")
+    def full_analysis_status(project_id: str):
+        from .full_analysis import FullProjectAnalysis
+        return FullProjectAnalysis(service).status(project_id)
+
+    @router.post("/{project_id}/full-analysis/pause")
+    def pause_full_analysis(project_id: str, body: FullAnalysisPauseBody):
+        from .full_analysis import FullProjectAnalysis
+        full = FullProjectAnalysis(service)
+        result = full.set_paused(project_id, body.paused)
+        if not body.paused:
+            queued = analysis.queue(project_id)
+            return {**result, **queued}
+        return result
 
     return router

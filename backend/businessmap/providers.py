@@ -384,7 +384,7 @@ class ProviderService:
 
     def complete(self, system, user, history=None, provider_id=None, max_output=2200, context=None,
                  expected_destination=None, before_send=None, _connection_test=False,
-                 _tool_messages=None, _tools=None, _deadline=None):
+                 _tool_messages=None, _tools=None, _deadline=None, json_mode=False):
         provider = self.get(provider_id)
         if not provider:
             raise ToolError("尚未配置并启用模型。", 409)
@@ -419,6 +419,10 @@ class ProviderService:
             if destination.hostname == "api.deepseek.com":
                 # Reserve the bounded output budget for answers and tool calls.
                 payload["thinking"] = {"type": "disabled"}
+                if json_mode:
+                    # Opt in only for the official endpoint. Compatible
+                    # gateways and ordinary chat may not support JSON mode.
+                    payload["response_format"] = {"type": "json_object"}
             if (destination.hostname == "spark-api-open.xf-yun.com"
                     and destination.path.removesuffix("/chat/completions") in ("/v1", "/v2", "/x2")):
                 # Spark v1 otherwise enables external web search by default.
@@ -522,7 +526,10 @@ class ProviderService:
         config_update(self.store, "provider_usage", accumulate)
         if truncated_reasoning and not _connection_test:
             raise ToolError("模型已耗尽输出额度，思考后仍未返回正文。请尝试非思考模型或其他模型；未执行任何查询或写入。", 502)
-        result = {"text": answer.strip(), "usage": usage, "provider": provider["name"]}
+        output_limited = (data["choices"][0].get("finish_reason") == "length" if kind == "openai-compatible"
+                          else data.get("stop_reason") == "max_tokens" if kind == "anthropic"
+                          else data["candidates"][0].get("finishReason") == "MAX_TOKENS")
+        result = {"text": answer.strip(), "usage": usage, "provider": provider["name"], "output_limited": output_limited}
         if tools_enabled:
             result.update({"tool_calls": tool_calls, "assistant_message": assistant_message})
         if _connection_test:

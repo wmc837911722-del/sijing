@@ -25,7 +25,7 @@ class SourceNavigator:
         "import", "package", "return", "function", "const", "def",
     }
 
-    def __init__(self, store, repository_id):
+    def __init__(self, store, repository_id, *, load_inventory=True):
         self.store = store
         self.repo = dict(store.get_repository(repository_id))
         self.repository_id = self.repo["id"]
@@ -36,7 +36,9 @@ class SourceNavigator:
         self.epoch = store._vault_epoch
         # Reuse the authoritative source safety filter, with bounded Git output
         # and regular-file mode checks supplied by this adapter's _git method.
-        self.files = {item["path"]: item for item in Store._source_files(self, self.repo, self.commit)}
+        self.files = ({item["path"]: item for item in Store._source_files(self, self.repo, self.commit)}
+                      if load_inventory else {})
+        self._read_files = {}
         self._guard()
 
     def _safe_source(self, path, size):
@@ -60,18 +62,23 @@ class SourceNavigator:
         if any(current.get(key) != self.repo.get(key) for key in ("commit", "path", "vault_path")):
             raise CoreError(409, "仓库版本已变化，请重新检索源码")
 
-    def _run_git(self, args, *, max_bytes, allow_no_match=False, deadline=None):
-        timeout = self.COMMAND_TIMEOUT
-        if deadline is not None:
-            timeout = min(timeout, deadline - time.monotonic())
-        if timeout <= 0:
-            raise CoreError(408, "源码检索超时，请缩小关键词范围")
+    @staticmethod
+    def _git_invocation(args):
         env = {key: value for key, value in os.environ.items()
                if not key.upper().startswith(("GIT_", "SSH_ASKPASS", "GCM_"))}
         env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
                    GIT_ASKPASS="", GIT_SSH_COMMAND="false", GIT_NO_LAZY_FETCH="1")
         command = ["git", "--no-pager", "-c", "core.hooksPath=" + os.devnull,
                    "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", *args]
+        return command, env
+
+    def _run_git(self, args, *, max_bytes, allow_no_match=False, deadline=None):
+        timeout = self.COMMAND_TIMEOUT
+        if deadline is not None:
+            timeout = min(timeout, deadline - time.monotonic())
+        if timeout <= 0:
+            raise CoreError(408, "源码检索超时，请缩小关键词范围")
+        command, env = self._git_invocation(args)
         try:
             process = subprocess.Popen(command, cwd=Path(self.repo["path"]), env=env, shell=False,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -131,8 +138,8 @@ class SourceNavigator:
         except UnicodeError:
             raise CoreError(415, "源码必须是 UTF-8 文本") from None
         # Match repository_context's redaction while retaining source line numbers.
-        return re.sub(r"(?i)((?:api[_-]?key|password|secret|token)\s*[:=]\s*)['\"][^'\"\r\n]+['\"]",
-                      r'\1"[REDACTED]"', content)
+        from .full_source import redact_source
+        return redact_source(content, item["path"])[0]
 
     @staticmethod
     def _integer(value, name, minimum, maximum=None):
@@ -170,7 +177,7 @@ class SourceNavigator:
         if not total:
             actual_end = 1  # Empty editors still open at line 1; content remains empty.
         next_line = actual_end if partial else actual_end + 1 if actual_end < total else None
-        item = self.files[path]
+        item = self.files.get(path) or self._read_files[path]
         reference = (f"source://{quote(self.repository_id, safe='')}/{self.commit}/{quote(path, safe='/')}"
                      f"#L{line_start}-L{actual_end}")
         return {"repository_id": self.repository_id, "commit": self.commit, "blob": item["blob"],
@@ -185,13 +192,28 @@ class SourceNavigator:
             raise CoreError(409, "只能读取所选仓库当前快照的源码")
         if not self._valid_path(path):
             raise CoreError(400, "源码路径必须是仓库内的相对路径")
-        if path not in self.files:
-            raise CoreError(404, "源码不在所选仓库的安全跟踪文件范围内")
         self._integer(line_start, "line_start", 1)
         if line_end is not None:
             self._integer(line_end, "line_end", line_start)
         self._integer(max_chars, "max_chars", 1, self.MAX_CHARS)
-        result = self._receipt(path, self._blob(self.files[path]), line_start, line_end, max_chars)
+        content = None
+        if path in self.files:
+            try:
+                content = self._blob(self.files[path])
+            except CoreError as error:
+                if error.status_code != 415:
+                    raise
+                # The complete reader recognizes a narrow Java/Kotlin UTF-8
+                # NUL char-literal case; arbitrary binary remains unreadable.
+        if content is None:
+            # Search stays bounded by its existing small-file policy. Explicit
+            # provenance links from complete analysis may also reference large
+            # source files and route/build contracts from the same snapshot.
+            from .full_source import FullSourceInventory
+            with FullSourceInventory(self.store, self.repository_id) as inventory:
+                content = inventory.read(path)["content"]
+                self._read_files[path] = dict(inventory.file_map[path])
+        result = self._receipt(path, content, line_start, line_end, max_chars)
         self._guard()
         return result
 

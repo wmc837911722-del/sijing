@@ -236,3 +236,36 @@ def test_probe_never_accepts_other_empty_or_malformed_answers(service, monkeypat
                                                      "message": {"content": None, "reasoning_content": reasoning}}]})
     with pytest.raises(ToolError, match="未返回可用文本"):
         service.complete("Reply OK", "Connection test", max_output=32, _connection_test=True)
+
+
+def test_text_completion_exposes_only_boolean_output_limit_diagnostic(service, monkeypatch):
+    save(service, "https://api.deepseek.com", "deepseek-v4-pro")
+    mock_vendor(monkeypatch, lambda _: {"choices": [{"finish_reason": "length", "message": {"content": '{"unfinished":'}}],
+                                      "usage": {"prompt_tokens": 7000, "completion_tokens": 2800}})
+    result = service.complete("Policy", "Analyze", max_output=2800)
+    assert result["output_limited"] is True
+    assert result["usage"]["output_tokens"] == 2800
+
+
+@pytest.mark.parametrize("base", ["https://api.deepseek.com", "https://api.deepseek.com/v1", "https://api.deepseek.com/v1/chat/completions"])
+@pytest.mark.parametrize("json_mode", [False, True])
+def test_official_deepseek_json_mode_is_explicitly_requested_only(service, monkeypatch, base, json_mode):
+    save(service, base, "deepseek-v4-pro")
+    requests = mock_vendor(monkeypatch, lambda _: {"choices": [{"finish_reason": "stop", "message": {"content": '{"summary":"已分析"}'}}]})
+    result = service.complete("Output JSON with a summary field", "Analyze business", json_mode=json_mode)
+    assert parse_json_answer(result["text"]) == {"summary": "已分析"}
+    payload = json.loads(requests[0].content)
+    if json_mode:
+        assert payload["response_format"] == {"type": "json_object"}
+    else:
+        assert "response_format" not in payload
+    assert payload["thinking"] == {"type": "disabled"}
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("base", ["https://api.deepseek.com.example.invalid/v1", "https://gateway.example.invalid/api.deepseek.com/v1", "https://deepseek.example.invalid/v1", "https://api.siliconflow.cn/v1"])
+def test_requested_json_mode_is_not_sent_to_unsupported_or_lookalike_hosts(service, monkeypatch, base):
+    save(service, base, "deepseek-v4-pro")
+    requests = mock_vendor(monkeypatch, lambda _: {"choices": [{"message": {"content": '{"summary":"mock"}'}}]})
+    service.complete("Output JSON", "Analyze business", json_mode=True)
+    assert set(json.loads(requests[0].content)) == {"model", "messages", "max_tokens"}
