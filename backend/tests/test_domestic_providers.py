@@ -74,9 +74,87 @@ def test_domestic_endpoints_use_selected_model_key_and_stable_prefix(service, mo
         {"role": "user", "content": "Stable business evidence"},
         {"role": "user", "content": "Current question"},
     ]
-    assert not {"temperature", "top_p", "thinking", "enable_thinking", "response_format"} & payload.keys()
+    assert not {"temperature", "top_p", "enable_thinking", "response_format"} & payload.keys()
+    if base == "https://api.deepseek.com":
+        assert payload["thinking"] == {"type": "disabled"}
+    else:
+        assert "thinking" not in payload
     assert "fixture-key" not in json.dumps(service.list())
     assert "fixture-key" not in json.dumps(service.store.config_get("providers"))
+
+
+@pytest.mark.parametrize("base", ["https://api.deepseek.com", "https://api.deepseek.com/v1",
+                                  "https://api.deepseek.com/v1/chat/completions"])
+@pytest.mark.parametrize("operation", ["complete", "tool_turn"])
+def test_official_deepseek_uses_output_budget_for_body_and_tools(service, monkeypatch, base, operation):
+    save(service, base, "deepseek-v4-pro")
+    tools = [{"type": "function", "function": {"name": "knowledge_read",
+              "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}}]
+    answer = '{"summary":"订单规则需要审批"}'
+
+    def vendor(payload):
+        if payload.get("thinking") != {"type": "disabled"}:
+            return {"choices": [{"finish_reason": "length", "message": {
+                "content": None, "reasoning_content": "Private default thinking exhausted the output budget"}}],
+                "usage": {"prompt_tokens": 8839, "completion_tokens": 5999}}
+        message = {"content": answer}
+        if operation == "tool_turn":
+            message = {"content": None, "tool_calls": [{"id": "read-order", "type": "function",
+                "function": {"name": "knowledge_read", "arguments": '{"path":"业务/订单流程.md"}'}}]}
+        return {"choices": [{"finish_reason": "tool_calls" if operation == "tool_turn" else "stop",
+                              "message": message}],
+                "usage": {"prompt_tokens": 8839, "completion_tokens": 48}}
+
+    requests = mock_vendor(monkeypatch, vendor)
+    if operation == "complete":
+        result = service.complete("Business policy", "Analyze order rules", max_output=6000)
+        assert parse_json_answer(result["text"]) == {"summary": "订单规则需要审批"}
+    else:
+        result = service.tool_turn("Business policy", [{"role": "user", "content": "Read order rules"}],
+                                   tools, max_output=6000)
+        assert result["text"] == ""
+        assert result["tool_calls"] == [{"id": "read-order", "name": "knowledge_read",
+                                          "arguments": {"path": "业务/订单流程.md"}}]
+    assert len(requests) == 1
+    payload = json.loads(requests[0].content)
+    assert payload["model"] == "deepseek-v4-pro"
+    assert payload["max_tokens"] == 6000
+    if operation == "tool_turn":
+        assert payload["tools"] == tools
+    assert result["usage"]["output_tokens"] == 48
+
+
+@pytest.mark.parametrize("base", ["https://api.deepseek.com.example.invalid/v1",
+                                  "https://gateway.example.invalid/api.deepseek.com/v1",
+                                  "https://deepseek.example.invalid/v1", "https://api.siliconflow.cn/v1"])
+@pytest.mark.parametrize("operation", ["complete", "tool_turn"])
+def test_other_compatible_hosts_do_not_receive_deepseek_thinking_setting(service, monkeypatch, base, operation):
+    save(service, base, "deepseek-v4-pro")
+    requests = mock_vendor(monkeypatch, lambda _: {"choices": [{"message": {"content": "业务回答"}}]})
+    if operation == "complete":
+        result = service.complete("Policy", "Question")
+    else:
+        result = service.tool_turn("Policy", [{"role": "user", "content": "Question"}], [])
+    assert result["text"] == "业务回答"
+    assert len(requests) == 1
+    assert set(json.loads(requests[0].content)) == {"model", "messages", "max_tokens"}
+
+
+@pytest.mark.parametrize("operation", ["complete", "tool_turn"])
+def test_deepseek_reasoning_only_is_still_rejected_without_retry_or_executable_output(service, monkeypatch, operation):
+    save(service, "https://api.deepseek.com", "deepseek-v4-pro")
+    requests = mock_vendor(monkeypatch, lambda _: {"choices": [{"finish_reason": "length", "message": {
+        "content": None, "reasoning_content": "PRIVATE-REASONING SELECT * FROM orders"}}],
+        "usage": {"prompt_tokens": 8839, "completion_tokens": 5999}})
+    with pytest.raises(ToolError) as error:
+        if operation == "complete":
+            service.complete("Policy", "Question", max_output=6000)
+        else:
+            service.tool_turn("Policy", [{"role": "user", "content": "Question"}], [], max_output=6000)
+    assert error.value.status_code == 502
+    assert "PRIVATE-REASONING" not in error.value.message
+    assert len(requests) == 1
+    assert service.usage()["output_tokens"] == 5999
 
 
 @pytest.mark.parametrize("base", ["https://api.minimax.cn/v1", "https://api.minimax.io/v1", "https://api.minimaxi.com/v1"])

@@ -27,4 +27,6 @@ API 地址填写基础路径，不要加 `/chat/completions`。企业代理、�
 
 MiniMax 官方地址使用独立思考字段，避免思考片段混入最终 JSON；星火官方兼容路径显式关闭默认联网搜索。普通业务调用不自动扩大输出额度或重复重试。部分深度思考模型可能超出当前调用额度，这种情况会明确报错；可换用支持短回答的非思考模型。
 
+DeepSeek 官方域名 `api.deepseek.com` 的 OpenAI 兼容请求按[官方思考模式文档](https://api-docs.deepseek.com/guides/thinking_mode/)显式设置 `thinking: {type: "disabled"}`，将现有输出额度用于正文和工具调用；其他兼容域名不附加此参数，只有思考内容的响应仍拒绝用于查询或写入。
+
 缓存统计只采用服务商实际返回的数据。Kimi、百炼等的 `prompt_tokens_details.cached_tokens` 与 DeepSeek 的 `prompt_cache_hit_tokens` 都能识别，未提供字段时为未知，不编造命中数。不承诺固定命中率。配置平台不会自动发送代码；仓库仍需单独绑定允许使用的模型。

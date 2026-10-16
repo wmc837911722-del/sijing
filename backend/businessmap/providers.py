@@ -416,6 +416,9 @@ class ProviderService:
             if destination.hostname in ("api.minimax.cn", "api.minimax.io", "api.minimaxi.com"):
                 # Keep reasoning out of business answers and JSON/SQL responses.
                 payload["reasoning_split"] = True
+            if destination.hostname == "api.deepseek.com":
+                # Reserve the bounded output budget for answers and tool calls.
+                payload["thinking"] = {"type": "disabled"}
             if (destination.hostname == "spark-api-open.xf-yun.com"
                     and destination.path.removesuffix("/chat/completions") in ("/v1", "/v2", "/x2")):
                 # Spark v1 otherwise enables external web search by default.
