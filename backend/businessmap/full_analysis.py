@@ -295,6 +295,18 @@ class FullProjectAnalysis:
     def _public(run):
         return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "interrupted") if key in run}
 
+    def _actionable_failure(self, run):
+        # Only codes emitted by our controlled failure diagnostic may select
+        # user-facing actions. Never derive UI messages from exception text.
+        with self.store._lock, self.store._db() as db:
+            rows = db.execute("SELECT json_extract(data,'$.details.http_status') FROM full_analysis_chunks WHERE run_id=? AND status='failed'", (run["run_id"],)).fetchall()
+        codes = {row[0] for row in rows if isinstance(row[0], int) and not isinstance(row[0], bool)}
+        actions = ((402, "模型余额不足（HTTP 402），请充值后继续完整分析；已成功片段已保留。"),
+                   (401, "模型凭据或访问权限不可用（HTTP 401），请检查模型配置和权限后继续；已成功片段已保留。"),
+                   (403, "模型凭据或访问权限不可用（HTTP 403），请检查模型配置和权限后继续；已成功片段已保留。"),
+                   (429, "模型请求受到限流（HTTP 429），请稍后继续完整分析；已成功片段已保留。"))
+        return next((message for code, message in actions if code in codes), None)
+
     def status(self, project_id):
         self.project_analysis.projects.get(project_id)
         run = self._load(project_id)
@@ -319,6 +331,10 @@ class FullProjectAnalysis:
             except ToolError as error:
                 if error.status_code != 409:
                     raise
+        if run["status"] in {"failed", "paused"}:
+            action = self._actionable_failure(run)
+            if action:
+                run["error"] = action
         return self._public(self._progress(run))
 
     def set_paused(self, project_id, paused):
@@ -635,7 +651,7 @@ class FullProjectAnalysis:
             elif run["paused"]:
                 run.update(status="paused", summary="完整分析已暂停；已成功片段保留，恢复时继续未完成片段。")
             elif run["coverage"]["completed_chunks"] != run["coverage"]["total_chunks"]:
-                run.update(status="failed", error="部分独立批次未通过输出核验或调用未成功；没有自动付费重试，再次分析仅继续未完成片段。", summary="完整分析尚未完成，原地图与总结保留。")
+                run.update(status="failed", error=self._actionable_failure(run) or "部分独立批次未通过输出核验或调用未成功；没有自动付费重试，再次分析仅继续未完成片段。", summary="完整分析尚未完成，原地图与总结保留。")
             else:
                 self.project_analysis.guard(snapshot)
                 self._verify_coverage(run)

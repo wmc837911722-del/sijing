@@ -720,3 +720,41 @@ def test_non_output_failures_keep_only_controlled_diagnostics(full_project, monk
     failed = next(chunk for chunk in full._chunks(full._load(project["id"])) if chunk["status"] == "failed")
     assert failed["details"] == want
     assert "PRIVATE-KEY-DO-NOT-PERSIST" not in json.dumps(failed)
+
+
+@pytest.mark.parametrize("code,action", [(402, "余额不足"), (429, "限流"), (401, "凭据"), (403, "访问权限")])
+def test_failed_and_paused_status_show_controlled_http_action(full_project, monkeypatch, code, action):
+    full, service, project = full_project
+    full.CONCURRENCY = 1
+    def rejected(*args, **kwargs):
+        kwargs["before_send"]()
+        raise ToolError(f"模型服务返回 HTTP {code}。请检查模型、地址、凭据或额度。", 502)
+    monkeypatch.setattr(service.providers, "complete", rejected)
+    failed = full.analyze(project["id"])
+    assert failed["status"] == "failed" and failed["coverage"]["completed_chunks"] < failed["coverage"]["total_chunks"]
+    assert action in failed["error"] and str(code) in failed["error"]
+    full.set_paused(project["id"], True)
+    monkeypatch.setattr(service.providers, "complete", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("status must not call model")))
+    status = full.status(project["id"])
+    assert status["status"] == "paused" and action in status["error"]
+    assert full._controls(full._load(project["id"]))["paused"] is True
+
+
+def test_failure_action_does_not_expose_untrusted_error_or_unknown_http_code(full_project, monkeypatch):
+    full, service, project = full_project
+    full.CONCURRENCY = 1
+    def rejected(*args, **kwargs):
+        kwargs["before_send"]()
+        raise ToolError("PRIVATE-SECRET HTTP 402 must not be inferred", 502)
+    monkeypatch.setattr(service.providers, "complete", rejected)
+    failed = full.analyze(project["id"])
+    assert failed["status"] == "failed" and "PRIVATE-SECRET" not in json.dumps(failed)
+    run = full._load(project["id"])
+    chunk = next(chunk for chunk in full._chunks(run) if chunk["status"] == "failed")
+    chunk["details"] = {"http_status": 499}
+    chunk["error"] = "PRIVATE-SECRET untrusted stored legacy error"
+    full._chunk_save(run, chunk)
+    status = full.status(project["id"])
+    assert status["status"] == "failed"
+    assert "PRIVATE-SECRET" not in json.dumps(status)
+    assert "余额不足" not in status["error"] and "499" not in status["error"]
