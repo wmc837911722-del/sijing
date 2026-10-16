@@ -366,3 +366,95 @@ def test_prompt_estimate_falls_back_to_full_wire_when_usage_or_append_contract_i
         current_messages = []
     current = _prompt_snapshot(system, current_messages, tools)
     assert _prompt_input_bound(current, (previous, actual)) == current["bytes"]
+
+
+def test_short_source_citation_uses_actual_returned_range_instead_of_retyping_long_uri(service, code_repository, monkeypatch):
+    import subprocess
+    from pathlib import Path
+    from urllib.parse import quote
+
+    repo = code_repository
+    source = Path(repo["path"])
+    path = "src/" + "arena/settlement/" * 12 + "DeductionRule.java"
+    target = source / path
+    target.parent.mkdir(parents=True)
+    target.write_text("public final class DeductionRule {\n" +
+                      "    public int deductedStars(int originalStars) { return Math.max(0, originalStars - 1); }\n" * 20 + "}\n")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "-qm", "Long receipt with a bounded returned range"], check=True)
+    repo["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    service.store._write_repo(repo)
+    base = f"source://{repo['id']}/{repo['commit']}/{quote(path, safe='/')}"
+    actual = base + "#L1-L1"
+
+    def short_finish(payload):
+        receipt = json.loads(next(m["content"] for m in payload["messages"] if m["role"] == "tool"))
+        assert receipt["reference"] == actual and receipt["line_end"] == 1
+        assert "citation_id" in receipt, "successful source reads must grant a short citation receipt"
+        citation_id = receipt["citation_id"]
+        assert len(citation_id) < 25
+        return finish(citation_id, f"已读取实际返回的行段。[原文]({citation_id})")
+
+    model(monkeypatch, [("repository_read", {"path": path, "line_start": 1, "line_end": 22, "max_chars": 90}),
+                       finish(base + "#L1-L22"), short_finish])
+    result = service.chat("查看对应源码行段", repository_id=repo["id"])
+    assert result["completion"] == "complete" and result["activities"][1]["status"] == "error"
+    assert result["sources"][0]["path"] == actual
+    assert result["sources"][0]["commit"] == repo["commit"]
+    assert result["sources"][0]["line_start"] == result["sources"][0]["line_end"] == 1
+    assert f"]({actual})" in result["answer"]
+
+
+def test_short_note_links_expand_only_citations_selected_for_the_answer(service, monkeypatch):
+    from urllib.parse import quote
+
+    first, second = "业务/退款规则.md", "数据/订单表.md"
+    def final(payload):
+        receipts = [json.loads(m["content"]) for m in payload["messages"] if m["role"] == "tool"]
+        assert all("citation_id" in receipt for receipt in receipts)
+        chosen, unused = (receipt["citation_id"] for receipt in receipts)
+        return finish(chosen, f"[已引用]({chosen}) [未引用]({unused}) [不存在](r_unknown_9) [伪造范围]({chosen}#L1-L99)")
+    model(monkeypatch, [("knowledge_read", {"path": first}), ("knowledge_read", {"path": second}), final])
+    result = service.chat("读取业务规则")
+    assert result["answer"] == f"[已引用]({quote(first, safe='/')}) 未引用 不存在 伪造范围"
+    assert [receipt["path"] for receipt in result["sources"]] == [first]
+
+
+def test_short_ids_reject_unknown_and_previous_run_citations(service, monkeypatch):
+    captured = []
+    def finish_current(payload):
+        receipt = json.loads(next(m["content"] for m in payload["messages"] if m["role"] == "tool"))
+        assert "citation_id" in receipt
+        captured.append(receipt["citation_id"])
+        return finish(receipt["citation_id"])
+    model(monkeypatch, [("knowledge_read", {"path": "业务/退款规则.md"}), finish_current])
+    assert service.chat("退款规则")["completion"] == "complete"
+    previous = captured[0]
+    model(monkeypatch, [("knowledge_read", {"path": "数据/订单表.md"}), finish(previous),
+                       finish("r_unknown_9"), finish_current])
+    result = service.chat("订单表", history=[{"role": "assistant", "content": f"之前引用 {previous}"}])
+    assert captured[1] != previous
+    assert [activity["status"] for activity in result["activities"]] == ["complete", "error", "error", "complete"]
+    assert [receipt["path"] for receipt in result["sources"]] == ["数据/订单表.md"]
+
+
+def test_closing_context_preserves_short_id_to_actual_read_mapping(service, monkeypatch):
+    import re
+
+    monkeypatch.setattr("businessmap.exploration.MAX_TOTAL_TOKENS", 24000)
+    paths = ["规则/已读甲.md", "规则/已读乙.md"]
+    for path, text in zip(paths, ["甲的真实依据", "乙的真实依据"]):
+        service.store.save_note(path, "# 依据\n" + text)
+    def final(payload):
+        assert {tool["function"]["name"] for tool in payload["tools"]} == {"finish_answer"}
+        evidence = json.loads(payload["messages"][-1]["content"])["read_evidence"]
+        ids = [item["reference"] for item in evidence]
+        assert len(set(ids)) == 2 and all(re.fullmatch(r"r_[0-9a-f]{8}_\d+", ref) for ref in ids)
+        chosen = next(item["reference"] for item in evidence if "乙的真实依据" in item["content"])
+        return finish(chosen, f"乙的依据已核对。[依据]({chosen})")
+    model(monkeypatch, [("knowledge_read", {"path": paths[0]}), ("knowledge_read", {"path": paths[1]}), final],
+          usage=lambda count: {"prompt_tokens": (1000, 14000, 100)[count - 1], "completion_tokens": 10})
+    result = service.chat("只引用乙的依据")
+    assert result["completion"] == "complete"
+    assert [receipt["path"] for receipt in result["sources"]] == [paths[1]]

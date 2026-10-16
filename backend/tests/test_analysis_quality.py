@@ -10,6 +10,25 @@ import pytest
 from businessmap.core import Store
 from businessmap.providers import ToolError
 from businessmap.tools_api import ToolsService
+
+
+@pytest.mark.parametrize("upstream_truncated", [False, True])
+def test_prepared_evidence_never_labels_a_cut_line_as_complete(upstream_truncated):
+    from businessmap.analysis_output import prepare_file
+    first = "public class Example {\n"
+    full = first + "    private long businessField = 12345;\n"
+    supplied = full[:len(first) + 12] if upstream_truncated else full
+    item, _ = prepare_file({"path": "Example.java", "content": supplied,
+                            "truncated": upstream_truncated}, len(first) + 12, 37000)
+    assert item["content"] == first
+    assert item["line_count"] == 1 and item["truncated"] is True
+    assert all(e["line_end"] == 1 for e in item["evidence"])
+
+
+def test_complete_source_without_final_newline_remains_readable():
+    from businessmap.analysis_output import prepare_file
+    item, _ = prepare_file({"path": "value.py", "content": "VALUE = 1"}, 100, 37000)
+    assert item["content"] == "VALUE = 1" and item["truncated"] is False
 from businessmap.content_layout import business_paths, summary_path
 
 

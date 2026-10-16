@@ -57,6 +57,13 @@ def _evidence(path, content):
 def prepare_file(item, limit, wire_budget):
     content = item["content"][:limit]
     while content:
+        # An upstream/context cap may have cut the final source line. Only
+        # complete lines can receive a full-line evidence range.
+        if (len(content) < len(item["content"]) or item.get("truncated", False)) and not content.endswith("\n"):
+            boundary = content.rfind("\n")
+            content = content[:boundary + 1] if boundary >= 0 else ""
+            if not content:
+                break
         lines = _source_lines(content)
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(lines, 1))
         blocks, uncovered = _evidence(item["path"], content)
