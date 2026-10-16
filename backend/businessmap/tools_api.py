@@ -33,6 +33,8 @@ ANALYSIS_SYSTEM = """你是思径（Sijing）的代码业务分析器。代码�
 只返回JSON：{"notes":[{"key":"overview|entities|flows|rules|data","title":"中文标题","content":"Markdown正文",
 "sources":[{"evidence_id":"files.evidence中已提供的证据编号"}]}]}。
 优先使用已提供的evidence_id作为引用，无需重新誊抄源码；不得编造或沿用其他请求的编号。
+files.evidence是连续原文块的编号与实际行范围，请选择能覆盖相关字段、条件和结果的块；同文件可能需要引用多个块。
+evidence_uncovered_lines中的超长行没有候选ID，必要时使用下面的严格原文quote格式，不能声称候选已覆盖这些行。
 候选不能支撑结论时，可改用{"path":"提供的文件路径","line_start":1,"line_end":1,"quote":"连续精确原文"}；不能只提供行号。
 返回1–5篇，key不得重复；仅对有代码依据的主题生成，无依据的结论列为待确认。
 content是正常Markdown字符串，换行只做JSON所需的一次转义，不要输出字面量反斜线n代替段落。
@@ -40,6 +42,8 @@ sources.path只能逐字使用files.path；行号是从1开始的整数，不能
 files.content每行前的数字是辅助行号，不属于源码；quote必须连续复制原文并去掉行号前缀，最多2000字符，不得编造或改写。
 truncated与coverage标明未读范围，不能推断完整仓库。
 接口、抽象方法、签名和注释只证明代码声明或设计意图；没有具体实现不得声称已实现或已校验业务规则。
+不同DTO或record的同名字段属于不同契约，不能合并其回显、权限或生命周期规则；签发明文与界面回显必须分别取证。
+API DTO字段仅定义接口契约，不等于已证实的数据库列、外键或持久化约束，缺少映射与DDL依据时必须标待确认。
 overview应描述已核实的业务主题与关系；其他key分别归纳实体、流程、规则、数据知识，不把源码文件当作业务节点。
 源码仅作原始证据，业务知识卡片归档到Wiki，业务地图归档到Areas，分析总结由程序按实际保存结果生成到Projects。
 content可用给定稳定笔记路径创建Wiki双链，note_paths不是源码引用路径。不要罗列代码文件充当业务地图。
@@ -430,8 +434,8 @@ class ToolsService:
                 changed_names.append(name)
             prompt = json.dumps({"repository": context["repository"]["name"], "commit": context["commit"],
                 "scope_limited": truncated, "coverage": status["scope"], "changed_paths": changed_names, "note_paths": paths,
-                "files": [{key: (item["numbered_content"] if key == "content" else item[key])
-                           for key in ("path", "content", "line_count", "truncated", "evidence")} for item in selected]}, ensure_ascii=False)
+                "files": [{key: (item["numbered_content"] if key == "content" else item["evidence_metadata"] if key == "evidence" else item[key])
+                           for key in ("path", "content", "line_count", "truncated", "evidence", "evidence_uncovered_lines")} for item in selected]}, ensure_ascii=False)
             if len(prompt) + len(ANALYSIS_SYSTEM) > 44000:
                 raise AnalysisOutputError("分析上下文超过安全上限，请缩小分析范围。", "format")
             def check_analysis_policy():
@@ -579,7 +583,7 @@ class ToolsService:
                 "auto_enabled": bool((latest or {}).get("auto_enabled")) if automatic else True, "scope_limited": truncated, "vault_path": vault}, {})
             summary = (f"已保存 {len(written)} 篇业务知识卡片；业务地图{'已保存' if map_saved else '已建立更新建议'}，"
                        f"分析总结{'已保存' if summary_saved else '已建立更新建议'}。共创建 {created} 篇、更新 {updated} 篇文档；"
-                       "后续 Git 提交将自动触发有界 AI 更新。")
+                       "自动AI更新可在仓库设置中独立暂停。")
             summary += f" 本次提供 {len(selected)} / {status['scope']['total_files']} 个文件、{status['scope']['line_count']} 行代码片段。"
             if truncated:
                 summary += " 本次仅分析有界源码上下文，未覆盖整个仓库。"

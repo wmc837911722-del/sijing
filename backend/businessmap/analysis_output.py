@@ -26,17 +26,32 @@ def _source_lines(content):
     return [line.removesuffix("\r") for line in lines]
 
 
-def _evidence(path, lines):
-    meaningful = [(index, line.strip()) for index, line in enumerate(lines, 1)
-                  if line.strip() and not line.lstrip().startswith(("//", "#", "*", "/*", "import ", "package ", "from "))
-                  and line.strip() not in {"{", "}", "};"}]
-    if not meaningful:
-        return []
-    first, text = next(((index, line) for index, line in meaningful
-                        if re.search(r"\b(return|if|raise|throw|case|assert)\b", line)), meaningful[0])
-    snippet = text[:300]
-    identifier = hashlib.sha256(f"{path}\0{first}\0{snippet}".encode()).hexdigest()[:24]
-    return [{"evidence_id": "e_" + identifier, "path": path, "line_start": first, "line_end": first, "quote": snippet}]
+def _evidence(path, content):
+    groups, uncovered = [], []
+    pending, first, last = "", 1, 1
+    lines = content.split("\n")
+    for index, body in enumerate(lines, 1):
+        line = body + ("\n" if index < len(lines) else "")
+        if not line:
+            continue
+        if pending and len(pending) + len(line) > 1500:
+            groups.append((first, last, pending))
+            pending = ""
+        if len(line) > 1500:
+            uncovered.append(index)
+            continue
+        if not pending:
+            first = index
+        pending += line
+        last = index
+    if pending:
+        groups.append((first, last, pending))
+    blocks = []
+    for first, last, snippet in groups:
+        identifier = hashlib.sha256(f"{path}\0{first}\0{last}\0{snippet}".encode()).hexdigest()[:24]
+        blocks.append({"evidence_id": "e_" + identifier, "path": path,
+                       "line_start": first, "line_end": last, "quote": snippet})
+    return blocks, uncovered
 
 
 def prepare_file(item, limit, wire_budget):
@@ -44,12 +59,15 @@ def prepare_file(item, limit, wire_budget):
     while content:
         lines = _source_lines(content)
         numbered = "\n".join(f"{index}: {line}" for index, line in enumerate(lines, 1))
+        blocks, uncovered = _evidence(item["path"], content)
+        metadata = [{key: block[key] for key in ("evidence_id", "line_start", "line_end")} for block in blocks]
         exposed = {"path": item["path"], "content": numbered, "line_count": len(lines),
                    "truncated": len(content) < len(item["content"]) or bool(item.get("truncated", False)),
-                   "evidence": _evidence(item["path"], lines)}
+                   "evidence": metadata, "evidence_uncovered_lines": uncovered}
         size = len(json.dumps(exposed, ensure_ascii=False))
         if size <= wire_budget:
-            return {**exposed, "content": content, "numbered_content": numbered}, size
+            return {**exposed, "content": content, "numbered_content": numbered,
+                    "evidence": blocks, "evidence_metadata": metadata}, size
         content = content[:max(0, len(content) * wire_budget // size - 1)]
     return None, 0
 

@@ -160,15 +160,14 @@ def test_model_can_cite_only_a_current_request_evidence_id(analysis, monkeypatch
     def reply(payload):
         supplied = json.loads(payload["messages"][-1]["content"])
         evidence = supplied["files"][0]["evidence"]
-        assert sum(len(item["quote"]) for item in evidence) <= 300
-        assert evidence[0]["quote"] in CODE
+        assert all(set(item) == {"evidence_id", "line_start", "line_end"} for item in evidence)
         response = answer()
         response["notes"][0]["sources"] = [{"evidence_id": evidence[0]["evidence_id"]}]
         return response
     requests = model(monkeypatch, reply)
     tools.analyze(repo["id"])
     note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
-    assert "return amount > 0;" in note and "L3–L3" in note
+    assert "boolean refund(int amount)" in note and "return amount > 0;" in note and "L1–L5" in note
     assert len(requests) == 1
 
 
@@ -191,6 +190,47 @@ def test_native_evidence_id_retains_its_known_position_for_repeated_same_line_te
     candidate = supplied["evidence"][0]
     checked = verify_sources([{"evidence_id": candidate["evidence_id"]}], [supplied])
     assert checked == [{"path": PATH, "line_start": 1, "line_end": 1, "excerpt": content.rstrip("\n")}]
+
+
+@pytest.mark.parametrize("content", [
+    "@Data\npublic class AgentCredential {\n    private String credentialId;\n    private String issuedPlaintext;\n}\n",
+    "if (amount <= 0) {\n    throw new IllegalArgumentException();\n}\nreturn calculateRefund(amount);\n",
+    "class ManyFields {\n" + "".join(f"    private String field{index};\n" for index in range(120)) + "}\n",
+])
+def test_evidence_blocks_cover_dto_fields_and_control_flow_without_repeating_wire_source(content):
+    from businessmap.analysis_output import prepare_file, verify_sources
+    prepared, wire_size = prepare_file({"path": PATH, "content": content}, 6000, 37000)
+    blocks = prepared["evidence"]
+    assert "".join(block["quote"] for block in blocks) == content
+    assert all(len(block["quote"]) <= 1500 for block in blocks)
+    exposed = {"path": PATH, "content": prepared["numbered_content"], "line_count": prepared["line_count"],
+               "truncated": False, "evidence": prepared["evidence_metadata"], "evidence_uncovered_lines": []}
+    assert wire_size == len(json.dumps(exposed, ensure_ascii=False))
+    assert all(set(block) == {"evidence_id", "line_start", "line_end"} for block in exposed["evidence"])
+    checked = verify_sources([{"evidence_id": blocks[0]["evidence_id"]}], [prepared])
+    assert checked[0]["excerpt"] == blocks[0]["quote"].removesuffix("\n").removesuffix("\r")
+
+
+def test_oversized_lines_have_no_block_id_and_are_explicitly_uncovered():
+    from businessmap.analysis_output import prepare_file, verify_sources
+    content = "X" * 3301 + "\nnext();\n"
+    prepared, _ = prepare_file({"path": PATH, "content": content}, 6000, 37000)
+    assert "".join(block["quote"] for block in prepared["evidence"]) == "next();\n"
+    assert all(len(block["quote"]) <= 1500 for block in prepared["evidence"])
+    assert prepared["evidence_uncovered_lines"] == [1]
+    first = prepared["evidence"][0]
+    checked = verify_sources([{"evidence_id": first["evidence_id"]}], [prepared])[0]
+    assert checked == {"path": PATH, "line_start": 2, "line_end": 2, "excerpt": "next();"}
+
+
+def test_evidence_id_with_contradictory_source_coordinates_is_still_rejected():
+    from businessmap.analysis_output import prepare_file, verify_sources
+    prepared, _ = prepare_file({"path": PATH, "content": CODE}, 6000, 37000)
+    identifier = prepared["evidence"][0]["evidence_id"]
+    with pytest.raises(ToolError):
+        verify_sources([{"evidence_id": identifier, "path": "invented.java"}], [prepared])
+    with pytest.raises(ToolError):
+        verify_sources([{"evidence_id": identifier, "line_start": True}], [prepared])
 
 
 def test_failed_provider_records_safe_summary_and_does_not_retry(analysis, monkeypatch):

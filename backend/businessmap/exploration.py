@@ -72,6 +72,24 @@ SOURCE_TOOLS = [
 ]
 
 
+def _prompt_snapshot(system, messages, tools):
+    """Freeze the actual request before its transcript is appended in place."""
+    return {"system": system, "tools": json.dumps(tools, ensure_ascii=False),
+            "messages": tuple(json.dumps(message, ensure_ascii=False) for message in messages),
+            "bytes": len(json.dumps({"system": system, "messages": messages, "tools": tools}, ensure_ascii=False).encode())}
+
+
+def _prompt_input_bound(current, previous):
+    if previous is not None:
+        last, actual = previous
+        if (isinstance(actual, int) and not isinstance(actual, bool) and actual > 0
+                and current["system"] == last["system"] and current["tools"] == last["tools"]
+                and current["messages"][:len(last["messages"])] == last["messages"]):
+            # Reuse measured prefix tokens; count every new UTF-8 byte as a token.
+            return actual + max(0, current["bytes"] - last["bytes"])
+    return current["bytes"]
+
+
 class Exploration:
     def __init__(self, service, selected, mode, datasource, allowed, guard, progress=None, cancelled=None, repository_id=None):
         self.service, self.store, self.selected = service, service.store, selected
@@ -253,13 +271,15 @@ class Exploration:
                     for m in (history or [])[-8:] if m.get("role") in ("user", "assistant")]
         messages.append({"role": "user", "content": message})
         unstructured = 0
+        previous_prompt = None
         for turn in range(MAX_TURNS):
             self.guard()
             remaining = MAX_TOTAL_TOKENS - sum(self.usage.get(k) or 0 for k in ("input_tokens", "output_tokens"))
+            prompt = _prompt_snapshot(system, messages, tool_schemas)
             finish_only = (turn == MAX_TURNS - 1 or self.calls >= MAX_TOOLS - 1 or remaining <= 10000
                            or self.deadline - time.monotonic() <= 35
                            or len(json.dumps(messages, ensure_ascii=False)) > MAX_TRANSCRIPT_CHARS
-                           or len((system + json.dumps([messages, tool_schemas], ensure_ascii=False)).encode()) + 2300 >= remaining)
+                           or _prompt_input_bound(prompt, previous_prompt) + 2300 >= remaining)
             request_system, request_messages, request_tools, max_output = system, messages, tool_schemas, 1800
             if finish_only:
                 closing = self.closing_context(message, remaining)
@@ -272,11 +292,14 @@ class Exploration:
             if self.calls >= MAX_TOOLS or remaining <= 0:
                 break
             tool_names = {t["function"]["name"] for t in request_tools}
+            sent_prompt = _prompt_snapshot(request_system, request_messages, request_tools) if finish_only else prompt
             response = self.service.providers.tool_turn(request_system, request_messages, request_tools,
                 provider_id=self.selected["id"], max_output=max_output,
                 expected_destination=provider_destination(self.selected), before_send=self.guard,
                 timeout=min(60, max(0.1, self.deadline - time.monotonic())))
-            self.account(response.get("usage") or {})
+            usage = response.get("usage") or {}
+            previous_prompt = sent_prompt, usage.get("input_tokens")
+            self.account(usage)
             self.guard()
             calls = response.get("tool_calls") or []
             messages.append(response["assistant_message"])

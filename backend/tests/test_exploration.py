@@ -288,3 +288,81 @@ def test_closing_does_not_drop_a_late_exception_and_then_claim_a_complete_answer
           usage=lambda count: {"prompt_tokens": 10000 if count == 1 else 100, "completion_tokens": 10})
     result = service.chat("所有订单都能退款吗？")
     assert "补充" in result["answer"]
+
+
+def test_reported_prompt_usage_leaves_budget_to_read_late_english_source_helper(service, code_repository, monkeypatch):
+    """Actual source receipts grow in bytes much faster than reported prompt tokens."""
+    import subprocess
+    from pathlib import Path
+
+    repo = code_repository
+    source = Path(repo["path"])
+    path = "arena/JdbcStarServiceImpl.java"
+    (source / "arena").mkdir()
+    lines = ["package arena.settlement;", "public final class JdbcStarServiceImpl {",
+             "    public void settle(StarAdjustment adjustment) {"]
+    lines += [f'        settlementSteps.add(new StarAdjustment("round-{index:03d}", adjustment.getOriginalStars(), adjustment.getProtectionCard()));'
+              for index in range(150)]
+    lines.append("    }")
+    helper_start = len(lines) + 1
+    lines += ["    private int deductAfterProtection(StarAdjustment adjustment) {",
+              "        if (adjustment.consumeProtectionCard()) return adjustment.getOriginalStars();",
+              "        return Math.max(0, adjustment.getOriginalStars() - 1);", "    }", "}"]
+    (source / path).write_text("\n".join(lines) + "\n")
+    for index in range(7):
+        (source / f"arena/SettlementPlan{index}.java").write_text(
+            "package arena.settlement;\npublic final class SettlementPlan {\n" +
+            "    // settlement operation follows the configured business rule and preserves original adjustment details.\n" * 12 + "}\n")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "commit", "-qm", "Large English implementation with a later helper"], check=True)
+    repo["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    service.store._write_repo(repo)
+    reference = f"source://{repo['id']}/{repo['commit']}/{path}#L{helper_start}-L{len(lines)}"
+
+    def read_helper(payload):
+        assert "repository_read" in {tool["function"]["name"] for tool in payload["tools"]}, \
+            "full English transcript bytes must not force synthesis before the helper can be read"
+        return "repository_read", {"path": path, "line_start": helper_start, "line_end": len(lines)}
+
+    def final(payload):
+        assert "consumeProtectionCard" in json.dumps(payload["messages"], ensure_ascii=False)
+        return finish(reference, "实际实现先消耗保星卡，否则扣一星且不低于零。")
+
+    reported_inputs = (4000, 6000, 8000, 10000, 12000, 13500)
+    requests = model(monkeypatch, [("repository_search", {"query": "settlement"}),
+        ("repository_read", {"path": path, "line_start": 1, "line_end": 43}),
+        ("repository_read", {"path": path, "line_start": 44, "line_end": 86}),
+        ("repository_read", {"path": path, "line_start": 87, "line_end": 129}), read_helper, final],
+        usage=lambda count: {"prompt_tokens": reported_inputs[count - 1], "completion_tokens": 100})
+    result = service.chat("从结算实际实现和后部helper解释保星与扣星顺序。", repository_id=repo["id"])
+    assert len(requests) == 6 and result["completion"] == "complete"
+    assert result["sources"][0]["path"] == reference
+    assert result["usage"]["input_tokens"] == sum(reported_inputs)
+    assert result["usage"]["input_tokens"] + result["usage"]["output_tokens"] < 60000
+    # This must exercise the original failure, not a tiny synthetic tool result.
+    fifth = requests[4]
+    full_bytes = len(json.dumps({"system": fifth["messages"][0]["content"],
+        "messages": fifth["messages"][1:], "tools": fifth["tools"]}, ensure_ascii=False).encode())
+    remaining = 60000 - sum(reported_inputs[:4]) - 400
+    assert full_bytes + 2300 >= remaining
+
+
+@pytest.mark.parametrize("change", ["unknown", "zero", "boolean", "negative", "system", "tools", "message", "removed"])
+def test_prompt_estimate_falls_back_to_full_wire_when_usage_or_append_contract_is_unknown(change):
+    from businessmap.exploration import _prompt_input_bound, _prompt_snapshot
+
+    system, messages, tools = "stable policy", [{"role": "user", "content": "original evidence"}], []
+    previous = _prompt_snapshot(system, messages, tools)
+    actual = {"unknown": None, "zero": 0, "boolean": True, "negative": -1}.get(change, 10)
+    current_messages = messages + [{"role": "assistant", "content": "new observation"}]
+    if change == "system":
+        system += " changed"
+    elif change == "tools":
+        tools = [{"type": "function", "function": {"name": "changed"}}]
+    elif change == "message":
+        current_messages[0] = {"role": "user", "content": "replaced evidence"}
+    elif change == "removed":
+        current_messages = []
+    current = _prompt_snapshot(system, current_messages, tools)
+    assert _prompt_input_bound(current, (previous, actual)) == current["bytes"]
