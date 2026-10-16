@@ -553,9 +553,30 @@ class Store:
             self.git_transport.cleanup_secrets(repo_id)
             return updated
 
+    def projects(self) -> list[dict]:
+        from .business_projects import BusinessProjects
+        return BusinessProjects(self).list()
+
+    def get_project(self, project_id: str) -> dict:
+        from .business_projects import BusinessProjects
+        return BusinessProjects(self).get(project_id)
+
+    def create_project(self, name: str, description: str, repository_ids: list[str], repository_roles: dict | None = None) -> dict:
+        from .business_projects import BusinessProjects
+        return BusinessProjects(self).create(name, description, repository_ids, repository_roles)
+
+    def update_project(self, project_id: str, revision: str, **changes) -> dict:
+        from .business_projects import BusinessProjects
+        return BusinessProjects(self).update(project_id, revision, **changes)
+
+    def project_for_repository(self, repository_id: str) -> dict | None:
+        from .business_projects import BusinessProjects
+        return BusinessProjects(self).for_repository(repository_id)
+
     def workspace(self) -> dict:
         graph = self.graph()
         repos = self.repositories()
+        projects = self.projects()
         from .content_layout import is_source_document
         with self._lock:
             note_count = len(self._cache)
@@ -563,8 +584,8 @@ class Store:
         return {"name": "业务知识库", "vault_path": str(self.vault), "version": self.version,
                 "demo": self.config_get("demo_vault_path") == str(self.vault),
                 "stats": {"notes": note_count, "business_notes": note_count - source_count,
-                          "source_documents": source_count, "links": len(graph["edges"]), "repositories": len(repos)},
-                "repositories": repos, "recent_activity": self.activities()[:8]}
+                          "source_documents": source_count, "links": len(graph["edges"]), "repositories": len(repos), "projects": len(projects)},
+                "projects": projects, "repositories": repos, "recent_activity": self.activities()[:8]}
 
     def tasks(self) -> list[dict]:
         with self._lock, self._db() as db:

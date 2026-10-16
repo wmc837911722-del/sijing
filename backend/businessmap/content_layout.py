@@ -24,7 +24,27 @@ def summary_path(repo_id):
     return f"{PROJECT_ROOT}/{repo_id}/分析总结.md"
 
 
+def project_business_paths(project_id):
+    return {"overview": f"{MAP_ROOT}/项目/{project_id}/业务地图.md",
+            **{key: f"{WIKI_ROOT}/项目/{project_id}/{key}.md" for key in ("entities", "flows", "rules", "data")}}
+
+
+def project_summary_path(project_id):
+    return f"{PROJECT_ROOT}/项目/{project_id}/分析总结.md"
+
+
+def project_id_from_path(path):
+    for prefix in (WIKI_ROOT, MAP_ROOT, PROJECT_ROOT):
+        if path.startswith(prefix + "/项目/"):
+            parts = path[len(prefix) + len("/项目/"):].split("/")
+            if len(parts) >= 2:
+                return parts[0]
+    return None
+
+
 def repository_id_from_path(path):
+    if project_id_from_path(path):
+        return None
     for prefix in (SOURCE_ROOT, WIKI_ROOT, MAP_ROOT, PROJECT_ROOT, "代码索引", "业务地图"):
         if path.startswith(prefix + "/"):
             parts = path[len(prefix) + 1:].split("/")

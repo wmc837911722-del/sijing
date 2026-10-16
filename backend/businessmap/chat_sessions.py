@@ -67,6 +67,7 @@ class ChatSessions:
     @staticmethod
     def _public(session):
         result = {key: value for key, value in session.items() if not key.startswith("_")}
+        result.setdefault("project_id", None)
         result["messages"] = [{key: value for key, value in message.items() if not key.startswith("_")}
                               for message in session["messages"]]
         return result
@@ -74,7 +75,7 @@ class ChatSessions:
     @staticmethod
     def _summary(session):
         result = {key: session.get(key) for key in (
-            "id", "title", "created_at", "updated_at", "mode", "provider_id", "repository_id", "datasource_id", "pending")}
+            "id", "title", "created_at", "updated_at", "mode", "provider_id", "repository_id", "project_id", "datasource_id", "pending")}
         result["message_count"] = len(session["messages"])
         result["preview"] = session["messages"][-1]["content"][:120] if session["messages"] else ""
         return result
@@ -94,7 +95,7 @@ class ChatSessions:
             raise ToolError("会话标题过长。")
         session = {"id": uuid.uuid4().hex, "title": title or "新对话", "created_at": timestamp(),
                    "updated_at": timestamp(), "messages": [], "mode": "knowledge", "provider_id": None,
-                   "repository_id": None, "datasource_id": None, "pending": False, "pending_activity": [],
+                   "repository_id": None, "project_id": None, "datasource_id": None, "pending": False, "pending_activity": [],
                    "cancel_requested": False, "earlier_messages_removed": 0,
                    "_vault_path": str(self.store.vault), "_automatic_title": not bool(title)}
         self._save(session)
@@ -109,7 +110,7 @@ class ChatSessions:
             if entry.get("pending"):
                 self.get(entry["id"])
         entries = [entry for entry in self.store.config_get("chat_index", []) if entry.get("_vault_path") == vault]
-        return [{key: value for key, value in entry.items() if not key.startswith("_")}
+        return [{"project_id": None, **{key: value for key, value in entry.items() if not key.startswith("_")}}
                 for entry in sorted(entries, key=lambda item: item["updated_at"], reverse=True)]
 
     def _recover(self, session):
@@ -156,14 +157,15 @@ class ChatSessions:
         # flag in a SQLite transaction so concurrent progress cannot erase it.
         return self._public(self.store.config_update(self._key(chat_id), request_stop))
 
-    def send(self, chat_id, message, mode="knowledge", provider_id=None, repository_id=None, datasource_id=None):
+    def send(self, chat_id, message, mode="knowledge", provider_id=None, repository_id=None, datasource_id=None,
+             project_id=None):
         self._read(chat_id)
         if mode not in ("knowledge", "data") or not isinstance(message, str) or not message.strip() or len(message) > 8000:
             raise ToolError("请提供有效的问题和模式。")
         with self._lock(chat_id):
             session = self._recover(self._read(chat_id))
-            self.service.validate_selections(provider_id, repository_id, datasource_id)
-            scope = self.service.history_scope(mode, repository_id, datasource_id, provider_id)
+            self.service.validate_selections(provider_id, repository_id, datasource_id, project_id=project_id)
+            scope = self.service.history_scope(mode, repository_id, datasource_id, provider_id, project_id=project_id)
             history = []
             for previous in reversed(session["messages"]):
                 if previous.get("_scope") != scope or previous.get("error"):
@@ -174,7 +176,7 @@ class ChatSessions:
             history.reverse()
             if session["_automatic_title"] and not session["messages"]:
                 session["title"] = re.sub(r"\s+", " ", message).strip()[:60]
-            session.update(mode=mode, provider_id=provider_id, repository_id=repository_id,
+            session.update(mode=mode, provider_id=provider_id, repository_id=repository_id, project_id=project_id,
                            datasource_id=datasource_id, pending=True, pending_activity=[],
                            cancel_requested=False, updated_at=timestamp())
             session["messages"].append({"id": uuid.uuid4().hex, "role": "user", "content": message, "_scope": scope})
@@ -210,7 +212,7 @@ class ChatSessions:
             try:
                 reply = self.service.chat(message, mode, datasource_id, history, provider_id, repository_id,
                                           expected_vault=session["_vault_path"], expected_history_scope=scope,
-                                          progress=progress, cancelled=cancelled)
+                                          progress=progress, cancelled=cancelled, project_id=project_id)
                 assistant = {"id": uuid.uuid4().hex, "role": "assistant", "content": reply["answer"], "_scope": scope}
                 assistant.update({key: reply[key] for key in ("sources", "result", "provider", "usage", "activities", "completion") if key in reply})
                 assistant.setdefault("activities", self._finished_activities(session["pending_activity"]))

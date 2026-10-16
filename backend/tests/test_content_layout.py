@@ -29,7 +29,7 @@ def test_business_graph_excludes_source_material_and_does_not_dangle_edges(store
     assert graph["edges"] == [{"source": "业务/规则.md", "target": "业务/流程.md"}]
     assert store.workspace()["stats"] == {
         "notes": 5, "business_notes": 2, "source_documents": 3,
-        "links": 1, "repositories": 0,
+        "links": 1, "repositories": 0, "projects": 0,
     }
 
 

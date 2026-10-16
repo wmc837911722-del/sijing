@@ -22,7 +22,7 @@ from .core import CoreError
 from .query import QueryService
 from .chat_sessions import ChatSessions
 from .exploration import Exploration
-from .content_layout import repository_id_from_path, SOURCE_ROOT
+from .content_layout import repository_id_from_path, project_id_from_path, SOURCE_ROOT
 from .knowledge import KnowledgeNavigator
 from .analysis_output import analysis_status, normalize_markdown, verify_sources, render_excerpt, prepare_file, AnalysisOutputError
 
@@ -61,11 +61,15 @@ class ToolsService:
         self.queries = QueryService(store)
         self.chats = ChatSessions(store, self)
 
-    def validate_selections(self, provider_id=None, repository_id=None, datasource_id=None):
+    def validate_selections(self, provider_id=None, repository_id=None, datasource_id=None, project_id=None):
+        if repository_id is not None and project_id is not None:
+            raise ToolError("不能同时选择业务项目和单个仓库。")
         if provider_id is not None and (not provider_id or not self.providers.get(provider_id)):
             raise ToolError("指定的模型配置不存在。", 404)
         if repository_id is not None:
             self.store.get_repository(repository_id)
+        if project_id is not None:
+            self.store.get_project(project_id)
         if datasource_id is not None:
             self.queries.get(datasource_id)
 
@@ -149,6 +153,16 @@ class ToolsService:
                 meta = yaml.safe_load(match.group(1))
                 if isinstance(meta, dict) and isinstance(meta.get("repository_id"), str):
                     ids.add(meta["repository_id"])
+                if isinstance(meta, dict) and "source_repositories" in meta:
+                    sources = meta["source_repositories"]
+                    if not isinstance(sources, list) or not sources:
+                        ids.add("invalid-project-provenance")
+                    else:
+                        for source in sources:
+                            if not isinstance(source, dict) or not isinstance(source.get("repository_id"), str):
+                                ids.add("invalid-project-provenance")
+                            else:
+                                ids.add(source["repository_id"])
             except yaml.YAMLError:
                 pass
         return ids
@@ -167,16 +181,47 @@ class ToolsService:
                 return False
         return True
 
-    def history_scope(self, mode, repository_id, datasource_id, provider_id=None):
+    def history_scope(self, mode, repository_id, datasource_id, provider_id=None, project_id=None):
         selected = self.providers.get(provider_id)
-        repos = [repository_id] if repository_id else sorted(r["id"] for r in self.store.repositories())
+        project = self.store.get_project(project_id) if project_id is not None else None
+        repos = sorted(project["repository_ids"]) if project else [repository_id] if repository_id else sorted(r["id"] for r in self.store.repositories())
         policies = {rid: self.store.config_get(f"repository_model_policy:{rid}") for rid in repos}
         policy_version = hashlib.sha256(json.dumps(policies, sort_keys=True).encode()).hexdigest()
-        return [mode, repository_id, datasource_id if mode == "data" else None,
-                provider_destination(selected) if selected else None, policy_version]
+        scope = [mode, repository_id, datasource_id if mode == "data" else None,
+                 provider_destination(selected) if selected else None, policy_version]
+        if project is not None:
+            scope.append({"project_id": project_id, "revision": project["revision"],
+                          "repositories": {rid: self.store.get_repository(rid).get("commit") for rid in repos}})
+        return scope
 
     def _eligible(self, note):
         path = note["path"]
+        content = note.get("content", "")
+        match = re.match(r"\A---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", content, re.S)
+        try:
+            meta = yaml.safe_load(match.group(1)) if match else {}
+        except yaml.YAMLError:
+            meta = {}
+        project_id = meta.get("project_id") if isinstance(meta, dict) else None
+        if project_id_from_path(path) or project_id is not None:
+            if not isinstance(project_id, str) or not isinstance(meta.get("source_repositories"), list):
+                return False
+            try:
+                project = self.store.get_project(project_id)
+                expected = {rid: self.store.get_repository(rid).get("commit") for rid in project["repository_ids"]}
+                sources = meta["source_repositories"]
+                actual = {s["repository_id"]: s["commit"] for s in sources}
+                if len(actual) != len(sources) or actual != expected:
+                    return False
+                state = self.store.config_get(f"project_analysis:{project_id}", {})
+                key = meta.get("generated_key")
+                entry = state.get("notes", {}).get(key) if isinstance(key, str) else None
+                return bool(entry and not entry.get("stale") and not entry.get("conflict")
+                            and state.get("vault_path") == str(self.store.vault)
+                            and state.get("project_revision") == project["revision"]
+                            and entry.get("revision") == note.get("revision"))
+            except (CoreError, KeyError, TypeError):
+                return False
         # Obsidian-style moves preserve frontmatter provenance. A generated note
         # must not become "manual/current" merely because its folder changed.
         if (not path.startswith(("业务地图/", "代码索引/"))
@@ -251,14 +296,23 @@ class ToolsService:
         except Exception:
             return False
 
-    def search(self, query, limit=8, repository_id=None, selected_provider=None, excluded=None):
+    def note_in_scope(self, note, repository_id=None, project_id=None):
+        ownership = self.note_repositories(note)
+        if repository_id is not None:
+            return repository_id in ownership
+        if project_id is not None:
+            members = set(self.store.get_project(project_id)["repository_ids"])
+            return bool(ownership and ownership <= members)
+        return True
+
+    def search(self, query, limit=8, repository_id=None, selected_provider=None, excluded=None, project_id=None):
         if not isinstance(query, str) or len(query) > 8000:
             raise ToolError("检索问题过长。")
         if repository_id is not None:
             self.store.get_repository(repository_id)
         decisions = {}
         def allowed(note):
-            if repository_id is not None and repository_id not in self.note_repositories(note):
+            if not self.note_in_scope(note, repository_id, project_id):
                 return False
             if not self._eligible(note):
                 return False
@@ -272,8 +326,8 @@ class ToolsService:
                     else navigator.list(limit=max(1, min(int(limit), 20))))
         return [self.store.read_note(note["path"]) for note in selected["notes"]]
 
-    def context(self, message, include_demo=True, repository_id=None, selected_provider=None, excluded=None):
-        notes = self.search(message, 8, repository_id, selected_provider, excluded)
+    def context(self, message, include_demo=True, repository_id=None, selected_provider=None, excluded=None, project_id=None):
+        notes = self.search(message, 8, repository_id, selected_provider, excluded, project_id)
         chunks, sources, budget = [], [], 22000
         for note in notes:
             if not include_demo:
@@ -290,10 +344,10 @@ class ToolsService:
         return chunks, sources
 
     def chat(self, message, mode="knowledge", datasource_id=None, history=None, provider_id=None, repository_id=None,
-             expected_vault=None, expected_history_scope=None, progress=None, cancelled=None):
+             expected_vault=None, expected_history_scope=None, progress=None, cancelled=None, project_id=None):
         if mode not in ("knowledge", "data") or not message.strip() or len(message) > 8000:
             raise ToolError("请提供有效的问题和模式。")
-        self.validate_selections(provider_id, repository_id, datasource_id)
+        self.validate_selections(provider_id, repository_id, datasource_id, project_id)
         vault = expected_vault or str(self.store.vault)
         def check_vault():
             if str(self.store.vault) != vault:
@@ -303,14 +357,17 @@ class ToolsService:
         selected_provider = self.providers.get(provider_id)
         if selected_provider and repository_id:
             self.repository_provider(repository_id, selected_provider)
+        if selected_provider and project_id:
+            for member in self.store.get_project(project_id)["repository_ids"]:
+                self.repository_provider(member, selected_provider)
         current_scope = self.history_scope(mode, repository_id, datasource_id,
-                                           selected_provider["id"] if selected_provider else provider_id)
+                                           selected_provider["id"] if selected_provider else provider_id, project_id)
         if expected_history_scope is not None and expected_history_scope != current_scope:
             raise ToolError("此会话的模型或仓库授权已变化，本次请求未发送，请重新提问。", 409)
         excluded = set()
         if not selected_provider:
             chunks, sources = self.context(message, include_demo=(mode != "data" or bool(ds and ds.get("demo"))),
-                                           repository_id=repository_id)
+                                           repository_id=repository_id, project_id=project_id)
             check_vault()
             if mode == "data":
                 answer = "尚未配置模型，未生成 SQL，也未访问数据库。配置模型后可使用数据问答；也可在 SQL 查询中直接运行自己的只读 SQL。"
@@ -323,7 +380,7 @@ class ToolsService:
         # Only server-owned history with the same destination and current policies is trusted.
         def check_request_policy():
             check_vault()
-            if current_scope != self.history_scope(mode, repository_id, datasource_id, selected_provider["id"]):
+            if current_scope != self.history_scope(mode, repository_id, datasource_id, selected_provider["id"], project_id):
                 raise ToolError("组装知识来源期间模型或仓库授权已变化，本次请求未发送，请重新提问。", 409)
         check_request_policy()
         if expected_history_scope != current_scope:
@@ -331,8 +388,7 @@ class ToolsService:
         if mode == "data" and not datasource_id:
             raise ToolError("数据问答需要选择数据源。")
         def allowed(note):
-            ownership = self.note_repositories(note)
-            if repository_id is not None and repository_id not in ownership:
+            if not self.note_in_scope(note, repository_id, project_id):
                 return False
             if not self._eligible(note):
                 return False
@@ -345,7 +401,7 @@ class ToolsService:
                     return False
             return True
         reply = Exploration(self, selected_provider, mode, ds, allowed, check_request_policy,
-                            progress=progress, cancelled=cancelled, repository_id=repository_id).run(message, history)
+                            progress=progress, cancelled=cancelled, repository_id=repository_id, project_id=project_id).run(message, history)
         if excluded:
             reply["answer"] = "已按仓库模型授权过滤知识来源，未授权或未绑定仓库的笔记未发送。\n\n" + reply["answer"]
         return reply
@@ -358,12 +414,17 @@ class ToolsService:
         return candidate
 
     def candidates(self):
-        return [c for c in self.store.config_get("analysis_candidates", []) if c["vault_path"] == str(self.store.vault)]
+        existing = self.store.config_get("analysis_candidates", [])
+        project_candidates = self.store.config_get("project_analysis_candidates", [])
+        return [c for c in [*existing, *project_candidates] if c["vault_path"] == str(self.store.vault)]
 
     def apply_candidate(self, candidate_id, revision):
         candidate = next((c for c in self.candidates() if c["id"] == candidate_id), None)
         if not candidate:
             raise ToolError("更新建议不存在。", 404)
+        if candidate.get("project_id"):
+            from .project_analysis import ProjectAnalysis
+            return ProjectAnalysis(self).apply_candidate(candidate_id, revision)
         repo = self.store.get_repository(candidate["repository_id"])
         if candidate["commit"] != repo.get("commit"):
             raise ToolError("代码已有新提交，此建议已过期，请重新分析。", 409)
@@ -379,6 +440,8 @@ class ToolsService:
         return saved
 
     def analyze(self, repo_id, automatic=False, changed_paths=None, task_id=None):
+        if self.store.project_for_repository(repo_id):
+            raise ToolError("该仓库已属于业务项目，请从项目发起前后端联合分析。", 409)
         from .content_layout import business_paths, summary_path
         with _ANALYSIS_LOCK, analysis_status(self.store, repo_id) as status:
             selected_provider = self.repository_provider(repo_id)
@@ -597,6 +660,10 @@ class ToolsService:
                     "usage": response["usage"], "provider": response["provider"]}
 
     def on_repository_synced(self, repo_id, changed_paths):
+        if self.store.project_for_repository(repo_id):
+            # Project results keep a commit snapshot and become ineligible when
+            # any member changes. Project analysis is explicitly started by users.
+            return
         state = self.store.config_get(f"ai_analysis:{repo_id}", {})
         if not state.get("auto_enabled"):
             return
@@ -633,6 +700,8 @@ class ToolsService:
 
     def set_auto_analysis(self, repo_id, enabled):
         self.store.get_repository(repo_id)
+        if enabled and self.store.project_for_repository(repo_id):
+            raise ToolError("该仓库属于业务项目，请使用项目联合分析。", 409)
         state = self.store.config_get(f"ai_analysis:{repo_id}", {})
         if enabled and not state.get("last_analyzed_commit"):
             raise ToolError("请先主动执行一次 AI 业务分析，再启用自动更新。", 409)
@@ -710,6 +779,7 @@ class ChatBody(Body):
     datasource_id: str | None = None
     provider_id: str | None = Field(default=None, max_length=160)
     repository_id: str | None = Field(default=None, max_length=160)
+    project_id: str | None = Field(default=None, max_length=160)
     history: list[HistoryMessage] = Field(default_factory=list, max_length=30)
 
 
@@ -722,6 +792,7 @@ class ChatMessageBody(Body):
     mode: Literal["knowledge", "data"]
     provider_id: str | None = Field(default=None, max_length=160)
     repository_id: str | None = Field(default=None, max_length=160)
+    project_id: str | None = Field(default=None, max_length=160)
     datasource_id: str | None = Field(default=None, max_length=160)
 
 
@@ -741,6 +812,8 @@ def create_router(store):
     router = APIRouter(prefix="/api", route_class=ToolRoute)
     service = ToolsService(store)
     store.on_repository_synced = service.on_repository_synced
+    from .project_routes import create_project_router
+    router.include_router(create_project_router(service))
 
     @router.get("/settings")
     def settings():
@@ -794,7 +867,7 @@ def create_router(store):
     @router.post("/chat")
     def chat(body: ChatBody):
         return service.chat(body.message, body.mode, body.datasource_id, [m.model_dump() for m in body.history],
-                            body.provider_id, body.repository_id)
+                            body.provider_id, body.repository_id, project_id=body.project_id)
 
     @router.get("/chats")
     def list_chats():

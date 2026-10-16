@@ -31,3 +31,42 @@
   .repository-form-scroll { padding: 19px 23px; }
   .repository-form-footer { padding: 13px 23px 16px; }
 }
+.project-heading-actions { display: flex; gap: 10px; flex-shrink: 0; }
+.business-project { padding-top: 26px; border-top: 1px solid var(--line); }
+.project-section-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 18px; margin-bottom: 18px; }
+.project-section-heading h2 { display: flex; align-items: center; gap: 10px; margin: 0; font-size: 20px; overflow-wrap: anywhere; }
+.project-section-heading p { color: var(--muted); font-size: 13px; margin: 8px 0 0; max-width: 70ch; line-height: 1.7; }
+.project-section-heading > .button { flex-shrink: 0; }
+.project-analysis-controls { display: flex; align-items: center; gap: 24px; justify-content: space-between; }
+.project-analysis-controls .repo-model-binding { flex: 1; min-width: 0; border-top: 0; padding: 0; }
+.project-analysis-controls > .button { flex-shrink: 0; }
+.project-repositories { margin-top: 22px; }
+.project-role-group + .project-role-group { margin-top: 25px; }
+.project-role-group > h3 { margin: 0 0 12px; font-size: 13px; color: var(--muted); font-weight: 500; }
+.project-repository { padding: 16px; }
+.project-repository .repo-card-top { margin-bottom: 10px; }
+.project-repository .repo-symbol { width: 30px; height: 30px; }
+.project-repository .repo-symbol svg { width: 18px; height: 18px; }
+.project-repository .repo-actions { justify-content: flex-start; }
+.project-member-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.project-member-fieldset legend { font-size: 13px; font-weight: 500; padding: 0; margin-bottom: 8px; }
+.project-member-options { max-height: 250px; overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+.project-member-option { display: flex; align-items: center; gap: 12px; padding: 11px 13px; border-bottom: 1px solid var(--line); }
+.project-member-option:last-child { border-bottom: 0; }
+.project-member-option label { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; cursor: pointer; }
+.project-member-option input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); flex-shrink: 0; }
+.project-member-option strong { font-size: 12px; font-weight: 500; display: block; overflow-wrap: anywhere; }
+.project-member-option small { display: block; color: var(--muted); font-size: 11px; margin-top: 4px; }
+.project-member-option select { width: 82px; flex-shrink: 0; }
+.project-advanced { margin-top: 30px; }
+.project-advanced-actions { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 15px 15px; align-items: center; }
+.project-advanced-actions .form-hint { width: 100%; margin: 0; }
+.project-import-side { border: 0; border-top: 1px solid var(--line); padding: 18px 0 0; margin: 4px 0 0; min-width: 0; }
+.project-import-side legend { padding: 0 10px 0 0; font-size: 15px; font-weight: 500; }
+.project-import-side .repository-advanced .button { justify-self: start; }
+@media (max-width: 880px) {
+  .repositories-content .page-heading { align-items: flex-start; flex-direction: column; }
+  .project-analysis-controls { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .project-analysis-controls > .button { margin-bottom: 14px; }
+  .project-section-heading h2 { flex-wrap: wrap; font-size: 18px; }
+}

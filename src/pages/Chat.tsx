@@ -1,31 +1,31 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, Database, FileBarChart2, FileText, GitBranch, LoaderCircle, MessageSquare, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings2, Sparkles, Square, TriangleAlert } from 'lucide-react';
+import { ArrowRight, ArrowUp, BookOpen, Check, ChevronDown, Database, FileBarChart2, FileText, FolderOpen, GitBranch, LoaderCircle, MessageSquare, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings2, Sparkles, Square, TriangleAlert } from 'lucide-react';
 import { errorMessage, formatTime, get, post } from '../api';
 import { MarkdownView } from '../components/MarkdownView';
 import { ResultsTable } from '../components/UI';
 import { BrandMark } from '../components/BrandMark';
-import type { Datasource, NoteSummary, Notify, QueryResult, Report, Repository, RepositoryModelPolicy, Settings } from '../types';
+import type { BusinessProject, Datasource, NoteSummary, Notify, QueryResult, Report, Repository, RepositoryModelPolicy, Settings } from '../types';
 import '../chat.css';
 
 type Mode = 'knowledge' | 'data';
 type ChatActivity = { id: string; tool: string; label: string; status: 'running' | 'complete' | 'error'; path?: string; detail?: string };
 type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string; sources?: { path: string; title: string; revision?: string }[]; result?: QueryResult; provider?: string; error?: string | boolean; activities?: ChatActivity[]; completion?: 'complete' | 'limited' };
-type ChatSession = { id: string; title: string; created_at: string; updated_at: string; messages: ChatMessage[]; mode: Mode; provider_id?: string | null; repository_id?: string | null; datasource_id?: string | null; pending?: boolean; pending_activity?: ChatActivity[]; cancel_requested?: boolean; earlier_messages_removed?: number };
+type ChatSession = { id: string; title: string; created_at: string; updated_at: string; messages: ChatMessage[]; mode: Mode; provider_id?: string | null; repository_id?: string | null; project_id?: string | null; datasource_id?: string | null; pending?: boolean; pending_activity?: ChatActivity[]; cancel_requested?: boolean; earlier_messages_removed?: number };
 type ChatSummary = Pick<ChatSession, 'id' | 'title' | 'created_at' | 'updated_at' | 'pending'>;
-type Selection = { mode: Mode; provider_id: string; repository_id: string; datasource_id: string };
+type Selection = { mode: Mode; provider_id: string; repository_id: string; project_id: string; datasource_id: string };
 type Failure = { message: string; question: string; saved: boolean };
-type Props = { settings: Settings | null; repositories: Repository[]; datasources: Datasource[]; notes: NoteSummary[]; businessNoteCount: number; notify: Notify; onOpen: (path: string) => void; onReport: () => void; onConfigure: () => void; onRepositories: () => void; refresh: () => void };
+type Props = { settings: Settings | null; repositories: Repository[]; projects: BusinessProject[]; datasources: Datasource[]; notes: NoteSummary[]; businessNoteCount: number; notify: Notify; onOpen: (path: string) => void; onReport: () => void; onConfigure: () => void; onRepositories: () => void; refresh: () => void };
 
 const NEW_CHAT = '__new__';
 const MESSAGE_LIMIT = 8000;
-const DEFAULT_SELECTION: Selection = { mode: 'knowledge', provider_id: '', repository_id: '', datasource_id: '' };
+const DEFAULT_SELECTION: Selection = { mode: 'knowledge', provider_id: '', repository_id: '', project_id: '', datasource_id: '' };
 const SUGGESTIONS = {
   knowledge: [ ['梳理业务', '这个系统有哪些核心业务流程？'], ['理解规则', '订单退款需要满足哪些条件？'], ['追溯代码', '订单状态如何流转，对应哪些代码？'] ],
   data: [ ['汇总数据', '按渠道统计订单数量和金额'], ['分析趋势', '最近 7 天每天的订单数量是多少？'], ['查看分布', '各订单状态分别有多少条记录？'] ],
 };
 
 function selectionFrom(session: ChatSession): Selection {
-  return { mode: session.mode || 'knowledge', provider_id: session.provider_id || '', repository_id: session.repository_id || '', datasource_id: session.datasource_id || '' };
+  return { mode: session.mode || 'knowledge', provider_id: session.provider_id || '', repository_id: session.repository_id || '', project_id: session.project_id || '', datasource_id: session.datasource_id || '' };
 }
 
 function mergeHistory(current: ChatSummary[], incoming: ChatSummary[]): ChatSummary[] {
@@ -80,7 +80,7 @@ function QueryCard({ result, title, notify, onReport, refresh }: { result: Query
   </section>;
 }
 
-export default function Chat({ settings, repositories, datasources, notes, businessNoteCount, notify, onOpen, onReport, onConfigure, onRepositories, refresh }: Props) {
+export default function Chat({ settings, repositories, projects, datasources, notes, businessNoteCount, notify, onOpen, onReport, onConfigure, onRepositories, refresh }: Props) {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [sessions, setSessions] = useState<Record<string, ChatSession>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -121,20 +121,24 @@ export default function Chat({ settings, repositories, datasources, notes, busin
   const effectiveProviderId = selection.provider_id || settings?.active_provider_id;
   const provider = settings?.providers.find(item => item.id === effectiveProviderId);
   const repository = repositories.find(item => item.id === selection.repository_id);
-  const currentPolicy = repositoryPolicy?.id === selection.repository_id ? repositoryPolicy : null;
+  const project = projects.find(item => item.id === selection.project_id);
+  const scopeId = selection.project_id ? `project:${selection.project_id}` : selection.repository_id;
+  const scopeLabel = selection.project_id ? '项目' : '仓库';
+  const currentPolicy = repositoryPolicy?.id === scopeId ? repositoryPolicy : null;
   const policy = currentPolicy?.policy;
-  const policyMismatch = Boolean(provider && selection.repository_id && (policy?.status !== 'ready' || policy.provider_id !== effectiveProviderId));
+  const policyMismatch = Boolean(provider && scopeId && (policy?.status !== 'ready' || policy.provider_id !== effectiveProviderId));
   const filteredChats = chats.filter(chat => chat.title.toLocaleLowerCase().includes(filter.trim().toLocaleLowerCase()));
 
   useEffect(() => {
-    if (!selection.repository_id) { setRepositoryPolicy(null); return; }
+    if (!scopeId) { setRepositoryPolicy(null); return; }
     let live = true;
-    const id = selection.repository_id;
-    void get<RepositoryModelPolicy>(`/api/repositories/${encodeURIComponent(id)}/model-policy`)
+    const id = scopeId;
+    const policyPath = selection.project_id ? `/api/projects/${encodeURIComponent(selection.project_id)}/model-policy` : `/api/repositories/${encodeURIComponent(selection.repository_id)}/model-policy`;
+    void get<RepositoryModelPolicy>(policyPath)
       .then(value => { if (live) setRepositoryPolicy({ id, policy: value }); })
       .catch(err => { if (live) setRepositoryPolicy({ id, error: errorMessage(err) }); });
     return () => { live = false; };
-  }, [selection.repository_id, repositories, settings?.providers]);
+  }, [scopeId, selection.project_id, selection.repository_id, repositories, projects, settings?.providers]);
 
   useEffect(() => {
     let live = true;
@@ -217,7 +221,7 @@ export default function Chat({ settings, repositories, datasources, notes, busin
   const send = async () => {
     const message = text.trim();
     if (!message || exceedsLimit || busy || sendLocks.current.has(key) || creatingRef.current || loading || (activeId && !session)) return;
-    if (policyMismatch) { notify('请先核对仓库绑定，并使用仓库允许的模型', 'error'); return; }
+    if (policyMismatch) { notify(`请先核对${scopeLabel}绑定，并使用允许的模型`, 'error'); return; }
     if (selection.mode === 'data' && !datasources.some(item => item.id === selection.datasource_id)) { notify('请先选择本次查询使用的数据库', 'error'); return; }
     let target = activeId;
     let lockKey = key;
@@ -244,7 +248,7 @@ export default function Chat({ settings, repositories, datasources, notes, busin
       }
       const value = await post<ChatSession>(`/api/chats/${encodeURIComponent(target)}/messages`, {
         message, mode: selection.mode, provider_id: selection.provider_id || null,
-        repository_id: selection.repository_id || null, datasource_id: selection.datasource_id || null,
+        repository_id: selection.repository_id || null, project_id: selection.project_id || null, datasource_id: selection.datasource_id || null,
       });
       remember(value); refresh();
     } catch (err) {
@@ -288,7 +292,7 @@ export default function Chat({ settings, repositories, datasources, notes, busin
           {loading ? <div className="bm-chat-loading" role="status"><LoaderCircle size={20} className="bm-chat-spin"/>正在加载对话…</div> : !messages.length && !busy && !failure ? <div className="bm-chat-welcome">
             <div className="bm-chat-welcome-brand"><div className="bm-chat-welcome-symbol"><BrandMark size={23}/></div><p className="bm-chat-eyebrow">思径助理</p></div><h2>从一个业务问题开始</h2><p>看懂业务，找到依据。</p>
             <div className="bm-chat-suggestions">{SUGGESTIONS[selection.mode].map(([label, question]) => <button type="button" key={question} onClick={() => { setDraft(question); input.current?.focus(); }}><span>{label}<ArrowRight size={14}/></span><strong>{question}</strong></button>)}</div>
-            <div className="bm-chat-welcome-context"><span><BookOpen size={14}/>{businessNoteCount} 篇业务知识</span><span><GitBranch size={14}/>{repositories.length} 个仓库</span></div>
+            <div className="bm-chat-welcome-context"><span><BookOpen size={14}/>{businessNoteCount} 篇业务知识</span><span><FolderOpen size={14}/>{projects.length} 个业务项目 · {repositories.length} 个仓库</span></div>
           </div> : null}
           {Boolean(session?.earlier_messages_removed) && <p className="bm-chat-earlier-note">这段对话较长，当前保留最近 {messages.length} 条消息。</p>}
           <div className="bm-chat-log" role="log" aria-label="对话消息" aria-live="polite" aria-relevant="additions">
@@ -307,9 +311,9 @@ export default function Chat({ settings, repositories, datasources, notes, busin
       </div>
 
       <div className="bm-chat-composer-area">
-        {selection.repository_id && <div className="bm-chat-repository-policy" role="status">
-          <span>{currentPolicy?.error ? `无法读取仓库模型绑定：${currentPolicy.error}` : !policy ? '正在读取仓库允许的模型…' : policy.status === 'ready' ? `仓库绑定：${policy.provider_name || '已配置模型'} · ${policy.model} · ${policy.base_url}` : policy.status === 'changed' ? '仓库绑定的模型配置已变化，请重新确认。' : policy.status === 'missing' ? '仓库绑定的模型已移除，请重新绑定。' : '此仓库尚未绑定模型；绑定后可进行 AI 问答。'}{!provider && ' 当前使用本地检索，不会发送代码。'}</span>
-          {policy?.status === 'ready' && policy.provider_id !== effectiveProviderId ? <button type="button" className="bm-chat-text-button" disabled={busy || creating} onClick={() => updateSelection({ provider_id: policy.provider_id || '' })}>使用绑定模型</button> : policy && policy.status !== 'ready' ? <button type="button" className="bm-chat-text-button" onClick={onRepositories}>前往仓库绑定</button> : null}
+        {scopeId && <div className="bm-chat-repository-policy" role="status">
+          <span>{currentPolicy?.error ? `无法读取${scopeLabel}模型绑定：${currentPolicy.error}` : !policy ? `正在读取${scopeLabel}允许的模型…` : policy.status === 'ready' ? `${scopeLabel}绑定：${policy.provider_name || '已配置模型'} · ${policy.model} · ${policy.base_url}` : policy.status === 'changed' ? `${scopeLabel}的模型配置或成员已变化，请重新确认绑定。` : policy.status === 'missing' ? '绑定的模型已移除，请重新绑定。' : `此${scopeLabel}尚未绑定模型；绑定后可进行 AI 问答。`}{!provider && ' 当前使用本地检索，不会发送代码。'}</span>
+          {policy?.status === 'ready' && policy.provider_id !== effectiveProviderId ? <button type="button" className="bm-chat-text-button" disabled={busy || creating} onClick={() => updateSelection({ provider_id: policy.provider_id || '' })}>使用绑定模型</button> : policy && policy.status !== 'ready' ? <button type="button" className="bm-chat-text-button" onClick={onRepositories}>前往项目与仓库绑定</button> : null}
         </div>}
         <form className="bm-chat-composer" onSubmit={event => { event.preventDefault(); void send(); }}>
           <label className="bm-chat-input-label" htmlFor="bm-chat-input">{selection.mode === 'data' ? '描述你想查询的业务数据' : '询问业务规则、流程或代码'}</label>
@@ -317,10 +321,11 @@ export default function Chat({ settings, repositories, datasources, notes, busin
           {messageLength > 7000 && <p id="bm-chat-input-limit" className={`bm-chat-input-limit${exceedsLimit ? ' is-invalid' : ''}`} role={exceedsLimit ? 'alert' : undefined}>{messageLength.toLocaleString()} / {MESSAGE_LIMIT.toLocaleString()} 字符{exceedsLimit ? ' · 请缩短问题后发送，当前文字已保留。' : ''}</p>}
           <div className="bm-chat-composer-bottom"><div className="bm-chat-controls">
             <label className="bm-chat-select"><Sparkles size={14}/><span>模型</span><select aria-label="问答使用的模型" value={selection.provider_id} onChange={event => updateSelection({ provider_id: event.target.value })} disabled={busy || creating}><option value="">{settings?.active_provider_id ? `默认 · ${settings.providers.find(item => item.id === settings.active_provider_id)?.name || '当前模型'}` : '本地知识检索'}</option>{selection.provider_id && !settings?.providers.some(item => item.id === selection.provider_id) && <option value={selection.provider_id} disabled>已移除的模型</option>}{settings?.providers.map(item => <option key={item.id} value={item.id}>{item.name} · {item.model}</option>)}</select></label>
-            <label className="bm-chat-select"><GitBranch size={14}/><span>仓库</span><select aria-label="问答使用的仓库" value={selection.repository_id} onChange={event => updateSelection({ repository_id: event.target.value })} disabled={busy || creating}><option value="">当前知识库</option>{selection.repository_id && !repository && <option value={selection.repository_id} disabled>已移除的仓库</option>}{repositories.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+            <label className="bm-chat-select"><FolderOpen size={14}/><span>项目</span><select aria-label="问答使用的项目" value={selection.project_id} onChange={event => updateSelection({ project_id: event.target.value, repository_id: '' })} disabled={busy || creating}><option value="">当前知识库</option>{selection.project_id && !project && <option value={selection.project_id} disabled>已移除的项目</option>}{projects.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+            <details className="bm-chat-scope-advanced"><summary>单仓范围{repository ? ` · ${repository.name}` : ''}</summary><label className="bm-chat-select"><GitBranch size={14}/><span>仓库</span><select aria-label="问答使用的仓库" value={selection.repository_id} onChange={event => updateSelection({ repository_id: event.target.value, project_id: '' })} disabled={busy || creating}><option value="">全部知识</option>{selection.repository_id && !repository && <option value={selection.repository_id} disabled>已移除的仓库</option>}{repositories.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></details>
             <label className="bm-chat-select"><BookOpen size={14}/><span>模式</span><select aria-label="问答模式" value={selection.mode} onChange={event => updateSelection({ mode: event.target.value as Mode })} disabled={busy || creating}><option value="knowledge">知识问答</option><option value="data">只读问数</option></select></label>
             <label className={`bm-chat-select${selection.mode !== 'data' ? ' is-inactive' : ''}`}><Database size={14}/><span>数据库</span><select aria-label="问答使用的数据库" value={selection.datasource_id} onChange={event => updateSelection({ datasource_id: event.target.value })} disabled={selection.mode !== 'data' || busy || creating}><option value="">{datasources.length ? '选择数据库' : '尚未配置'}</option>{selection.datasource_id && !datasources.some(item => item.id === selection.datasource_id) && <option value={selection.datasource_id} disabled>已移除的数据库</option>}{datasources.map(item => <option key={item.id} value={item.id}>{item.name}{item.demo ? '（示例）' : ''}</option>)}</select></label>
-          </div>{busy ? <button type="button" className="bm-chat-send" disabled={stopRequested || !session?.pending} onClick={() => void stop()} aria-label={stopRequested ? '正在停止' : '停止回答'} title={stopRequested ? '当前模型调用或工具执行结束后停止' : '停止探索；当前模型调用或工具执行会先结束'}>{stopRequested ? <LoaderCircle size={18} className="bm-chat-spin"/> : <Square size={15} fill="currentColor"/>}</button> : <button type="submit" className="bm-chat-send" disabled={!text.trim() || exceedsLimit || creating || loading || policyMismatch || Boolean(activeId && !session)} aria-label="发送问题" title={policyMismatch ? '先使用仓库绑定的模型' : '发送问题（Enter）'}>{creating ? <LoaderCircle size={19} className="bm-chat-spin"/> : <ArrowUp size={21}/>}</button>}</div>
+          </div>{busy ? <button type="button" className="bm-chat-send" disabled={stopRequested || !session?.pending} onClick={() => void stop()} aria-label={stopRequested ? '正在停止' : '停止回答'} title={stopRequested ? '当前模型调用或工具执行结束后停止' : '停止探索；当前模型调用或工具执行会先结束'}>{stopRequested ? <LoaderCircle size={18} className="bm-chat-spin"/> : <Square size={15} fill="currentColor"/>}</button> : <button type="submit" className="bm-chat-send" disabled={!text.trim() || exceedsLimit || creating || loading || policyMismatch || Boolean(activeId && !session)} aria-label="发送问题" title={policyMismatch ? `先使用${scopeLabel}绑定的模型` : '发送问题（Enter）'}>{creating ? <LoaderCircle size={19} className="bm-chat-spin"/> : <ArrowUp size={21}/>}</button>}</div>
         </form>
         <div className="bm-chat-composer-note"><span>{selection.mode === 'data' ? '仅执行只读查询，结果可保存为报表' : provider ? `${provider.model} · 回答附业务知识来源` : '未选择模型时，使用本地笔记检索'}</span><span>Enter 发送 · Shift + Enter 换行</span></div>
       </div>
