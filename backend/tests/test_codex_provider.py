@@ -51,6 +51,12 @@ else:
     elif mode == 'quota':
         print(json.dumps({'type': 'turn.failed', 'error': {'message': 'usage limit reached raw-secret'}}))
         sys.exit(1)
+    elif mode == 'login-error':
+        print(json.dumps({'type': 'turn.failed', 'error': {'message': 'authentication failed raw-secret'}}))
+        sys.exit(1)
+    elif mode == 'stream-error':
+        print(json.dumps({'type': 'error', 'message': 'stream disconnected raw-secret'}))
+        sys.exit(1)
     elif mode == 'tool':
         print(json.dumps({'type': 'item.started', 'item': {'id': 'a', 'type': 'command_execution', 'command': 'raw-secret'}}), flush=True)
         time.sleep(5)
@@ -68,7 +74,7 @@ else:
         if mode == 'warning':
             print(json.dumps({'type': 'item.completed', 'item': {'id':'warning', 'type':'error', 'message':'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.'}}))
         print(json.dumps({'type': 'turn.started'}))
-        print(json.dumps({'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'text': json.dumps({'answer': '{"title":"规则","summary":"已分析","findings":[],"unknowns":[]}'})}}))
+        print(json.dumps({'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'text': 'raw-secret' if mode == 'bad-envelope' else json.dumps({'answer': '{"title":"规则","summary":"已分析","findings":[],"unknowns":[]}'})}}))
         if mode != 'incomplete':
             usage = {'input_tokens': 110, 'cached_input_tokens': 10, 'output_tokens': 3000 if mode == 'limited' else 30}
             if mode.startswith('missing-'):
@@ -212,6 +218,20 @@ def test_codex_unverified_catalog_prevents_any_source_dispatch(service, cli):
     with pytest.raises(ToolError, match="工具边界"):
         service.complete("规则", "源码", provider_id=selected["id"])
     assert not (cli / "invocation.json").exists()
+
+
+@pytest.mark.parametrize("mode,reason", [
+    ("quota", "quota"), ("login-error", "login"), ("stream-error", "stream_error"),
+    ("stderr", "process_exit"), ("malformed", "invalid_event"), ("bad-envelope", "invalid_json"),
+    ("incomplete", "incomplete"), ("tool", "unexpected_tool"), ("huge", "output_limit"),
+])
+def test_codex_failure_keeps_only_fixed_reason_code(service, cli, mode, reason):
+    (cli / "mode").write_text(mode)
+    selected = save(service)
+    with pytest.raises(ToolError) as error:
+        service.complete("规则", "源码", provider_id=selected["id"])
+    assert getattr(error.value, "codex_reason", None) == reason
+    assert "raw-secret" not in str(error.value)
 
 
 def test_codex_pause_during_run_terminates_process_and_preserves_guard_reason(service, cli):

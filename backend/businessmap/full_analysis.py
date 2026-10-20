@@ -305,8 +305,12 @@ class FullProjectAnalysis:
     def _actionable_failure(self, run):
         # Only codes emitted by our controlled failure diagnostic may select
         # user-facing actions. Never derive UI messages from exception text.
+        from .codex_provider import CODEX_FAILURE_ACTIONS
         with self.store._lock, self.store._db() as db:
-            rows = db.execute("SELECT json_extract(data,'$.details.http_status') FROM full_analysis_chunks WHERE run_id=? AND status='failed'", (run["run_id"],)).fetchall()
+            rows = db.execute("SELECT json_extract(data,'$.details.http_status'),json_extract(data,'$.details.codex_reason') FROM full_analysis_chunks WHERE run_id=? AND status='failed'", (run["run_id"],)).fetchall()
+        codex_reasons = {row[1] for row in rows if isinstance(row[1], str) and row[1] in CODEX_FAILURE_ACTIONS}
+        if codex_reasons:
+            return next(message for reason, message in CODEX_FAILURE_ACTIONS.items() if reason in codex_reasons)
         codes = {row[0] for row in rows if isinstance(row[0], int) and not isinstance(row[0], bool)}
         actions = ((402, "模型余额不足（HTTP 402），请充值后继续完整分析；已成功片段已保留。"),
                    (401, "模型凭据或访问权限不可用（HTTP 401），请检查模型配置和权限后继续；已成功片段已保留。"),
@@ -706,6 +710,11 @@ class FullProjectAnalysis:
         code = getattr(error, "status_code", None)
         if isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599:
             details["status_code"] = code
+        from .codex_provider import CODEX_FAILURE_ACTIONS
+        codex_reason = getattr(error, "codex_reason", None)
+        if isinstance(codex_reason, str) and codex_reason in CODEX_FAILURE_ACTIONS:
+            details["codex_reason"] = codex_reason
+            return details
         if isinstance(error, ToolError) and isinstance(error.message, str):
             match = re.fullmatch(r"模型服务返回 HTTP ([1-5][0-9]{2})。请检查模型、地址、凭据或额度。", error.message)
             if match:
@@ -782,7 +791,7 @@ class FullProjectAnalysis:
                             # silently retried; transport/auth/input faults stop dispatch.
                             if not independent_output_failure:
                                 stop = True
-                            if getattr(error, "status_code", None) == 409:
+                            if getattr(error, "status_code", None) == 409 and not self._failure_details(error).get("codex_reason"):
                                 changed = ToolError("分析期间项目、代码版本或模型授权变化，已拒绝过时结果。", 409)
                             chunk.update(status="failed", error="来源或模型结果未通过完整批次核验。", category=getattr(error, "category", "model"),
                                          details=self._failure_details(error))
