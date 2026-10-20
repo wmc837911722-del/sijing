@@ -151,15 +151,20 @@ class FullProjectAnalysis:
     def _segment_identity(segment):
         return tuple(segment.get(key) for key in ("repository_id", "commit", "path", "blob", "line_start", "line_end", "content_hash", "kind", "redacted", "evidence_id"))
 
-    def _adopt_receipts(self, snapshot, run):
+    def _adopt_receipts(self, snapshot, run, migration=None):
         planned = self._chunks(run)
-        index = {self._segment_identity(segment): number for number, segment in enumerate(segment for chunk in planned for segment in chunk["segments"])}
+        index, segment_modules = {}, {}
+        for number, (module_id, segment) in enumerate((chunk["module_id"], segment) for chunk in planned for segment in chunk["segments"]):
+            identity = self._segment_identity(segment)
+            index[identity], segment_modules[identity] = number, module_id
         available, reused, used = set(index), [], set()
         with self.store._lock, self.store._db() as db:
-            rows = db.execute("SELECT data FROM full_analysis_runs WHERE project_id=? AND id<>? ORDER BY updated_at DESC", (run["project_id"], run["run_id"])).fetchall()
+            rows = ([( _json(migration["run"]),)] if migration else db.execute(
+                "SELECT data FROM full_analysis_runs WHERE project_id=? AND id<>? ORDER BY updated_at DESC",
+                (run["project_id"], run["run_id"])).fetchall())
         for row in rows:
             previous = json.loads(row[0])
-            authorized = previous.get("receipt_boundary") == run["receipt_boundary"]
+            authorized = bool(migration) or previous.get("receipt_boundary") == run["receipt_boundary"]
             if not authorized and not previous.get("receipt_boundary"):
                 # Older v3 runs did not store a boundary. Their snapshot hash
                 # can prove it without guessing from commits alone.
@@ -187,10 +192,12 @@ class FullProjectAnalysis:
                         break
                 if not valid:
                     continue
-                modules = {chunk["module_id"] for chunk in planned if any(self._segment_identity(segment) in identities for segment in chunk["segments"])}
+                modules = {segment_modules[identity] for identity in identities}
                 if modules != {old["module_id"]}:
                     continue
                 copied = {**old, "reused_from": {"run_id": previous["run_id"], "chunk_id": old["id"], "input_hash": old["input_hash"]}, "reused_at": now()}
+                if migration:
+                    copied["origin_provider"] = old.get("origin_provider", migration["source_provider"])
                 reused.append(copied)
                 used.update(identities)
         if not reused:
@@ -293,7 +300,7 @@ class FullProjectAnalysis:
 
     @staticmethod
     def _public(run):
-        return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "interrupted") if key in run}
+        return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "receipt_migration", "interrupted") if key in run}
 
     def _actionable_failure(self, run):
         # Only codes emitted by our controlled failure diagnostic may select
@@ -357,6 +364,148 @@ class FullProjectAnalysis:
         self.store.config_update("full_analysis_control:" + run["run_id"], lambda value: {**(value or {}), "paused": True, "cancelled": True}, {})
         run["status"] = "cancelled"
         return self._public(self._progress(run))
+
+    def continue_with_provider(self, project_id, provider_id, source_run_id):
+        """Explicitly move verified receipts to a newly authorized destination.
+
+        Unlike automatic reuse, this requires the original authorization still
+        to be current. No model calls or Markdown writes occur here.
+        """
+        with self._exclusive(project_id):
+            snapshot = self.project_analysis.snapshot(project_id)
+            previous = self._load(project_id)
+            if (not previous or previous["run_id"] != source_run_id
+                    or previous["snapshot_id"] != self._snapshot_id(snapshot)
+                    or previous.get("receipt_boundary") != self._receipt_boundary(snapshot)
+                    or previous.get("vault_path") != snapshot["vault_path"]):
+                raise ToolError("原分析断点或授权已变化，不能接续；请使用仍有效的原模型绑定。", 409)
+            selected = self.service.providers.get(provider_id)
+            if not selected:
+                raise ToolError("模型配置不存在。", 404)
+            if provider_destination(selected) == provider_destination(snapshot["provider"]):
+                raise ToolError("当前已绑定此模型，请直接继续完整分析。", 409)
+            completed = [chunk for chunk in self._chunks(previous) if chunk["status"] == "completed"]
+            # Reconstruct the original paid input from fixed, redacted Git blobs.
+            # A hash is not trusted merely because it is present in SQLite.
+            from .full_source import FullSourceInventory
+            with ExitStack() as sources:
+                inventories = {}
+                repositories = {repository["id"]: repository for repository in snapshot["repositories"]}
+                for chunk in completed:
+                    self.project_analysis.guard(snapshot)
+                    for segment in chunk["segments"]:
+                        rid = segment["repository_id"]
+                        if rid not in inventories:
+                            inventories[rid] = sources.enter_context(FullSourceInventory(self.store, repositories[rid]))
+                    if not self._receipt_input_matches(snapshot, previous, chunk, inventories) or not self._valid_receipt(chunk):
+                        raise ToolError("已完成结果的源码、输入或引用核验失败，未更改模型绑定。", 409)
+            current, auto_states = self._bind_continuation(snapshot, selected)
+            try:
+                self.project_analysis.guard(current)
+                self._plan(project_id, current)
+                run = self._load(project_id, self._snapshot_id(current))
+                migration = {"source_run_id": previous["run_id"],
+                             "source_provider": provider_destination(snapshot["provider"]),
+                             "target_provider": provider_destination(current["provider"]),
+                             "source_provider_name": snapshot["provider"]["name"],
+                             "target_provider_name": current["provider"]["name"], "created_at": now()}
+                self.project_analysis.guard(current)
+                self._adopt_receipts(current, run, {**migration, "run": previous})
+                if run.get("reused_chunks", 0) != len(completed):
+                    raise ToolError("完整结果未全部匹配新源码计划，原断点保留，未开始模型调用。", 409)
+                run.update(receipt_migration=migration, status="paused", summary="已核验并接续原模型的成功结果；保留原始来源，继续时仅发送未完成源码。")
+                self.store.config_set("full_analysis_control:" + run["run_id"], {"paused": True, "cancelled": False})
+                self._save(self._progress(run))
+            except Exception:
+                self._rollback_continuation(snapshot, current, auto_states)
+                raise
+            return self._public(run)
+
+    def _bind_continuation(self, snapshot, selected):
+        # Retain the exact revisions we write, rather than reading them after
+        # bind_model returns: another process can grant different consent then.
+        policies, auto_states = {}, {}
+        with self.store._lock, self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self.project_analysis.guard(snapshot)
+            current = self.service.providers.get(selected["id"])
+            if not current or provider_destination(current) != provider_destination(selected):
+                raise ToolError("模型目标已变化，未更改模型绑定。", 409)
+            for rid in snapshot["project"]["repository_ids"]:
+                policies[rid] = {"provider_id": selected["id"], "provider_name": selected["name"],
+                                 **{key: selected[key] for key in ("kind", "base_url", "model")}, "revision": uuid.uuid4().hex}
+                self.project_analysis._set(db, "repository_model_policy:" + rid, policies[rid])
+                key = "ai_analysis:" + rid
+                row = db.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+                before = row[0] if row else None
+                after = {**(json.loads(before) if before else {}), "auto_enabled": False}
+                auto_states[key] = (before, after)
+                self.project_analysis._set(db, key, after)
+        return {**snapshot, "provider": selected, "policies": policies}, auto_states
+
+    def _rollback_continuation(self, original, current, auto_states):
+        with self.store._lock, self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if (str(self.store.vault) != original["vault_path"] or self.store._vault_epoch != original["vault_epoch"]
+                    or self.project_analysis.projects.get(original["project"]["id"]) != original["project"]):
+                return
+            for rid, expected in current["policies"].items():
+                row = db.execute("SELECT value FROM config WHERE key=?", ("repository_model_policy:" + rid,)).fetchone()
+                if not row or json.loads(row[0]) != expected:
+                    return  # A newer grant/revocation wins, including the same destination.
+            for rid, policy in original["policies"].items():
+                self.project_analysis._set(db, "repository_model_policy:" + rid, policy)
+            for key, (before, expected) in auto_states.items():
+                row = db.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+                if row and json.loads(row[0]) == expected:
+                    if before is None:
+                        db.execute("DELETE FROM config WHERE key=?", (key,))
+                    else:
+                        db.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (key, before))
+            # Every binding has fresh random policy revisions. Thus this exact
+            # snapshot belongs only to this attempt, never a prior analysis.
+            rows = db.execute("SELECT id FROM full_analysis_runs WHERE project_id=? AND snapshot_id=?",
+                              (current["project"]["id"], self._snapshot_id(current))).fetchall()
+            for (run_id,) in rows:
+                db.execute("DELETE FROM full_analysis_chunks WHERE run_id=?", (run_id,))
+                db.execute("DELETE FROM full_analysis_runs WHERE id=?", (run_id,))
+                db.execute("DELETE FROM config WHERE key=?", ("full_analysis_control:" + run_id,))
+
+    def _receipt_input_matches(self, snapshot, run, chunk, inventories=None):
+        wire = self._payload(snapshot, run, chunk, inventories)
+        if _hash(wire) == chunk.get("input_hash"):
+            return True
+        # Early paid receipts used stable e_* IDs on the wire. Accept only an
+        # authentic inherited receipt, with its original hash left unchanged.
+        origin = chunk.get("reused_from") or {}
+        if origin.get("run_id") == run["run_id"] or origin.get("input_hash") != chunk.get("input_hash"):
+            return False
+        with self.store._lock, self.store._db() as db:
+            row = db.execute("SELECT c.data FROM full_analysis_chunks c JOIN full_analysis_runs r ON r.id=c.run_id WHERE c.run_id=? AND c.id=? AND r.project_id=?",
+                             (origin.get("run_id"), origin.get("chunk_id"), run["project_id"])).fetchone()
+        if not row:
+            return False
+        original = json.loads(row[0])
+        if original.get("status") != "completed" or any(original.get(key) != chunk.get(key) for key in
+                ("segments", "result", "usage", "input_hash", "completed_at")):
+            return False
+        payload = json.loads(wire)
+        for item, segment in zip(payload["files"], chunk["segments"]):
+            item["evidence_id"] = segment["evidence_id"]
+        return _hash(_json(payload)) == chunk.get("input_hash")
+
+    @staticmethod
+    def _valid_receipt(chunk):
+        result = chunk.get("result")
+        ids = {segment["evidence_id"] for segment in chunk.get("segments", [])}
+        return (isinstance(result, dict) and isinstance(result.get("title"), str)
+                and isinstance(result.get("summary"), str) and isinstance(result.get("unknowns"), list)
+                and all(isinstance(value, str) for value in result["unknowns"])
+                and isinstance(result.get("findings"), list)
+                and all(isinstance(finding, dict) and isinstance(finding.get("text"), str) and finding["text"].strip()
+                        and isinstance(finding.get("evidence_ids"), list) and finding["evidence_ids"]
+                        and all(isinstance(value, str) and value in ids for value in finding["evidence_ids"])
+                        for finding in result["findings"]))
 
     def plan(self, project_id, expected_snapshot=None):
         with self._exclusive(project_id):
@@ -455,15 +604,18 @@ class FullProjectAnalysis:
         self._save(self._progress(run))
         return self._public(run)
 
-    def _payload(self, snapshot, run, chunk):
+    def _payload(self, snapshot, run, chunk, inventories=None):
         from .full_source import FullSourceInventory
         files = []
+        shared = inventories is not None
+        inventories = inventories if shared else {}
         with ExitStack() as stack:
-            inventories = {}
             contents = {}
             for segment in chunk["segments"]:
                 rid = segment["repository_id"]
                 if rid not in inventories:
+                    if shared:
+                        raise ToolError("完整源码共享读取会话不完整，未接受分析结果。", 409)
                     repository = next(repository for repository in snapshot["repositories"] if repository["id"] == rid)
                     inventories[rid] = stack.enter_context(FullSourceInventory(self.store, repository))
                 key = (rid, segment["path"])
@@ -536,7 +688,8 @@ class FullProjectAnalysis:
         for finding in result["findings"]:
             finding["evidence_ids"] = list(dict.fromkeys(mapping[value] for value in finding["evidence_ids"]))
 
-        chunk.update(status="completed", result=result, usage=response.get("usage", {}), input_hash=_hash(wire), completed_at=now(), error=None)
+        chunk.update(status="completed", result=result, usage=response.get("usage", {}), input_hash=_hash(wire), completed_at=now(), error=None,
+                     origin_provider=provider_destination(snapshot["provider"]))
         self._chunk_save(run, chunk)
         return chunk
 
@@ -769,6 +922,8 @@ class FullProjectAnalysis:
         _, frontmatter, markdown = content.split("---", 2)
         metadata = yaml.safe_load(frontmatter)
         metadata.update(source_paths=source_paths, full_run_id=run["run_id"], full_analysis=True)
+        if run.get("receipt_migration"):
+            metadata["receipt_migration"] = run["receipt_migration"]
         if key.startswith("overview:part:"):
             metadata["content_role"] = "business_map"
         elif key.startswith("summary:part:"):
@@ -860,6 +1015,21 @@ class FullProjectAnalysis:
             overview = semantic_map + f"\n\n## 完整源码覆盖\n\n{coverage['analyzed_files']} / {coverage['eligible_files']} 文件，{coverage['analyzed_lines']} 行，{coverage['completed_chunks']} / {coverage['total_chunks']} 批次。代码覆盖完整不等于业务语义已验收。\n\n## 全部模块知识索引\n\n{navigation(written)}\n"
             summary = f"# {snapshot['project']['name']} · 完整代码分析总结\n\n## 完整覆盖\n\n- 安全源码：{coverage['analyzed_files']} / {coverage['eligible_files']} 文件、{coverage['analyzed_lines']} 行。\n- 模型批次：{coverage['completed_chunks']} / {coverage['total_chunks']}，来源ID均核验。\n- 目录模块：{coverage['total_modules']}，本次保存模块首页 {len(written)} 篇。\n- 明确排除：{coverage['excluded_files']} 个文件。\n\n## 固定代码版本\n\n" + "\n".join(f"- {source['repository_id']}: `{source['commit']}`" for source in run["source_repositories"])
             summary += "\n\n## 模块导航\n\n" + navigation(written) + "\n\n## 排除清单\n\n" + ("\n".join(f"- {item['repository_id']}/{item.get('path', '')}：{item['reason']}" for item in run["exclusions"]) or "无。")
+            if migration := run.get("receipt_migration"):
+                origins = {}
+                provider_names = {provider["id"]: provider["name"] for provider in self.store.config_get("providers", [])}
+                for chunk in chunks:
+                    if chunk.get("reused_from"):
+                        origin = chunk.get("origin_provider", migration["source_provider"])
+                        entry = origins.setdefault(_json(origin), {"provider": origin, "chunks": 0})
+                        entry["chunks"] += 1
+                authors = "\n".join(
+                    f"- {provider_names.get(entry['provider']['id'], entry['provider']['kind'])}（{entry['provider']['model']}）：{entry['chunks']} 批。"
+                    for entry in origins.values())
+                summary += ("\n\n## 混合模型来源\n\n"
+                            f"已复用 {run.get('reused_chunks', 0)} 批原始分析结果，原始模型分别为：\n\n{authors}\n\n"
+                            f"其余源码与最终归纳由 {migration['target_provider_name']}（{migration['target_provider']['model']}）处理。"
+                            "复用前已核对固定代码、脱敏输入与引用；原模型回执保留。\n")
             summary += "\n\n## 验收边界\n\n全部纳入范围的安全源码文本均已逐行送达模型并获得结构与引用有效的结果；这不保证业务语义正确，也不代表真实运行或跨端闭环验收。人工修改文档与并发冲突均保留为更新建议，不计入本次成功保存模块；成功批次可断点复用，没有自动付费重试。\n"
             return {"overview": (snapshot["project"]["name"] + " · 业务地图", overview, []),
                     "summary": (snapshot["project"]["name"] + " · 完整分析总结", summary, [])}

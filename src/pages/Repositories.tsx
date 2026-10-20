@@ -7,6 +7,8 @@ import CandidateReview from '../components/CandidateReview';
 import ProjectConnectionForm from '../components/ProjectConnectionForm';
 import RepositoryConnectionForm, { type RepositoryConnectionDraft } from '../components/RepositoryConnectionForm';
 import ProjectAnalysisProgress from '../components/ProjectAnalysisProgress';
+import { canContinueWithModel, confirmsModelContinuation } from '../project-model-binding';
+import './model-binding.css';
 
 const policyDescriptions = {
   unbound: '尚未绑定模型。请先选择允许接收代码的模型。',
@@ -44,6 +46,7 @@ export default function Repositories({ projects, repositories, providers, tasks,
   const [binding, setBinding] = useState<Binding | null>(null);
   const [providerId, setProviderId] = useState('');
   const [bindingError, setBindingError] = useState('');
+  const [reuseCompleted, setReuseCompleted] = useState(true);
   const [analysisStatuses, setAnalysisStatuses] = useState<Record<string, AnalysisStatus>>({});
   const [projectStatuses, setProjectStatuses] = useState<Record<string, AnalysisStatus>>({});
   const [fullAnalysisStatuses, setFullAnalysisStatuses] = useState<Record<string, FullAnalysisStatus>>({});
@@ -115,15 +118,40 @@ export default function Repositories({ projects, repositories, providers, tasks,
     } catch (err) { notify(errorMessage(err), 'error'); }
     finally { setBusy(null); setAnalysisVersion(version => version + 1); refresh(); }
   };
-  const openBinding = (target: Binding) => { setBinding(target); setProviderId((target.kind === 'project' ? projectPolicies : policies)[target.id]?.provider_id || ''); setBindingError(''); };
+  const openBinding = (target: Binding) => { setBinding(target); setProviderId((target.kind === 'project' ? projectPolicies : policies)[target.id]?.provider_id || ''); setReuseCompleted(true); setBindingError(''); };
+  const bindingAnalysis = binding?.kind === 'project' ? fullAnalysisStatuses[binding.id] : undefined;
+  const canReuseCompleted = binding?.kind === 'project' && canContinueWithModel(projectPolicies[binding.id], bindingAnalysis, providerId);
   const bindModel = async (event: FormEvent) => {
     event.preventDefault(); if (!binding || !providerId || busy) return;
+    const continuation = canReuseCompleted && reuseCompleted ? { sourceRunId: bindingAnalysis?.run_id, providerId } : null;
+    const acceptContinuation = (analysis: FullAnalysisStatus) => {
+      setFullAnalysisStatuses(current => ({ ...current, [binding.id]: analysis }));
+      setPolicyVersion(version => version + 1);
+      notify(`已核验并接续 ${analysis.reused_chunks ?? 0} 个已完成批次，保留原模型来源。点击「继续完整分析」后才会发送新请求。`);
+    };
+    const finishBinding = () => { setBinding(null); setAnalysisVersion(version => version + 1); refresh(); };
     setBusy('binding'); setBindingError('');
     try {
-      const policy = await post<RepositoryModelPolicy>(`/api/${binding.kind === 'project' ? 'projects' : 'repositories'}/${binding.id}/model-policy`, { provider_id: providerId });
-      (binding.kind === 'project' ? setProjectPolicies : setPolicies)(current => ({ ...current, [binding.id]: policy }));
-      setBinding(null); notify('已绑定分析模型，可手动发起 AI 分析。'); refresh();
-    } catch (err) { setBindingError(errorMessage(err)); }
+      if (continuation) {
+        const analysis = await post<FullAnalysisStatus>(`/api/projects/${binding.id}/full-analysis/continue-with-model`, { provider_id: continuation.providerId, source_run_id: continuation.sourceRunId });
+        acceptContinuation(analysis);
+      } else {
+        const policy = await post<RepositoryModelPolicy>(`/api/${binding.kind === 'project' ? 'projects' : 'repositories'}/${binding.id}/model-policy`, { provider_id: providerId });
+        (binding.kind === 'project' ? setProjectPolicies : setPolicies)(current => ({ ...current, [binding.id]: policy }));
+        notify('已绑定分析模型，可手动发起 AI 分析。');
+      }
+      finishBinding();
+    } catch (err) {
+      if (continuation) {
+        let analysis: FullAnalysisStatus | undefined;
+        try { analysis = await get<FullAnalysisStatus>(`/api/projects/${binding.id}/full-analysis`); } catch { /* The mutation may still be completing; never retry it automatically. */ }
+        if (analysis && confirmsModelContinuation(analysis, continuation.sourceRunId, continuation.providerId)) {
+          acceptContinuation(analysis); finishBinding();
+        } else {
+          setBindingError('操作结果尚未确认，请刷新项目状态后再操作。');
+        }
+      } else { setBindingError(errorMessage(err)); }
+    }
     finally { setBusy(null); }
   };
   const editProject = (project?: BusinessProject) => { setProjectDraft({ project, name: project?.name || '', description: project?.description || '', repository_ids: project?.repository_ids || [], repository_roles: project?.repository_roles || {} }); setProjectError(''); };
@@ -176,6 +204,7 @@ export default function Repositories({ projects, repositories, providers, tasks,
         <div className="project-analysis-controls"><div className="repo-model-binding"><div><strong>{policy?.status === 'ready' ? `${policy.provider_name || '已绑定模型'} · ${policy.model}` : '项目分析模型'}</strong><button className="text-button" disabled={Boolean(busy) || !members.length || analyzing} onClick={() => openBinding({ kind: 'project', id: project.id, name: project.name, count: members.length })}>{policy?.status === 'ready' ? '更改绑定' : '绑定项目模型'}</button></div><p>{policy?.status === 'ready' ? `${policy.base_url} · 适用于项目全部 ${members.length} 个仓库` : policy ? policyDescriptions[policy.status] : '正在读取模型绑定…'}</p></div><div className="full-analysis-actions"><button className="button primary" disabled={Boolean(busy) || analyzing || !ready || policy?.status !== 'ready'} title={!members.length ? '请先在编辑项目中加入仓库' : !ready ? '等待全部成员仓库同步完成' : policy?.status !== 'ready' ? '先绑定允许接收项目全部仓库代码的模型' : '逐批分析各端全部可分析源码，并复用同版本已完成批次'} onClick={() => fullAnalysis?.status === 'paused' && !fullAnalysis.stale ? void pauseFullAnalysis(project.id, false) : void operate(project.id, 'analyze', 'project')}>{analyzing ? <span className="small-spinner"/> : <Sparkles size={15}/>} {analyzing ? '正在完整分析…' : fullAnalysis?.stale ? '重新完整分析' : canResume ? '继续完整分析' : '完整分析项目'}</button>{analyzing && <button className="button" disabled={Boolean(busy)} onClick={() => void pauseFullAnalysis(project.id, true)}><Pause size={14}/>{busy === `${project.id}-pause` ? '正在请求暂停…' : '暂停分析'}</button>}</div></div>
         {!members.length && <p className="repository-notice">项目还没有仓库。编辑项目加入前端、后端等仓库后，才能分析。</p>}
         <ProjectAnalysisProgress name={project.name} analysis={fullAnalysis} preview={projectStatuses[project.id]} error={fullAnalysisErrors[project.id]} submitting={busy === `${project.id}-analyze`}/>
+        {fullAnalysis?.receipt_migration && <p className="form-hint">已核验接续 {fullAnalysis.reused_chunks ?? 0} 个批次，保留 {fullAnalysis.receipt_migration.source_provider_name} 的原始结果与来源；后续批次使用 {fullAnalysis.receipt_migration.target_provider_name}。</p>}
         {fullAnalysisErrors[project.id] && <button className="text-button" onClick={() => setAnalysisVersion(version => version + 1)}>重新读取完整分析状态</button>}
         <div className="project-repositories">{(['frontend', 'backend'] as const).map(role => <div className="project-role-group" key={role}><h3>{role === 'frontend' ? '前端仓库' : '后端仓库'}</h3><div className="repo-grid">{members.filter(repo => (project.repository_roles?.[repo.id] || 'frontend') === role).map(repo => renderRepository(repo, true))}</div>{!members.some(repo => (project.repository_roles?.[repo.id] || 'frontend') === role) && <p className="form-hint">尚未加入{role === 'frontend' ? '前端' : '后端'}仓库，请编辑项目补充。</p>}</div>)}</div>
       </section>;
@@ -196,9 +225,14 @@ export default function Repositories({ projects, repositories, providers, tasks,
     {binding && <Modal title={binding.kind === 'project' ? '绑定项目分析模型' : '绑定仓库分析模型'} busy={busy === 'binding'} onClose={() => setBinding(null)}><form className="form-stack" onSubmit={bindModel}>
       <p className="form-hint">为「{binding.name}」选择允许接收代码片段的模型。{binding.kind === 'project' ? `绑定适用于项目内全部 ${binding.count} 个仓库，包括前端、后端等成员。` : ''}全局默认模型切换不会改变此绑定。</p>
       <label>分析模型<select aria-label="分析模型" autoFocus required disabled={busy === 'binding'} value={providerId} onChange={event => setProviderId(event.target.value)}><option value="">请选择模型</option>{providers.map(item => <option key={item.id} value={item.id}>{item.name} · {item.model}</option>)}</select></label>
-      {provider && <div className="repo-provider-preview"><strong>{provider.name} · {provider.model}</strong><p>代码发送至：{provider.base_url}</p><p>绑定仅保存选择，不会立即发送代码。服务地址、型号或项目成员变更后需重新绑定。</p></div>}
+      {provider && <div className="repo-provider-preview"><strong>{provider.name} · {provider.model === 'default' && provider.kind === 'codex-local' ? 'Codex CLI 内置默认模型' : provider.model}</strong><p>{provider.kind === 'codex-local' ? '通过本机 Codex CLI 调用已登录账号，代码片段会通过 Codex 发送给 OpenAI，并消耗 Codex 额度。' : `代码发送至：${provider.base_url}`}</p><p>绑定本身不会发送新模型请求。服务地址、型号或项目成员变更后需重新绑定。</p></div>}
+      {canReuseCompleted && <div>
+        <label className="model-checkpoint-option"><input type="checkbox" checked={reuseCompleted} disabled={busy === 'binding'} onChange={event => setReuseCompleted(event.target.checked)}/>核验并接续已完成结果</label>
+        <p className="form-hint">已有 {bindingAnalysis?.coverage?.completed_chunks ?? 0} 个批次。核验版本与输入后，保留原模型的结果和来源，仅让新模型分析未完成批次；本次操作不发送模型请求。</p>
+        {!reuseCompleted && <p className="form-hint">本次仅更改绑定，不接续已有断点。旧结果仍保留，后续完整分析将按新模型重新建立任务。</p>}
+      </div>}
       {!providers.length && <p className="repository-notice">请先在「模型配置」添加模型。</p>}{bindingError && <p role="alert" className="form-error">{bindingError}</p>}
-      <div className="modal-actions"><button className="button" type="button" disabled={busy === 'binding'} onClick={() => setBinding(null)}>取消</button><button className="button primary" disabled={busy === 'binding' || !provider}>{busy === 'binding' ? '正在绑定…' : binding.kind === 'project' ? '为全部成员绑定模型' : '绑定模型'}</button></div>
+      <div className="modal-actions"><button className="button" type="button" disabled={busy === 'binding'} onClick={() => setBinding(null)}>取消</button><button className="button primary" disabled={busy === 'binding' || !provider}>{busy === 'binding' ? canReuseCompleted && reuseCompleted ? '正在核验并接续…' : '正在绑定…' : canReuseCompleted && reuseCompleted ? '核验并绑定新模型' : binding.kind === 'project' ? '为全部成员绑定模型' : '绑定模型'}</button></div>
     </form></Modal>}
   </div></div>;
 }

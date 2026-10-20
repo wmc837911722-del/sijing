@@ -11,7 +11,7 @@ export type ProviderPreset = {
 };
 
 // These are editable connection shortcuts, never an allowlist of model IDs.
-// Leave the model blank so users choose a model available to their own account.
+// HTTP presets leave the model blank for users to choose their available model.
 export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   { id: 'kimi', group: '国内平台', name: 'Kimi · 月之暗面', kind: 'openai-compatible', base_url: 'https://api.moonshot.cn/v1', models: ['kimi-k3', 'kimi-k2.6', 'kimi-k2.7-code'], hint: '使用 Kimi 开放平台的 API Key；模型 ID 以控制台当前可用模型为准。' },
   { id: 'deepseek', group: '国内平台', name: 'DeepSeek', kind: 'openai-compatible', base_url: 'https://api.deepseek.com', models: ['deepseek-flash', 'deepseek-v4-pro'], hint: '使用 DeepSeek 开放平台的 API Key。' },
@@ -28,6 +28,7 @@ export const PROVIDER_PRESETS: readonly ProviderPreset[] = [
   { id: 'openai', group: '国际平台', name: 'OpenAI', kind: 'openai-compatible', base_url: 'https://api.openai.com/v1', models: [], hint: '填写 API 平台已开通的模型 ID 和 API Key。' },
   { id: 'anthropic', group: '国际平台', name: 'Anthropic', kind: 'anthropic', base_url: 'https://api.anthropic.com', models: [], hint: '使用 Anthropic Messages 接口的模型 ID 和 API Key。' },
   { id: 'gemini', group: '国际平台', name: 'Google Gemini', kind: 'gemini', base_url: 'https://generativelanguage.googleapis.com/v1beta', models: [], hint: '使用 Gemini API 的模型 ID 和 API Key。' },
+  { id: 'codex-local', group: '自定义与本地', name: '本机 Codex · 账号登录', kind: 'codex-local', base_url: 'codex://local', models: ['default'], hint: '使用本机 Codex CLI 已登录的账号与对应额度，无需 API 密钥。代码片段会通过 Codex 发送给 OpenAI。' },
   { id: 'custom', group: '自定义与本地', name: '自定义兼容服务', kind: 'openai-compatible', base_url: '', models: [], hint: '可连接其他国内平台、公司网关或私有部署；填写兼容接口的基础地址和模型 ID。' },
   { id: 'ollama', group: '自定义与本地', name: 'Ollama · 本地模型', kind: 'openai-compatible', base_url: 'http://127.0.0.1:11434/v1', models: [], hint: '填写本机已下载的模型名；默认本地 Ollama 无需 API 密钥。' },
 ];

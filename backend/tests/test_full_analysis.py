@@ -560,6 +560,108 @@ def test_policy_expansion_does_not_reuse_receipts_after_authorization_revision_c
     assert plan["coverage"]["completed_chunks"] == 0
 
 
+def test_explicit_provider_continuation_preserves_verified_original_receipts(full_project, monkeypatch):
+    from businessmap.providers import provider_destination
+    full, service, project = full_project
+    full.CONCURRENCY = 1
+    def stop_third(payload, count):
+        if count == 3:
+            raise ToolError("stop", 502)
+    calls = model(monkeypatch, service, stop_third)
+    old_status = full.analyze(project["id"])
+    old = full._load(project["id"])
+    old_data = json.dumps(old, sort_keys=True)
+    old_chunks = full._chunks(old)
+    original_provider = provider_destination(full.project_analysis.snapshot(project["id"])["provider"])
+    provider = service.providers.save({"name": "Second model", "kind": "openai-compatible", "base_url": "http://127.0.0.1:2/v1", "model": "second"})
+    result = full.continue_with_provider(project["id"], provider["id"], old_status["run_id"])
+    assert len(calls) == 3  # Moving checkpoints must not invoke any model.
+    assert result["run_id"] != old_status["run_id"]
+    assert result["status"] == "paused"
+    assert result["coverage"]["completed_chunks"] == result["reused_chunks"] == 2
+    assert result["receipt_migration"]["source_provider"] == original_provider
+    assert result["receipt_migration"]["target_provider"]["id"] == provider["id"]
+    with service.store._db() as db:
+        saved = json.loads(db.execute("SELECT data FROM full_analysis_runs WHERE id=?", (old["run_id"],)).fetchone()[0])
+    assert json.dumps(saved, sort_keys=True) == old_data
+    assert full._chunks(old) == old_chunks
+    run = full._load(project["id"])
+    reused = [chunk for chunk in full._chunks(run) if chunk["status"] == "completed"]
+    for chunk in reused:
+        origin = next(value for value in old_chunks if value["id"] == chunk["reused_from"]["chunk_id"])
+        assert chunk["result"] == origin["result"]
+        assert chunk["input_hash"] == origin["input_hash"]
+        assert chunk["completed_at"] == origin["completed_at"]
+        assert chunk["origin_provider"] == original_provider
+    full.set_paused(project["id"], False)
+    continued = model(monkeypatch, service)
+    assert full.analyze(project["id"])["status"] == "completed"
+    assert not {value["chunk_id"] for value in continued} & {value["id"] for value in reused}
+    from businessmap.content_layout import project_summary_path
+    summary = service.store.read_note(project_summary_path(project["id"]))["content"]
+    assert "混合模型" in summary and "Second model" in summary and "Fixture" in summary
+
+
+def test_provider_continuation_rejects_tampered_input_before_changing_binding(full_project, monkeypatch):
+    full, service, project = full_project
+    model(monkeypatch, service)
+    full.analyze(project["id"])
+    old = full._load(project["id"])
+    chunk = full._chunks(old)[0]
+    chunk["input_hash"] = "0" * 64
+    full._chunk_save(old, chunk)
+    provider = service.providers.save({"name": "Second", "kind": "openai-compatible", "base_url": "http://127.0.0.1:2/v1", "model": "second"})
+    policy = full.project_analysis.model_policy(project["id"])
+    with pytest.raises(ToolError) as error:
+        full.continue_with_provider(project["id"], provider["id"], old["run_id"])
+    assert error.value.status_code == 409
+    assert full.project_analysis.model_policy(project["id"]) == policy
+
+
+def test_provider_continuation_requires_current_source_snapshot(full_project, monkeypatch):
+    full, service, project = full_project
+    model(monkeypatch, service)
+    full.analyze(project["id"])
+    old = full._load(project["id"])
+    provider = service.providers.save({"name": "Second", "kind": "openai-compatible", "base_url": "http://127.0.0.1:2/v1", "model": "second"})
+    # Revoking/rebinding even the same old target must not be silently bypassed.
+    full.project_analysis.bind_model(project["id"], full.project_analysis.model_policy(project["id"])["provider_id"])
+    with pytest.raises(ToolError) as error:
+        full.continue_with_provider(project["id"], provider["id"], old["run_id"])
+    assert error.value.status_code == 409
+
+
+def test_provider_continuation_verifies_legacy_evidence_wire_without_rewriting_hash(full_project, monkeypatch):
+    full, service, project = full_project
+    full.CONCURRENCY = 1
+    original_payload = full._payload
+    def historic_payload(snapshot, run, chunk):
+        payload = json.loads(original_payload(snapshot, run, chunk))
+        for item, segment in zip(payload["files"], chunk["segments"]):
+            item["evidence_id"] = segment["evidence_id"]
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    monkeypatch.setattr(full, "_payload", historic_payload)
+    def pause(payload, count):
+        full.set_paused(project["id"], True)
+    model(monkeypatch, service, pause)
+    full.analyze(project["id"])
+    old = full._load(project["id"])
+    chunk = next(value for value in full._chunks(old) if value["status"] == "completed")
+    # Make an authentic earlier source receipt, as v3 -> v4 reuse did.
+    earlier = {**old, "run_id": "historic-source-run"}
+    full._save(earlier)
+    full._chunk_save(earlier, chunk)
+    chunk["reused_from"] = {"run_id": earlier["run_id"], "chunk_id": chunk["id"], "input_hash": chunk["input_hash"]}
+    full._chunk_save(old, chunk)
+    full._save(old)
+    monkeypatch.setattr(full, "_payload", original_payload)
+    provider = service.providers.save({"name": "Second", "kind": "openai-compatible", "base_url": "http://127.0.0.1:2/v1", "model": "second"})
+    result = full.continue_with_provider(project["id"], provider["id"], old["run_id"])
+    assert result["reused_chunks"] == 1
+    reused = next(value for value in full._chunks(full._load(project["id"])) if value["status"] == "completed")
+    assert reused["input_hash"] == chunk["input_hash"]
+
+
 def test_invalid_output_does_not_retry_or_block_other_independent_batches(full_project, monkeypatch):
     full, service, project = full_project
     full.CONCURRENCY = 1

@@ -55,6 +55,10 @@ class FullAnalysisPauseBody(BaseModel):
     paused: bool
 
 
+class ContinueWithModelBody(ProjectModelBody):
+    source_run_id: str = Field(min_length=1, max_length=160)
+
+
 class ProjectRoute(APIRoute):
     def get_route_handler(self):
         original = super().get_route_handler()
@@ -119,5 +123,10 @@ def create_project_router(service):
             queued = analysis.queue(project_id)
             return {**result, **queued}
         return result
+
+    @router.post("/{project_id}/full-analysis/continue-with-model")
+    def continue_with_model(project_id: str, body: ContinueWithModelBody):
+        from .full_analysis import FullProjectAnalysis
+        return FullProjectAnalysis(service).continue_with_provider(project_id, body.provider_id, body.source_run_id)
 
     return router

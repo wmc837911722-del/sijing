@@ -112,12 +112,25 @@ def provider_destination(provider):
     return {key: provider[key] for key in ("id", "kind", "base_url", "model")}
 
 
+def _aggregate_usage(previous, usage):
+    previous = previous or {"requests": 0}
+    count = previous["requests"]
+    def total(field):
+        current = usage.get(field)
+        if count == 0:
+            return current
+        old = previous.get(field)
+        return old + current if old is not None and current is not None else None
+    return {"requests": count + 1, **{field: total(field) for field in ("input_tokens", "output_tokens", "cached_tokens")}}
+
+
 class ProviderService:
     MAX_CONTEXT_CHARS = 48000
     DEFAULTS = {
         "openai-compatible": "https://api.openai.com/v1",
         "anthropic": "https://api.anthropic.com",
         "gemini": "https://generativelanguage.googleapis.com/v1beta",
+        "codex-local": "codex://local",
     }
 
     def __init__(self, store):
@@ -128,6 +141,12 @@ class ProviderService:
         active = self.store.config_get("active_provider_id")
         output = []
         for item in self.store.config_get("providers", []):
+            if item.get("kind") == "codex-local":
+                from .codex_provider import status
+                output.append({**{k: v for k, v in item.items() if k != "secret_ref"}, "has_key": False,
+                               "secret_storage": "none", "active": item["id"] == active,
+                               "capabilities": {"complete": True, "tool_turn": False}, "codex_status": status()})
+                continue
             key = item.get("secret_ref", f"provider:{item['id']}")
             public = {k: v for k, v in item.items() if k != "secret_ref"}
             output.append({**public, "has_key": bool(self.secrets.get(key)),
@@ -144,7 +163,9 @@ class ProviderService:
             raise ToolError("不支持的模型供应商类型。")
         base = (data.get("base_url") or self.DEFAULTS[kind]).strip().rstrip("/")
         parts = urlsplit(base)
-        if parts.scheme not in ("https", "http") or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment:
+        if kind == "codex-local" and base != "codex://local":
+            raise ToolError("Codex 仅支持本机登录连接。")
+        if kind != "codex-local" and (parts.scheme not in ("https", "http") or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment):
             raise ToolError("Base URL 必须是无内嵌凭据、查询参数和片段的 HTTP(S) 地址。")
         name, model = str(data.get("name", "")).strip(), str(data.get("model", "")).strip()
         if not name or not model or len(model) > 256 or len(name) > 160:
@@ -154,8 +175,11 @@ class ProviderService:
             raise ToolError("模型配置不存在。", 404)
         item = {"id": provider_id, "name": name, "kind": kind, "base_url": base, "model": model}
         previous = next((p for p in self.store.config_get("providers", []) if p["id"] == provider_id), {})
-        item["secret_ref"] = previous.get("secret_ref", f"provider:{provider_id}")
-        if "api_key" in data and data["api_key"] is not None:
+        if kind == "codex-local" and data.get("api_key"):
+            raise ToolError("本机 Codex 使用已有登录，不接受 API 密钥。")
+        if kind != "codex-local":
+            item["secret_ref"] = previous.get("secret_ref", f"provider:{provider_id}")
+        if kind != "codex-local" and "api_key" in data and data["api_key"] is not None:
             # A failed persistent update must never resurrect an older key after restart.
             item["secret_ref"] = f"provider:{provider_id}:{uuid.uuid4().hex}"
             self.secrets.set(item["secret_ref"], data["api_key"])
@@ -390,6 +414,23 @@ class ProviderService:
             raise ToolError("尚未配置并启用模型。", 409)
         if expected_destination is not None and provider_destination(provider) != expected_destination:
             raise ToolError("模型目标已变化，本次请求未发送。请确认模型配置并重新绑定仓库。", 409)
+        if provider["kind"] == "codex-local":
+            if _tool_messages is not None:
+                raise ToolError("本机 Codex 当前仅支持代码分析和业务归纳，暂不支持工具问答。", 409)
+            from .codex_provider import complete
+            messages = self.messages(system, user, history, context)
+            destination = provider_destination(provider)
+            def guard():
+                latest = next((p for p in self.store.config_get("providers", []) if p["id"] == provider["id"]), None)
+                if latest is None or provider_destination(latest) != destination:
+                    raise ToolError("模型目标已变化，本次请求已停止。", 409)
+                if before_send is not None:
+                    before_send()
+            result = complete(messages, provider["model"], max_output=max_output, before_send=guard,
+                              timeout=None if _deadline is None else _deadline - time.monotonic())
+            usage = result["usage"]
+            config_update(self.store, "provider_usage", lambda old: _aggregate_usage(old, usage))
+            return {**result, "provider": provider["name"]}
         tools_enabled = _tool_messages is not None
         messages = self._tool_transcript(system, _tool_messages, _tools) if tools_enabled else self.messages(system, user, history, context)
         metadata = next((p for p in self.store.config_get("providers", []) if p["id"] == provider["id"]), None)
@@ -516,14 +557,7 @@ class ProviderService:
             # Never include HTTP bodies, headers or exception URLs in errors/logs.
             raise ToolError(f"模型调用失败（{type(exc).__name__}），未获得有效结果。", 502) from None
         usage = {k: v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None for k, v in usage.items()}
-        def accumulate(old):
-            old = old or {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cached_tokens": None}
-            known_cached = usage["cached_tokens"]
-            return {"requests": old["requests"] + 1,
-                    "input_tokens": (old.get("input_tokens") or 0) + (usage["input_tokens"] or 0),
-                    "output_tokens": (old.get("output_tokens") or 0) + (usage["output_tokens"] or 0),
-                    "cached_tokens": known_cached if old["requests"] == 0 else (old["cached_tokens"] + known_cached if old.get("cached_tokens") is not None and known_cached is not None else None)}
-        config_update(self.store, "provider_usage", accumulate)
+        config_update(self.store, "provider_usage", lambda old: _aggregate_usage(old, usage))
         if truncated_reasoning and not _connection_test:
             raise ToolError("模型已耗尽输出额度，思考后仍未返回正文。请尝试非思考模型或其他模型；未执行任何查询或写入。", 502)
         output_limited = (data["choices"][0].get("finish_reason") == "length" if kind == "openai-compatible"

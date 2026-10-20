@@ -100,12 +100,19 @@ class ToolsService:
             statuses[repo["id"]].setdefault("status", "never")
         return {"statuses": statuses}
 
+    def _provider_metadata(self, provider_id):
+        # Authorization depends on destination metadata, never key availability.
+        # Frequent source guards must not open the OS credential store or probe
+        # unrelated provider runtimes; complete() obtains credentials at dispatch.
+        item = next((value for value in self.store.config_get("providers", []) if value.get("id") == provider_id), None)
+        return {key: item[key] for key in ("id", "name", "kind", "base_url", "model")} if item else None
+
     def model_policy(self, repo_id):
         self.store.get_repository(repo_id)
         policy = self.store.config_get(f"repository_model_policy:{repo_id}")
         if not policy:
             return {"status": "unbound"}
-        provider = self.providers.get(policy["provider_id"])
+        provider = self._provider_metadata(policy["provider_id"])
         destination = {"id": policy["provider_id"], **{k: policy[k] for k in ("kind", "base_url", "model")}}
         status = "missing" if not provider else "ready" if provider_destination(provider) == destination else "changed"
         return {**{k: v for k, v in policy.items() if k != "revision"}, "status": status}
@@ -129,7 +136,7 @@ class ToolsService:
             raise ToolError("此仓库尚未绑定模型。请在仓库页面选择并绑定允许接收代码及业务笔记的模型。", 409)
         if policy["status"] != "ready":
             raise ToolError("此仓库绑定的模型已被删除或目标配置已变化，请在仓库页面重新确认并绑定。", 409)
-        provider = self.providers.get(policy["provider_id"])
+        provider = self._provider_metadata(policy["provider_id"])
         destination = {"id": policy["provider_id"], **{k: policy[k] for k in ("kind", "base_url", "model")}}
         if not provider or provider_destination(provider) != destination:
             raise ToolError("仓库模型配置已变化，请重新确认并绑定。", 409)
@@ -739,7 +746,7 @@ class Body(BaseModel):
 class ProviderBody(Body):
     id: str | None = None
     name: str = Field(min_length=1, max_length=160)
-    kind: Literal["openai-compatible", "anthropic", "gemini"]
+    kind: Literal["openai-compatible", "anthropic", "gemini", "codex-local"]
     base_url: str = Field(default="", max_length=2048)
     model: str = Field(min_length=1, max_length=256)
     api_key: str | None = Field(default=None, max_length=16384)

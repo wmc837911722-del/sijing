@@ -105,18 +105,32 @@ class ProjectAnalysis:
 
     def guard(self, snapshot):
         try:
-            project = self.projects.get(snapshot["project"]["id"])
-            if (str(self.store.vault) != snapshot["vault_path"] or self.store._vault_epoch != snapshot["vault_epoch"]
-                    or project["revision"] != snapshot["project"]["revision"]
+            if str(self.store.vault) != snapshot["vault_path"] or self.store._vault_epoch != snapshot["vault_epoch"]:
+                raise ToolError("知识库已变化。", 409)
+            # Read one consistent local snapshot. Per-batch/per-poll guards must
+            # not open dozens of SQLite connections or retrieve model secrets.
+            ids = [repository["id"] for repository in snapshot["repositories"]]
+            keys = ["business_projects", "providers", "vault_path", *("repository_model_policy:" + rid for rid in ids)]
+            with self.store._lock, self.store._db() as db:
+                db.execute("BEGIN")
+                config = {row[0]: json.loads(row[1]) for row in db.execute(
+                    "SELECT key,value FROM config WHERE key IN (" + ",".join("?" for _ in keys) + ")", keys)}
+                repositories = {row[0]: json.loads(row[1]) for row in db.execute(
+                    "SELECT id,data FROM repositories WHERE id IN (" + ",".join("?" for _ in ids) + ")", ids)}
+            project = next((value for value in config.get("business_projects", [])
+                            if value["id"] == snapshot["project"]["id"] and value.get("vault_path") == snapshot["vault_path"]), None)
+            if (config.get("vault_path") != snapshot["vault_path"] or not project or project["revision"] != snapshot["project"]["revision"]
                     or project["repository_ids"] != snapshot["project"]["repository_ids"]):
                 raise ToolError("项目范围已变化。", 409)
+            provider = next((value for value in config.get("providers", []) if value["id"] == snapshot["provider"]["id"]), None)
+            if not provider or provider_destination(provider) != provider_destination(snapshot["provider"]):
+                raise ToolError("模型目标已变化。", 409)
             for repository in snapshot["repositories"]:
-                current = self.store.get_repository(repository["id"])
-                if any(current.get(key) != repository.get(key) for key in ("commit", "path", "vault_path", "status")):
+                current = repositories.get(repository["id"])
+                if not current or any(current.get(key) != repository.get(key) for key in ("commit", "path", "vault_path", "status")):
                     raise ToolError("代码版本已变化。", 409)
-                if self.store.config_get(f"repository_model_policy:{repository['id']}") != snapshot["policies"][repository["id"]]:
+                if config.get(f"repository_model_policy:{repository['id']}") != snapshot["policies"][repository["id"]]:
                     raise ToolError("模型授权已变化。", 409)
-                self.service.repository_provider(repository["id"], snapshot["provider"])
         except (CoreError, ToolError):
             raise ToolError("分析期间业务项目、代码版本、知识库或模型授权发生变化，已拒绝过时结果，请重新分析。", 409) from None
 
