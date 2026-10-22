@@ -300,12 +300,16 @@ class FullProjectAnalysis:
 
     @staticmethod
     def _public(run):
-        return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "receipt_migration", "interrupted") if key in run}
+        return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "receipt_migration", "interrupted", "synthesis_failure") if key in run}
 
     def _actionable_failure(self, run):
         # Only codes emitted by our controlled failure diagnostic may select
         # user-facing actions. Never derive UI messages from exception text.
         from .codex_provider import CODEX_FAILURE_ACTIONS
+        synthesis_failure = run.get("synthesis_failure")
+        reason = synthesis_failure.get("codex_reason") if isinstance(synthesis_failure, dict) else None
+        if isinstance(reason, str) and reason in CODEX_FAILURE_ACTIONS:
+            return CODEX_FAILURE_ACTIONS[reason]
         with self.store._lock, self.store._db() as db:
             rows = db.execute("SELECT json_extract(data,'$.details.http_status'),json_extract(data,'$.details.codex_reason') FROM full_analysis_chunks WHERE run_id=? AND status='failed'", (run["run_id"],)).fetchall()
         codex_reasons = {row[1] for row in rows if isinstance(row[1], str) and row[1] in CODEX_FAILURE_ACTIONS}
@@ -751,6 +755,7 @@ class FullProjectAnalysis:
                 return self._public(self._progress(run))
             chunks = self._chunks(run)
             pending = [chunk for chunk in chunks if chunk["status"] != "completed"]
+            run.pop("synthesis_failure", None)
             run.update(status="running", error=None, summary="正在分批完整阅读全部安全源码；成功片段已持久保存。")
             self._save(run)
             stop, changed = False, None
@@ -829,9 +834,20 @@ class FullProjectAnalysis:
                 except Exception as error:
                     controls = self._controls(run)
                     interrupted = controls.get("paused") or controls.get("cancelled")
-                    run.update(status=("cancelled" if controls.get("cancelled") else "paused") if interrupted else "failed", error=None if interrupted else "完整源码已保存，但业务域综合尚未成功；再次分析仅继续综合步骤。", summary="源码全覆盖完成，业务域综合已暂停。" if interrupted else "源码全覆盖完成，业务域综合未完成。")
+                    details = self._failure_details(error)
+                    from .codex_provider import CODEX_FAILURE_ACTIONS
+                    reason = details.get("codex_reason")
+                    codex_failure = isinstance(reason, str) and reason in CODEX_FAILURE_ACTIONS
+                    if not interrupted and codex_failure:
+                        run["synthesis_failure"] = {"codex_reason": reason}
+                        code = details.get("status_code")
+                        if isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599:
+                            run["synthesis_failure"]["status_code"] = code
+                    else:
+                        run.pop("synthesis_failure", None)
+                    run.update(status=("cancelled" if controls.get("cancelled") else "paused") if interrupted else "failed", error=None if interrupted else self._actionable_failure(run) or "完整源码已保存，但业务域综合尚未成功；再次分析仅继续综合步骤。", summary="源码全覆盖完成，业务域综合已暂停。" if interrupted else "源码全覆盖完成，业务域综合未完成。")
                     self._save(run)
-                    if getattr(error, "status_code", None) == 409:
+                    if getattr(error, "status_code", None) == 409 and not codex_failure:
                         raise
                     return self._public(run)
                 self.project_analysis.guard(snapshot)

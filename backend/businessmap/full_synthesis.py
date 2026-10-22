@@ -138,6 +138,10 @@ module_ids只能取本请求items.module_id，禁止编造。所有输入ID都�
         except ToolError as error:
             if error.status_code == 409:
                 self.project_analysis.guard(snapshot)
+            from .codex_provider import CODEX_FAILURE_ACTIONS, _codex_error
+            reason = getattr(error, "codex_reason", None)
+            if isinstance(reason, str) and reason in CODEX_FAILURE_ACTIONS:
+                raise _codex_error(reason, CODEX_FAILURE_ACTIONS[reason], error.status_code) from None
             raise ToolError("业务归纳模型调用未成功，请检查模型连接、额度或授权；已成功归纳保留，没有自动重试。", error.status_code) from None
         except Exception:
             raise ToolError("业务归纳模型调用未成功，已保存的断点保留；没有自动重试。", 502) from None

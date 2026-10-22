@@ -154,11 +154,30 @@ def _stop(process):
     except ProcessLookupError:
         pass
     except PermissionError:
-        # macOS may return EPERM for a group containing only an exited leader.
-        # A live owned process must still be stopped rather than ignored.
-        if process.poll() is None:
-            process.kill()
-            process.wait()
+        # macOS can deny a group signal while its leader is exiting but has
+        # not yet been reaped. Reap that race before deciding cleanup failed.
+        try:
+            process.wait(timeout=.15)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            except OSError:
+                raise _codex_error("process_cleanup", "Codex 进程组无法完整终止，未接受本次结果。") from None
+            try:
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                raise _codex_error("process_cleanup", "Codex 进程组无法完整终止，未接受本次结果。") from None
+        # Reaping/killing the leader alone is insufficient: descendants may
+        # still own the original group and must also be terminated.
+        try:
+            if os.name != "posix":
+                raise PermissionError()
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
             raise _codex_error("process_cleanup", "Codex 进程组无法完整终止，未接受本次结果。") from None
     process.wait()
 

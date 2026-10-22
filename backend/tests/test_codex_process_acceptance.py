@@ -9,6 +9,83 @@ import time
 import pytest
 
 from businessmap import codex_provider
+from businessmap.providers import ToolError
+
+
+class ExitingProcess:
+    """A controlled wait/reap boundary, without scheduling races or real PIDs."""
+    pid = 987654321
+    def __init__(self, initially_live=False):
+        self.returncode = None
+        self.initially_live = initially_live
+        self.killed = False
+        self.wait_timeouts = []
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if self.initially_live and not self.killed:
+            raise subprocess.TimeoutExpired("fixture", timeout)
+        self.returncode = -9 if self.killed else 1
+        return self.returncode
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group acceptance")
+def test_cleanup_exit_race_does_not_replace_original_login_failure(monkeypatch):
+    process = ExitingProcess()
+    signals = []
+    def killpg(pid, sig):
+        signals.append((pid, sig))
+        if len(signals) == 1:
+            raise PermissionError()
+        raise ProcessLookupError()
+    monkeypatch.setattr(codex_provider.os, "killpg", killpg)
+    with pytest.raises(ToolError) as error:
+        try:
+            raise codex_provider._codex_error("login", "Controlled login failure", 401)
+        finally:
+            codex_provider._stop(process)
+    assert error.value.codex_reason == "login"
+    assert process.returncode == 1 and not process.killed
+    assert process.wait_timeouts[0] is not None
+    assert len(signals) == 2
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group acceptance")
+@pytest.mark.parametrize("initially_live", [False, True])
+def test_cleanup_still_fails_closed_if_descendant_group_remains_denied(monkeypatch, initially_live):
+    process = ExitingProcess(initially_live)
+    def denied(*args):
+        raise PermissionError()
+    monkeypatch.setattr(codex_provider.os, "killpg", denied)
+    with pytest.raises(ToolError) as error:
+        codex_provider._stop(process)
+    assert error.value.codex_reason == "process_cleanup"
+    assert process.returncode is not None
+    assert process.killed == initially_live
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process-group acceptance")
+def test_cleanup_leader_exits_between_bounded_wait_and_kill(monkeypatch):
+    class VanishingProcess(ExitingProcess):
+        def kill(self):
+            self.initially_live = False
+            raise ProcessLookupError()
+    process = VanishingProcess(initially_live=True)
+    attempts = []
+    def killpg(*args):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise PermissionError()
+        raise ProcessLookupError()
+    monkeypatch.setattr(codex_provider.os, "killpg", killpg)
+    codex_provider._stop(process)
+    assert process.returncode == 1 and len(attempts) == 2
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group acceptance")
