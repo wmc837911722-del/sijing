@@ -432,6 +432,9 @@ def ssh_git(tmp_path, private_git):
             if process and process.poll() is None:
                 process.kill()
                 process.wait(timeout=3)
+            # After exit-status/EOF, let the SSH client finish its disconnect.
+            # An immediate TCP close can race OpenSSH and report a broken pipe.
+            transport.join(timeout=3)
             transport.close()
 
     def serve():
@@ -458,6 +461,40 @@ def ssh_git(tmp_path, private_git):
     for worker in workers:
         worker.join(timeout=3)
     thread.join(timeout=3)
+
+
+def test_ssh_fixture_waits_for_peer_disconnect_after_normal_eof(ssh_git, monkeypatch):
+    """Closing TCP before the client disconnects can make OpenSSH report EPIPE."""
+    server_closed = threading.Event()
+    original_close = paramiko.Transport.close
+    def observed_close(transport):
+        original_close(transport)
+        if transport.server_mode:
+            server_closed.set()
+    monkeypatch.setattr(paramiko.Transport, 'close', observed_close)
+    client = paramiko.SSHClient()
+    client.load_host_keys(ssh_git['connection']['known_hosts_path'])
+    try:
+        client.connect('127.0.0.1', port=ssh_git['port'], username='git',
+                       key_filename=ssh_git['connection']['ssh_key_path'],
+                       allow_agent=False, look_for_keys=False, timeout=3)
+        transport = client.get_transport()
+        channel = transport.open_session(timeout=3)
+        channel.exec_command("git-upload-pack '/company.git'")
+        channel.sendall(b'0000')
+        channel.shutdown_write()
+        advertised = b''
+        while data := channel.recv(65536):
+            advertised += data
+        assert b'refs/heads/main' in advertised
+        assert channel.recv_exit_status() == 0
+        # The client deliberately has not sent its disconnect yet. Observe
+        # actual server teardown, rather than relying on a random clone race.
+        assert not server_closed.wait(.5)
+        assert transport.is_active()
+    finally:
+        client.close()
+    assert server_closed.wait(3)
 
 
 def test_real_ssh_key_spaces_quotes_and_strict_known_hosts(store, ssh_git, tmp_path, monkeypatch):

@@ -123,6 +123,7 @@ class FullProjectAnalysis:
             except OSError as error:
                 raise ToolError("此业务项目完整分析已在运行。", 409) from error
             try:
+                self._recover_continuation(project_id)
                 yield
             finally:
                 handle.seek(0)
@@ -234,11 +235,17 @@ class FullProjectAnalysis:
         if controls.get("paused") or controls.get("cancelled"):
             raise _Paused()
 
-    def _save(self, run):
+    def _save(self, run, *, continuation=None):
         run["updated_at"] = now()
         with self.store._lock, self.store._db() as db:
+            if continuation:
+                db.execute("BEGIN IMMEDIATE")
+                self.project_analysis.guard(continuation)
             db.execute("INSERT OR REPLACE INTO full_analysis_runs VALUES (?,?,?,?,?)",
                        (run["run_id"], run["project_id"], run["snapshot_id"], _json(run), run["updated_at"]))
+            if continuation:
+                self.project_analysis._set(db, "full_analysis_control:" + run["run_id"], {"paused": True, "cancelled": False})
+                db.execute("DELETE FROM config WHERE key=?", ("full_analysis_migration:" + run["project_id"],))
 
     def _load(self, project_id, snapshot_id=None):
         with self.store._lock, self.store._db() as db:
@@ -324,6 +331,7 @@ class FullProjectAnalysis:
 
     def status(self, project_id):
         self.project_analysis.projects.get(project_id)
+        self._recover_if_idle(project_id)
         run = self._load(project_id)
         if not run or run["vault_path"] != str(self.store.vault):
             return {"status": "never"}
@@ -356,6 +364,7 @@ class FullProjectAnalysis:
         self.project_analysis.projects.get(project_id)
         if not isinstance(paused, bool):
             raise ToolError("paused 必须为布尔值。", 400)
+        self._recover_if_idle(project_id)
         run = self._load(project_id)
         if not run or run["vault_path"] != str(self.store.vault):
             raise ToolError("项目尚未建立完整分析计划。", 404)
@@ -366,6 +375,7 @@ class FullProjectAnalysis:
 
     def cancel(self, project_id):
         self.project_analysis.projects.get(project_id)
+        self._recover_if_idle(project_id)
         run = self._load(project_id)
         if not run or run["vault_path"] != str(self.store.vault):
             raise ToolError("项目尚未建立完整分析计划。", 404)
@@ -422,8 +432,7 @@ class FullProjectAnalysis:
                 if run.get("reused_chunks", 0) != len(completed):
                     raise ToolError("完整结果未全部匹配新源码计划，原断点保留，未开始模型调用。", 409)
                 run.update(receipt_migration=migration, status="paused", summary="已核验并接续原模型的成功结果；保留原始来源，继续时仅发送未完成源码。")
-                self.store.config_set("full_analysis_control:" + run["run_id"], {"paused": True, "cancelled": False})
-                self._save(self._progress(run))
+                self._save(self._progress(run), continuation=current)
             except Exception:
                 self._rollback_continuation(snapshot, current, auto_states)
                 raise
@@ -449,35 +458,65 @@ class FullProjectAnalysis:
                 after = {**(json.loads(before) if before else {}), "auto_enabled": False}
                 auto_states[key] = (before, after)
                 self.project_analysis._set(db, key, after)
+            current = {**snapshot, "provider": selected, "policies": policies}
+            # Consent and recovery metadata commit together. A process death at
+            # any later planning/adoption boundary can restore exact revisions.
+            self.project_analysis._set(db, "full_analysis_migration:" + snapshot["project"]["id"], {
+                "original": {key: snapshot[key] for key in ("project", "vault_path", "policies")},
+                "current": {"project": snapshot["project"], "policies": policies, "snapshot_id": self._snapshot_id(current)},
+                "auto_states": auto_states})
         return {**snapshot, "provider": selected, "policies": policies}, auto_states
+
+    def _recover_if_idle(self, project_id):
+        if self.store.config_get("full_analysis_migration:" + project_id):
+            try:
+                with self._exclusive(project_id):
+                    pass
+            except ToolError as error:
+                if error.status_code != 409:
+                    raise
+
+    def _recover_continuation(self, project_id):
+        # Caller owns the OS project lock; never roll back an active migration.
+        pending = self.store.config_get("full_analysis_migration:" + project_id)
+        if pending:
+            self._rollback_continuation(pending["original"], pending["current"], pending["auto_states"])
 
     def _rollback_continuation(self, original, current, auto_states):
         with self.store._lock, self.store._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            if (str(self.store.vault) != original["vault_path"] or self.store._vault_epoch != original["vault_epoch"]
-                    or self.project_analysis.projects.get(original["project"]["id"]) != original["project"]):
+            key = "full_analysis_migration:" + original["project"]["id"]
+            row = db.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
+            if not row or json.loads(row[0])["current"]["policies"] != current["policies"]:
                 return
-            for rid, expected in current["policies"].items():
-                row = db.execute("SELECT value FROM config WHERE key=?", ("repository_model_policy:" + rid,)).fetchone()
-                if not row or json.loads(row[0]) != expected:
-                    return  # A newer grant/revocation wins, including the same destination.
-            for rid, policy in original["policies"].items():
-                self.project_analysis._set(db, "repository_model_policy:" + rid, policy)
-            for key, (before, expected) in auto_states.items():
-                row = db.execute("SELECT value FROM config WHERE key=?", (key,)).fetchone()
-                if row and json.loads(row[0]) == expected:
-                    if before is None:
-                        db.execute("DELETE FROM config WHERE key=?", (key,))
-                    else:
-                        db.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (key, before))
-            # Every binding has fresh random policy revisions. Thus this exact
-            # snapshot belongs only to this attempt, never a prior analysis.
-            rows = db.execute("SELECT id FROM full_analysis_runs WHERE project_id=? AND snapshot_id=?",
-                              (current["project"]["id"], self._snapshot_id(current))).fetchall()
-            for (run_id,) in rows:
-                db.execute("DELETE FROM full_analysis_chunks WHERE run_id=?", (run_id,))
-                db.execute("DELETE FROM full_analysis_runs WHERE id=?", (run_id,))
-                db.execute("DELETE FROM config WHERE key=?", ("full_analysis_control:" + run_id,))
+            try:
+                if (str(self.store.vault) != original["vault_path"]
+                        or self.project_analysis.projects.get(original["project"]["id"]) != original["project"]):
+                    return
+                for rid, expected in current["policies"].items():
+                    row = db.execute("SELECT value FROM config WHERE key=?", ("repository_model_policy:" + rid,)).fetchone()
+                    if not row or json.loads(row[0]) != expected:
+                        return  # A newer grant/revocation wins, including the same destination.
+                for rid, policy in original["policies"].items():
+                    self.project_analysis._set(db, "repository_model_policy:" + rid, policy)
+                for auto_key, (before, expected) in auto_states.items():
+                    row = db.execute("SELECT value FROM config WHERE key=?", (auto_key,)).fetchone()
+                    if row and json.loads(row[0]) == expected:
+                        if before is None:
+                            db.execute("DELETE FROM config WHERE key=?", (auto_key,))
+                        else:
+                            db.execute("INSERT OR REPLACE INTO config VALUES (?,?)", (auto_key, before))
+                # Fresh random policy revisions make this snapshot unique to
+                # this attempt. Never rewrite the source run or its receipts.
+                snapshot_id = current.get("snapshot_id") or self._snapshot_id(current)
+                rows = db.execute("SELECT id FROM full_analysis_runs WHERE project_id=? AND snapshot_id=?",
+                                  (current["project"]["id"], snapshot_id)).fetchall()
+                for (run_id,) in rows:
+                    db.execute("DELETE FROM full_analysis_chunks WHERE run_id=?", (run_id,))
+                    db.execute("DELETE FROM full_analysis_runs WHERE id=?", (run_id,))
+                    db.execute("DELETE FROM config WHERE key=?", ("full_analysis_control:" + run_id,))
+            finally:
+                db.execute("DELETE FROM config WHERE key=?", (key,))
 
     def _receipt_input_matches(self, snapshot, run, chunk, inventories=None):
         wire = self._payload(snapshot, run, chunk, inventories)
@@ -789,17 +828,20 @@ class FullProjectAnalysis:
                             self._chunk_save(run, chunk)
                         except Exception as error:
                             reasons = (getattr(error, "details", None) or {}).get("reasons", {}) if isinstance(error, AnalysisOutputError) else {}
-                            independent_output_failure = (isinstance(error, AnalysisOutputError)
+                            details = self._failure_details(error)
+                            independent_output_failure = ((isinstance(error, AnalysisOutputError)
                                 and error.category in {"format", "citation"} and "wire_budget_exceeded" not in reasons)
+                                or (details.get("codex_reason") in {"invalid_json", "empty_response"}
+                                    and getattr(error, "status_code", None) != 409))
                             # Each independent output gets one attempt in this run.
                             # Invalid output must not block unrelated inputs or be
                             # silently retried; transport/auth/input faults stop dispatch.
                             if not independent_output_failure:
                                 stop = True
-                            if getattr(error, "status_code", None) == 409 and not self._failure_details(error).get("codex_reason"):
+                            if getattr(error, "status_code", None) == 409 and not details.get("codex_reason"):
                                 changed = ToolError("分析期间项目、代码版本或模型授权变化，已拒绝过时结果。", 409)
                             chunk.update(status="failed", error="来源或模型结果未通过完整批次核验。", category=getattr(error, "category", "model"),
-                                         details=self._failure_details(error))
+                                         details=details)
                             self._chunk_save(run, chunk)
                     # Pause may have been set by the UI during an in-flight request.
                     latest = self._controls(run)

@@ -137,25 +137,27 @@ class ProviderService:
         self.store = store
         self.secrets = Secrets(store.data_dir)
 
+    def _metadata(self, provider_id):
+        return next((item for item in self.store.config_get("providers", []) if item["id"] == provider_id), None)
+
+    def _public(self, item, active):
+        public = {key: value for key, value in item.items() if key != "secret_ref"}
+        if item.get("kind") == "codex-local":
+            from .codex_provider import status
+            return {**public, "has_key": False, "secret_storage": "none", "active": item["id"] == active,
+                    "capabilities": {"complete": True, "tool_turn": False}, "codex_status": status()}
+        key = item.get("secret_ref", f"provider:{item['id']}")
+        return {**public, "has_key": bool(self.secrets.get(key)),
+                "secret_storage": self.secrets.storage(key), "active": item["id"] == active}
+
     def list(self):
         active = self.store.config_get("active_provider_id")
-        output = []
-        for item in self.store.config_get("providers", []):
-            if item.get("kind") == "codex-local":
-                from .codex_provider import status
-                output.append({**{k: v for k, v in item.items() if k != "secret_ref"}, "has_key": False,
-                               "secret_storage": "none", "active": item["id"] == active,
-                               "capabilities": {"complete": True, "tool_turn": False}, "codex_status": status()})
-                continue
-            key = item.get("secret_ref", f"provider:{item['id']}")
-            public = {k: v for k, v in item.items() if k != "secret_ref"}
-            output.append({**public, "has_key": bool(self.secrets.get(key)),
-                           "secret_storage": self.secrets.storage(key), "active": item["id"] == active})
-        return output
+        return [self._public(item, active) for item in self.store.config_get("providers", [])]
 
     def get(self, provider_id=None):
-        wanted = provider_id or self.store.config_get("active_provider_id")
-        return next((p for p in self.list() if p["id"] == wanted), None)
+        active = self.store.config_get("active_provider_id")
+        item = self._metadata(provider_id or active)
+        return self._public(item, active) if item else None
 
     def save(self, data):
         kind = data.get("kind")
@@ -171,7 +173,7 @@ class ProviderService:
         if not name or not model or len(model) > 256 or len(name) > 160:
             raise ToolError("请填写供应商名称和模型名称。")
         provider_id = data.get("id") or uuid.uuid4().hex
-        if data.get("id") and not self.get(provider_id):
+        if data.get("id") and not self._metadata(provider_id):
             raise ToolError("模型配置不存在。", 404)
         item = {"id": provider_id, "name": name, "kind": kind, "base_url": base, "model": model}
         previous = next((p for p in self.store.config_get("providers", []) if p["id"] == provider_id), {})
