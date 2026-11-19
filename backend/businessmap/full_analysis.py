@@ -44,6 +44,48 @@ def _lines(content):
     return [line.removesuffix("\r") for line in lines]
 
 
+def _topic_index(body, field, project_name, topics, saved_paths):
+    from .content_layout import CATEGORY_NAMES
+    from .layout_migration import _rewrite_links
+
+    is_map = field == "purpose"
+    title = project_name + (" · 业务地图" if is_map else " · 业务梳理总结")
+    # Only regroup an exact leading list generated from all reviewed topics.
+    # Custom text and the historical summary boundary remain byte-for-byte.
+    flat = "\n\n".join("- " + op["title"] + "：" + op[field] for op in topics.values())
+    prefix = "# " + title + "\n\n" + flat
+    rest = body.removeprefix(prefix)
+    regroup = bool(flat and rest != body and (rest in ("", "\n") or rest.startswith("\n\n")))
+    sections = []
+    for category, label in CATEGORY_NAMES.items():
+        rows = []
+        for key, op in topics.items():
+            if op["category"] != category or (not regroup and key not in saved_paths):
+                continue
+            name = op["title"]
+            if key in saved_paths:
+                name = f"[[{saved_paths[key]}|{name}]]"
+            rows.append("- " + name + ("：" + op[field] if regroup else ""))
+        if rows:
+            sections.extend([("## " if regroup else "### ") + label, ("\n\n" if regroup else "\n").join(rows)])
+    listing = "\n\n".join(sections)
+    empty = "本次没有成功保存的业务主题；待确认内容不能当作已确认事实。"
+    if regroup:
+        guide = ""
+        if is_map:
+            guide = "\n\n下列条目介绍各主题的业务用途。" + ("打开主题可查看适用条件和待确认事项。" if saved_paths else empty)
+        body = "# " + title + guide + "\n\n" + listing + rest
+    else:
+        heading = "业务主题导航" if is_map else "已保存业务主题"
+        body += "\n\n## " + heading + "\n\n" + (listing or empty) + "\n"
+
+    allowed = set(saved_paths.values())
+    def public_link(match):
+        target, _, label = match[1].partition("|")
+        return match[0] if target.removesuffix(".md") in allowed else label or target
+    return _rewrite_links(body, {}, replace_link=public_link)
+
+
 def discover_module(repository, path, role):
     """Directory domains are navigation boundaries, never inferred call edges."""
     parts = list(PurePosixPath(path).parts)
@@ -1256,7 +1298,6 @@ class FullProjectAnalysis:
         return content
 
     def _publish(self, snapshot, run):
-        from .layout_migration import _rewrite_links
         self._recover_publications(run)
         state_key = f"project_analysis:{run['project_id']}"
         state = self.store.config_get(state_key, {})
@@ -1312,24 +1353,17 @@ class FullProjectAnalysis:
         module_keys = list(module_parts)  # Publication families; never source directory modules.
         paths.update(public_project_paths(snapshot["project"]["name"]))
 
-        def navigation(written):
-            result = []
-            for category, label in CATEGORY_NAMES.items():
-                selected = [key for key in written if topics[key]["category"] == category]
-                if selected:
-                    result.extend(["### " + label, "\n".join(f"- [[{paths[key][:-3]}|{topics[key]['title']}]]" for key in selected)])
-            return "\n\n".join(result) or "本次没有成功保存的业务主题；待确认内容不能当作已确认事实。"
+        index_topics = {}
+        for operation in coverage["catalogue"]:
+            key = "topic:" + operation["id"].partition(":")[2]
+            if key in topics:
+                index_topics[key] = {**operation, "title": topics[key]["title"]}
 
         def final_documents(written):
-            allowed = {paths[key][:-3] for key in written}
-            def public_link(match):
-                target, _, label = match[1].partition("|")
-                target = target.removesuffix(".md")
-                return match[0] if target in allowed else label or target
-            overview = _rewrite_links(overview_body, {}, replace_link=public_link)
-            summary = _rewrite_links(summary_body, {}, replace_link=public_link)
-            overview += "\n\n## 业务主题导航\n\n" + navigation(written) + "\n"
-            summary += "\n\n## 已保存业务主题\n\n" + navigation(written) + "\n"
+            saved_paths = {key: paths[key][:-3] for key in written}
+            name = snapshot["project"]["name"]
+            overview = _topic_index(overview_body, "purpose", name, index_topics, saved_paths)
+            summary = _topic_index(summary_body, "summary", name, index_topics, saved_paths)
             if len(written) != len(module_keys):
                 summary += "\n部分文档存在人工修改或并发变化，已保留原文；更新建议不计入本次成功保存主题。\n"
             deps = list(dict.fromkeys(path for key in written for path in documents[key][2]))

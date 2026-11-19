@@ -120,9 +120,9 @@ def test_publish_uses_reviewed_purpose_and_replays_saved_results(full_project, m
     assert path.read_text().count("# " + public_title) == 1
     for index in ("overview", "summary"):
         body = (service.store.vault / state()[index]["path"]).read_text()
-        assert public_title + "：" in body
-        assert state()[key]["path"][:-3] + "|" + public_title + "]]" in body
-        assert catalogue_title + "：" not in body
+        label = f"[[{state()[key]['path'][:-3]}|{public_title}]]"
+        assert body.count(label + "：") == 1
+        assert catalogue_title not in body
     assert state()[key]["path"] == path.relative_to(service.store.vault).as_posix()
     assert full._load(project["id"])["synthesis"] == projection and paid_rows() == ledger and calls == paid_calls
     human = path.read_text() + "\n人工说明\n"

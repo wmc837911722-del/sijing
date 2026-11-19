@@ -920,3 +920,81 @@ def test_failure_action_does_not_expose_untrusted_error_or_unknown_http_code(ful
     assert status["status"] == "failed"
     assert "PRIVATE-SECRET" not in json.dumps(status)
     assert "余额不足" not in status["error"] and "499" not in status["error"]
+
+@pytest.mark.parametrize("legacy", (False, True))
+def test_linked_purposes_and_summaries_are_grouped_once(full_project, monkeypatch, legacy):
+    from business_projection_fixture import projection_from_units, seal
+    from businessmap.business_semantics import _render_operation, _render_overviews, semantic_input_hash
+    from businessmap.full_synthesis import FullBusinessSynthesis, source_fact_units
+
+    full, service, project = full_project
+    calls = model(monkeypatch, service)
+    # Long, reviewed descriptions exercise both index families and page links.
+    purposes = {"flows": "提交报名审核。", "rules": "核对报名资格。"}
+    summaries = {"flows": "申请人可在门店提交报名。", "rules": "报名资格由门店核对。"}
+    if legacy:
+        full.PAGE_BYTES = 1200
+        purposes = {key: value * 23 for key, value in purposes.items()}
+        summaries = {key: value * 23 for key, value in summaries.items()}
+
+    def synthesize(_self, snapshot, run, chunks):
+        units = source_fact_units(snapshot, run, chunks)
+        routed = [{"fact_id": unit["_fact_id"], "disposition": "public",
+                   "category": "flows" if i % 2 else "rules", "title": "报名审核"}
+                  for i, unit in enumerate(units)]
+        identity = semantic_input_hash(snapshot, run, chunks, [])
+        projection = projection_from_units(snapshot, {**run, "semantic_input_hash": identity}, units, routed)
+        catalogue = projection["semantic_coverage"]["catalogue"]
+        for op in catalogue:
+            op.update(purpose=purposes[op["category"]], summary=summaries[op["category"]])
+            doc = next(d for d in projection["public_documents"] if d["category"] == op["category"])
+            claims = [c for c in projection["semantic_coverage"]["claims"] if c["operation_id"] == op["id"]]
+            doc["body"] = _render_operation(op, claims)
+        projection["overview_body"], projection["summary_body"] = _render_overviews(project["name"], catalogue, _legacy_boundary=legacy)
+        return seal(projection)
+
+    monkeypatch.setattr(FullBusinessSynthesis, "build", synthesize)
+    assert full.analyze(project["id"])["publication_complete"]
+    initial_calls = len(calls)
+    digest = full._load(project["id"])["synthesis"]["verification"]["projection_hash"]
+    def index_body(key):
+        notes = service.store.config_get("project_analysis:" + project["id"])["notes"]
+        def read(k):
+            return service.store.read_note(notes[k]["path"])["content"].split("---", 2)[-1].strip()
+        parts = [k for k, note in notes.items() if k.startswith(key + ":part:") and not note["stale"]]
+        if parts:
+            for part in parts:
+                assert "[[" + notes[part]["path"][:-3] + "|" in read(key)
+            return "\n\n".join(read(part).split("\n\n", 1)[1] for part in parts)
+        return read(key)
+
+    rules_path = "01-Wiki/完整赛事/规则/报名审核"
+    flow_path = "01-Wiki/完整赛事/流程/报名审核"
+    for key, descriptions in (("overview", purposes), ("summary", summaries)):
+        text = index_body(key)
+        assert text.count(f"[[{flow_path}|报名审核]]：" + descriptions["flows"]) == 1
+        assert text.count(f"[[{rules_path}|报名审核]]：" + descriptions["rules"]) == 1
+        assert "- 报名审核：" not in text
+        assert text.index("\n## 流程\n") < text.index(flow_path) < text.index("\n## 规则\n") < text.index(rules_path)
+    assert "业务用途" in index_body("overview")
+    boundary = "此处为静态资料整合" if legacy else "本文根据现有业务资料整理"
+    assert boundary in index_body("summary")
+    if legacy:
+        assert any(":part:" in k for k in service.store.config_get("project_analysis:" + project["id"])["notes"] if k.startswith("summary:"))
+    manual = service.store.vault / (rules_path + ".md")
+    manual.write_text(manual.read_text() + "\n人工补充\n")
+    assert not full.analyze(project["id"])["publication_complete"]
+    assert "人工补充" in manual.read_text()
+    for key, descriptions in (("overview", purposes), ("summary", summaries)):
+        text = index_body(key)
+        assert f"[[{rules_path}|" not in text
+        assert f"[[{flow_path}|报名审核]]：" + descriptions["flows"] in text
+        assert "- 报名审核：" + descriptions["rules"] in text
+    flow_note = service.store.vault / (flow_path + ".md")
+    flow_note.write_text(flow_note.read_text() + "\n另一项人工补充\n")
+    assert not full.analyze(project["id"])["publication_complete"]
+    assert "本次没有成功保存的业务主题" in index_body("overview")
+    assert "打开主题" not in index_body("overview")
+    for key in ("overview", "summary"):
+        assert "[[01-Wiki/" not in index_body(key)
+    assert len(calls) == initial_calls and full._load(project["id"])["synthesis"]["verification"]["projection_hash"] == digest
