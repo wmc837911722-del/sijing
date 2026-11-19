@@ -53,6 +53,29 @@ def _live_review_selection(receipt, allowlist):
             and grant['authorized_at'] <= time.time() < grant['expires_at'])
 
 
+def pending_review_priority(receipt, run, allowlist):
+    """Scheduling hint for an authenticated receipt. Claim and send recheck live authority."""
+    import time
+    from .semantic_proposal_recovery import _private_evidence_bytes
+    from .semantic_recovery import _evidence_json
+    if (receipt['policy'] != POLICY or receipt['consumed_at'] is not None
+            or any(receipt[k] != run.get(k) for k in ('run_id', 'snapshot_id', 'project_revision'))):
+        return False
+    try:
+        if not _live_review_selection(receipt, allowlist):
+            return False
+        if 'prior_bundle_id' in receipt:
+            return True
+        event = receipt.get('authority_event')
+        grant = _evidence_json(event['grant_raw'].encode('utf-8')) if event else receipt
+        evidence = event['evidence_raw'] if event else receipt['reconciliation_evidence']
+        return (_private_evidence_bytes(grant['reconciliation_ref']) == evidence.encode('utf-8')
+                and grant['authorized_at'] <= time.time() < grant['expires_at'])
+    except s.SemanticValidationError:
+        # Withdrawn live evidence gives no priority. The normal claim still rejects it.
+        return False
+
+
 def _require_allowances(value):
     s._require(all(type(value.get(key)) is int and value[key]==expected for key,expected in (
         ('logical_draft_maximum',2),('physical_maximum_calls',5),('replacement_allowance',1))), 'cache_invalid')

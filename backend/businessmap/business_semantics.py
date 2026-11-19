@@ -3560,9 +3560,10 @@ class BusinessSemanticIntegration:
                     raise
                 revision = _revision_context(2, proposal=parent, failure=failure, snapshot=self._snapshot, read_checkpoint=self._read_tasks().read_checkpoint)
 
-    def _run_packets(self, packets):
+    def _run_packets(self, packets, priority=()):
         _require(type(self.CONCURRENCY) is int and 1 <= self.CONCURRENCY <= 16, "input_invalid")
         results, failures, next_packet = [None] * len(packets), [], 0
+        order = sorted(range(len(packets)), key=lambda index: index not in priority)
         def execute(operations):
             try:
                 return self._integrate_packet(operations)
@@ -3576,7 +3577,8 @@ class BusinessSemanticIntegration:
             while next_packet < len(packets) or active:
                 while next_packet < len(packets) and len(active) < self.CONCURRENCY and not self._stopped.is_set():
                     self.guard()
-                    active[pool.submit(execute, packets[next_packet])] = next_packet
+                    index = order[next_packet]
+                    active[pool.submit(execute, packets[index])] = index
                     next_packet += 1
                 if not active:
                     break
@@ -3633,9 +3635,11 @@ class BusinessSemanticIntegration:
         from .semantic_review_recovery import POLICY as REVIEW_POLICY
         inventory_rows = self._read_tasks()
         recoveries = recovery_inventory(inventory_rows, snapshot=snapshot, expected_input_hash=self._input_hash, read_checkpoint=inventory_rows.read_checkpoint)
+        packet_hashes = []
         for packet in packets:
             atomic = next((plan for plan in atomic_preflight_plans if len(packet)==1 and packet[0]==plan['parent_operation']), None)
             packet_hash = atomic['packet_hash'] if atomic else _hash(self._packet(packet)[0])
+            packet_hashes.append(packet_hash)
             members = [row for row in rows.values() if row["data"]["context"].get("packet_hash") == packet_hash
                        and row["data"]["context"].get("generator_hash") == _semantic_generator_hash(snapshot)
                        and row["data"]["context"].get("budget_profile") == profile and row["status"] != "planned"]
@@ -3643,7 +3647,10 @@ class BusinessSemanticIntegration:
             allowance = sum(r["policy"] in {PROPOSAL_POLICY, REVIEW_POLICY, EXCEPTION_POLICY} and r["packet_hash"] == packet_hash for r in recoveries)
             remaining += 0 if any(row["stage"] == "review" and row["status"] == "accepted" for row in members) else max(0, 4 + allowance - len(members))
         self._preflight("semantics", remaining)
-        results = self._run_packets(packets)
+        from .semantic_review_recovery import pending_review_priority
+        pending_reviews = {r['packet_hash'] for r in recoveries if pending_review_priority(r, run, self.review_timeout_recovery_allowlist)}
+        priority = {index for index, packet_hash in enumerate(packet_hashes) if packet_hash in pending_reviews}
+        results = self._run_packets(packets, priority) if priority else self._run_packets(packets)
         claims = [claim for result in results for claim in result["claims"]]
         catalogue = [operation for result in results for operation in result["catalogue"]]
         decisions = {fid: decision for result in results for fid, decision in result["decisions"].items()}

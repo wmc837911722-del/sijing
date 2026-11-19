@@ -33,7 +33,7 @@ def test_only_ordinary_first_draft_timeout_is_eligible():
 
 
 @pytest.fixture
-def source_timeout(tmp_path):
+def source_timeout(tmp_path, request):
     import json
     import threading
     from types import SimpleNamespace
@@ -49,6 +49,12 @@ def source_timeout(tmp_path):
     run = {**original_run, 'project_id': snapshot['project']['id'], 'modules': [{'id': 'module'}]}
     chunks = [{'id': 'source', 'module_id': 'module', 'status': 'completed', 'result': {'summary': '',
         'findings': [{'text': '办理业务需要核对门店权限。', 'evidence_ids': []}, {'text': '办理业务需要核对适用范围。', 'evidence_ids': []}], 'unknowns': []}}]
+    multiple_packets = getattr(request, 'param', None) == 'two-packets'
+    if multiple_packets:
+        findings = chunks[0]['result']['findings']
+        findings.extend({'text': item['text'].replace('办理业务', '提交申请'), 'evidence_ids': []} for item in findings[:])
+        for item in findings:
+            item['text'] *= 220
     run['semantic_input_hash'] = s.semantic_input_hash(snapshot, run, chunks, [])
     units = source_fact_units(snapshot, run, chunks)
     synthesis = FullBusinessSynthesis.__new__(FullBusinessSynthesis)
@@ -62,7 +68,8 @@ def source_timeout(tmp_path):
         db.execute('INSERT INTO full_analysis_runs VALUES (?,?,?,?,?)', (run['run_id'], run['project_id'], run['snapshot_id'], s._json(run), 'fixture'))
         db.execute('INSERT INTO full_analysis_chunks VALUES (?,?,?)', (run['run_id'], 0, s._json(chunks[0])))
         for batch in synthesis._batches(snapshot, units, 0):
-            response = {'assignments': [{'fact_id': 'f'+str(i), 'disposition': 'public', 'category': 'flows', 'title': '办理业务'} for i in range(len(batch))]}
+            response = {'assignments': [{'fact_id': 'f'+str(i), 'disposition': 'public', 'category': 'flows',
+                'title': '提交申请' if item['text'].startswith('提交申请') else '办理业务'} for i, item in enumerate(batch)]}
             normalized = synthesis._validate(response, batch)
             key = synthesis.cache_identity(snapshot, run, batch, 0)
             db.execute('INSERT INTO full_analysis_synthesis VALUES (?,?,?,?)', (key, key, s._json(normalized), 'fixture'))
@@ -74,7 +81,7 @@ def source_timeout(tmp_path):
             error = ToolError('timeout', 408)
             error.codex_reason = 'timeout'
             raise error
-        result = {'operations': [{'title': '办理业务', 'category': 'flows', 'label_ids': [item['label_id'] for item in payload['items']]}]}
+        result = {'operations': [{'title': item['title'], 'category': 'flows', 'label_ids': [item['label_id']]} for item in payload['items']]}
         return {'text': json.dumps(result, ensure_ascii=False), 'usage': {}, 'output_limited': False}
     service = SimpleNamespace(store=store, providers=SimpleNamespace(complete=complete))
     runtime = s.BusinessSemanticIntegration(service, guard=lambda: None)
@@ -86,12 +93,13 @@ def source_timeout(tmp_path):
     runtime._usage = {'requests': 0, 'cache_hits': 0, 'input_tokens': 0, 'output_tokens': 0}
     operations = runtime._catalogue_page(runtime._catalogue_initial_labels(routing))
     packets = runtime._packets(operations)
+    assert len(packets) == (2 if multiple_packets else 1)
     with pytest.raises(s.SemanticValidationError):
-        runtime._integrate_packet(packets[0])
+        runtime._integrate_packet(packets[-1])
     with store._db() as db:
         rows = s.semantic_checkpoint_rows(db, run['semantic_input_hash'])
     parent = next(row for row in rows if row['stage'] == 'proposal')
-    yield SimpleNamespace(store=store, snapshot=snapshot, run=run, parent=parent, runtime=runtime, packet=packets[0], units=units, routing=routing)
+    yield SimpleNamespace(store=store, snapshot=snapshot, run=run, parent=parent, runtime=runtime, packet=packets[-1], packets=packets, units=units, routing=routing)
     fixture.close()
 
 

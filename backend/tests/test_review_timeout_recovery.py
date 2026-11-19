@@ -136,6 +136,107 @@ def test_review_child_completes_once_with_strict_review_and_free_replay(review_t
     assert again['review_hash']==plan['child_stage_hash'] and len(calls)==1
 
 
+@pytest.mark.parametrize('source_timeout', ['two-packets'], indirect=True)
+def test_normal_build_prioritizes_selected_review_and_preserves_projection_order(review_timeout, tmp_path):
+    from contextlib import nullcontext
+    from businessmap.semantic_recovery import held_project_lock
+    from businessmap.semantic_review_recovery import authorize_review_timeout_recovery
+    from test_business_semantics import review
+
+    c = review_timeout
+    plan, grant, evidence = review_grant(c, tmp_path)
+    service = SimpleNamespace(store=c.store, _exclusive=lambda _: nullcontext(), _controls=lambda _: {'paused': True},
+                              project_analysis=SimpleNamespace(guard=lambda _: None))
+    authorize_review_timeout_recovery(service, c.snapshot, c.run, plan, authorization=grant)
+    c.store.config_set('full_analysis_control:'+c.run['run_id'], {'paused': False, 'cancelled': False})
+    c.runtime.review_timeout_recovery_allowlist = {(plan['parent_stage_hash'], plan['child_stage_hash'])}
+    c.runtime.CONCURRENCY = 1
+    calls = []
+
+    def complete(system, user, **kwargs):
+        kwargs['before_send']()
+        payload = json.loads(user)
+        calls.append(payload)
+        value = review(payload) if payload['stage'] == 'review' else independent_candidate(payload)
+        return {'text': json.dumps(value, ensure_ascii=False), 'usage': {}, 'output_limited': False}
+
+    c.runtime.service.providers.complete = complete
+    with held_project_lock(c.snapshot['project']['id']):
+        projection = c.runtime.build(c.snapshot, c.run, units=c.units, routing=c.routing)
+        assert calls[0] == c.parent['data']['request']
+        assert [p['stage'] for p in calls] == ['review', 'proposal', 'review']
+        assert projection['verification']['packet_hashes'] == [sem._hash(c.runtime._packet(packet)[0]) for packet in c.packets]
+        assert projection['verification']['accepted_review_hashes'][-1] == plan['child_stage_hash']
+        plans = projection['usage']['plans']
+        assert {'stage': 'semantics', 'packets': 2, 'maximum_calls': 9} in plans
+        assert plans[-1] == {'stage': 'semantics', 'occupied_calls': 3, 'remaining_maximum_calls': 7, 'cumulative_maximum_calls': 10}
+        evidence.unlink()
+        grant.unlink()
+        original_scheduler = c.runtime._run_packets
+        c.runtime._run_packets = lambda packets: original_scheduler(packets)
+        again = c.runtime.build(c.snapshot, c.run, units=c.units, routing=c.routing)
+        assert again['verification'] == projection['verification'] and again['usage']['requests'] == 0
+        assert len(calls) == 3
+
+
+@pytest.mark.parametrize('durable', [False, True])
+@pytest.mark.parametrize('renewed', [False, True])
+def test_priority_only_uses_current_selected_unspent_authority(tmp_path, monkeypatch, durable, renewed):
+    from businessmap.semantic_review_recovery import POLICY, pending_review_priority
+    monkeypatch.setattr('time.time', lambda: 15)
+    evidence = tmp_path / 'evidence'
+    evidence.write_text('checked')
+    evidence.chmod(0o600)
+    path = tmp_path / 'grant'
+    grant = {'authorized_at': 10, 'expires_at': 20, 'reconciliation_ref': str(evidence)}
+    if durable:
+        grant['authorization_path'] = str(path)
+    raw = json.dumps(grant)
+    path.write_text(raw)
+    path.chmod(0o600)
+    run = dict(run_id='run', snapshot_id='snapshot', project_revision='revision')
+    receipt = {**run, **grant, 'policy': POLICY, 'consumed_at': None, 'reconciliation_evidence': 'checked',
+               'parent_stage_hash': 'parent', 'child_stage_hash': 'child'}
+    if durable:
+        receipt.update(prior_bundle_id='completed', authorization_raw=raw)
+    if renewed:
+        receipt.update(authorized_at=0, expires_at=5, reconciliation_ref='obsolete')
+        receipt['authority_event'] = {'grant_raw': raw, 'evidence_raw': 'checked', 'authorization_path': str(path)}
+    allowlist = set() if durable else {('parent', 'child')}
+    assert pending_review_priority(receipt, run, allowlist)
+    assert not pending_review_priority({**receipt, 'policy': 'other'}, run, allowlist)
+    assert not pending_review_priority({**receipt, 'consumed_at': 14}, run, allowlist)
+    assert not pending_review_priority(receipt, {**run, 'run_id': 'other'}, allowlist)
+    if not durable:
+        assert not pending_review_priority(receipt, run, set())
+    monkeypatch.setattr('time.time', lambda: 20)
+    assert not pending_review_priority(receipt, run, allowlist)
+    monkeypatch.setattr('time.time', lambda: 15)
+    evidence.unlink()
+    assert not pending_review_priority(receipt, run, allowlist)
+
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_priority_dispatch_preserves_parallelism_and_canonical_results_or_error(fail):
+    import threading
+    overlap = threading.Barrier(2)
+    runtime = sem.BusinessSemanticIntegration.__new__(sem.BusinessSemanticIntegration)
+    runtime.CONCURRENCY, runtime._stopped, runtime.guard = 2, threading.Event(), lambda: None
+    def integrate(packet):
+        if packet in (1, 3):
+            overlap.wait(timeout=4)
+            if fail:
+                raise RuntimeError(str(packet))
+        return packet
+    runtime._integrate_packet = integrate
+    packets = list(range(4))
+    if fail:
+        with pytest.raises(RuntimeError, match='^1$'):
+            runtime._run_packets(packets, {1, 3})
+    else:
+        assert runtime._run_packets(packets, {1, 3}) == packets
+
+
 def test_real_negative_child_only_enables_two_drafts_and_five_physical_calls(review_timeout,tmp_path):
     from contextlib import nullcontext
     from businessmap.semantic_review_recovery import authorize_review_timeout_recovery
