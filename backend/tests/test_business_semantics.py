@@ -2328,3 +2328,68 @@ def test_multi_operation_merge_target_uses_actual_full_text_cost_at_34000():
     builder._units['0']['text'] += 'x'
     assert not builder._packet_fits(operations)
     assert all(builder._packet_fits([operation]) for operation in operations)
+
+
+@pytest.mark.parametrize("change", ["none", "peer_commit", "source_scope", "packet_policy", "late_callback", "stop"])
+def test_settled_first_draft_replay_requires_the_same_preflight(semantic_case, monkeypatch, change):
+    from businessmap.business_semantics import SemanticValidationError
+    setup = build_case(semantic_case)
+    runtime, calls = setup[:2]
+    original = execute(setup)
+    sent = len(calls)
+    slow = []
+    integrate = runtime._integrate_packet
+
+    def integrated(packet):
+        slow.append(True)
+        return integrate(packet)
+
+    monkeypatch.setattr(runtime, "_integrate_packet", integrated)
+    select = runtime._settled_first_drafts
+
+    def select_then_change(rows, packets):
+        found = select(rows, packets)
+        assert len(found) == 1
+        if change == "peer_commit":
+            runtime.store.config_set("synthetic_peer_commit", True)
+        if change == "packet_policy":
+            runtime._packet_policy = (runtime._packet_policy[0], ())
+        if change == "late_callback":
+            def updated_control(plan):
+                runtime._run["snapshot_id"] += "-changed"
+            monkeypatch.setattr(runtime.service, "semantic_preflight", updated_control, raising=False)
+        if change == "source_scope":
+            runtime._run["snapshot_id"] += "-changed"
+        if change == "stop":
+            runtime._stopped.set()
+        return found
+
+    monkeypatch.setattr(runtime, "_settled_first_drafts", select_then_change)
+    if change in {"source_scope", "packet_policy", "late_callback", "stop"}:
+        with pytest.raises(SemanticValidationError) as failure:
+            execute(setup)
+        assert failure.value.reason_code == ("needs_review" if change == "stop" else "cache_invalid")
+    else:
+        replay = execute(setup)
+        assert replay["public_documents"] == original["public_documents"]
+        assert replay["usage"]["cache_hits"] == 3 and replay["usage"]["requests"] == 0
+        assert bool(slow) == (change == "peer_commit")
+    assert len(calls) == sent
+
+
+def test_older_generator_review_does_not_skip_a_current_first_review(semantic_case):
+    from businessmap import business_semantics as sem
+    setup = build_case(semantic_case)
+    runtime, calls, snapshot = setup[:3]
+    original = execute(setup)
+    with runtime.store._db() as db:
+        old, raw = db.execute("SELECT stage_hash,data FROM business_semantic_tasks WHERE stage='review'").fetchone()
+        data = json.loads(raw)
+        data["context"]["generator_hash"] = "a" * 64
+        key = sem.semantic_task_identity_hash(snapshot, runtime._input_hash, "review", data["request"], data["context"])
+        data["request_hash"] = key
+        db.execute("UPDATE business_semantic_tasks SET stage_hash=?,data=? WHERE stage_hash=?", (key, sem._json(data), old))
+    sent = len(calls)
+    replay = execute(setup)
+    assert [r["stage"] for r in calls[sent:]] == ["review"]
+    assert original["public_documents"] == replay["public_documents"]

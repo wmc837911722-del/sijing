@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -2371,6 +2372,9 @@ class BusinessSemanticIntegration:
     def _read_tasks(self):
         with self.store._db() as db:
             records = semantic_checkpoint_rows(db, self._input_hash)
+        return self._bind_tasks(records)
+
+    def _bind_tasks(self, records):
         from ._source_material import SourceMaterial
         if type(self._source_material) is SourceMaterial:
             from ._source_material import bind_source_material
@@ -2608,7 +2612,9 @@ class BusinessSemanticIntegration:
     def _current_inventory(self):
         # Plan ancestry and inventory must describe the same SQL snapshot.
         # Each admission, send check and preflight takes its own capture.
-        rows = self._read_tasks()
+        return self._inventory_from_rows(self._read_tasks())
+
+    def _inventory_from_rows(self, rows):
         atomic_plans = self._atomic_plans_from(rows)
         plans = self._repair_plans_from(rows)
         pairs = [(p['partition_revision']['parent_subdivision_hash'], p['partition_revision']['parent_review_hash']) for p in plans]
@@ -2671,14 +2677,104 @@ class BusinessSemanticIntegration:
     def _raise_cached_failure(self):
         self._current_inventory()
 
-    def _preflight(self, stage, remaining):
-        inventory = self._current_inventory()
+    def _replay_inputs(self):
+        return (self._packet_policy_binding(), getattr(self, "_packet_policy", None), _hash(self._run), self.public_content_revision,
+            tuple(frozenset(values) for values in (self.proposal_timeout_recovery_allowlist,
+                self.review_timeout_recovery_allowlist, self.atomic_budget_allowlist,
+                self.whole_operation_allowlist, self.partition_repair_allowlist)), self._source_material)
+
+    def _settled_first_drafts(self, rows, packets):
+        # The complete inventory validator below checks the review wire, result,
+        # claim identifiers and both task identities against these same frozen rows.
+        policy = getattr(self, "_packet_policy", None)
+        if policy is None or policy[0] != self._packet_policy_binding():
+            return {}
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row["data"]["context"].get("packet_hash"), []).append(row)
+        settled = {}
+        for index, (packet, digest) in enumerate(packets):
+            members = grouped.get(digest, ())
+            if (len(members) != 2 or any(row["attempt"] != 1 for row in members)
+                    or self._prepared_packet_entry(policy[1], packet)[1] is not None):
+                continue
+            by_status = {(row["stage"], row["status"]): row for row in members}
+            draft, review = by_status.get(("proposal", "proposed")), by_status.get(("review", "accepted"))
+            if not draft or not review or any(set(row["data"]) != {"result", "result_hash", "request", "request_hash", "context"} for row in members):
+                continue
+            payload, refs, ops = self._packet(packet)
+            context = {"packet_hash": digest, "input_ids": {key: unit["_fact_id"] for key, unit in refs.items()},
+                "operation_ids": {key: op["id"] for key, op in ops.items()}, "revision": _revision_context(),
+                "partition_review_hashes": payload["partition_review_hashes"], "budget_profile": self._profile(),
+                "generator_hash": _semantic_generator_hash(self._snapshot)}
+            if (draft["data"]["request"] != payload or draft["data"]["context"] != context or _hash(payload) != digest
+                    or review["data"]["context"].get("proposal_hash") != draft["stage_hash"]):
+                continue
+            settled[index] = draft, review, ops
+        return settled
+
+    def _preflight_settled(self, packets):
+        from ._frozen_routing import FrozenReader
+        # Keep one dedicated connection open only as a change observer. Release
+        # its read transaction before any source/ledger authentication takes place.
+        try:
+            path = self.store.db_path
+            initial = os.stat(path)
+        except (AttributeError, OSError, TypeError):
+            return None, {}
+        self.guard()
+        before = self._replay_inputs()
+        with self.store._db() as db:
+            if db.in_transaction:
+                return None, {}
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            version = db.execute("PRAGMA main.data_version").fetchone()[0]
+            rows = semantic_checkpoint_rows(db, self._input_hash)
+            db.rollback()
+            rows = self._bind_tasks(rows)
+            inventory = self._inventory_from_rows(rows)
+            reader = rows.read_checkpoint
+            active = any(r.get("consumed_at") is None for get in (reader.recovery_receipts,
+                reader.supersession_receipts, reader.d2_retry_rows) for r in get(self._input_hash))
+            pairs = {}
+            if type(reader) is FrozenReader and reader._FrozenReader__plain_capture and not active:
+                pairs = self._settled_first_drafts(rows, packets)
+            self.guard()
+            if self._stopped.is_set():
+                raise SemanticValidationError("needs_review")
+            checked = set(inventory["task_hashes"])
+            if (not self._owned_slots and not self._stopped.is_set() and self._replay_inputs() == before
+                    and os.path.samestat(initial, os.stat(path))
+                    and db.execute("PRAGMA main.data_version").fetchone()[0] == version):
+                settled = {}
+                for index, (draft, review, ops) in pairs.items():
+                    if draft["stage_hash"] in checked and review["stage_hash"] in checked:
+                        data, context = draft["data"], review["data"]["context"]
+                        settled[index] = {**_compile_candidate(data["result"], context["input_ids"], ops, context["claim_ids"]),
+                            "packet_hash": context["packet_hash"], "review_hash": review["stage_hash"]}
+                return inventory, settled
+        # A peer write or a local control/policy change invalidates the entire
+        # batch. No historical success can authorize any new work.
+        self.guard()
+        if self._stopped.is_set():
+            raise SemanticValidationError("needs_review")
+        return None, {}
+
+    def _preflight(self, stage, remaining, *, ordinary_packets=()):
+        inventory, settled = None, {}
+        if ordinary_packets and not self._owned_slots and not getattr(self.service, "semantic_preflight", None):
+            inventory, settled = self._preflight_settled(ordinary_packets)
+        if inventory is None:
+            inventory = self._current_inventory()
         plan = {"stage": stage, "occupied_calls": inventory["occupied_calls"], "remaining_maximum_calls": remaining,
                 "cumulative_maximum_calls": inventory["occupied_calls"] + remaining}
         self.plans.append(plan)
         callback = getattr(self.service, "semantic_preflight", None)
         if callback:
             callback(plan)
+            return {}
+        return settled
 
     def _call(self, stage, system, payload, normalize, *, context=None):
         lease = _semantic_admission_gate(self).acquire(self)
@@ -3594,6 +3690,13 @@ class BusinessSemanticIntegration:
             raise error
         return normalized
 
+    @staticmethod
+    def _prepared_packet_entry(policy_entries, operations):
+        packet_wire = _json(operations)
+        matches = [entry for entry in policy_entries if entry[0] == packet_wire]
+        _require(len(matches) == 1, "cache_invalid")
+        return matches[0]
+
     def _integrate_packet(self, operations):
         payload, refs, ops = self._packet(operations)
         prepared = getattr(self, '_packet_policy', None)
@@ -3603,13 +3706,11 @@ class BusinessSemanticIntegration:
             atomic_plans = self._atomic_plans()
             whole_plans = self._whole_plans() if (any(not self._packet_fits([op]) for op in operations)
                 or self.whole_operation_allowlist or any('whole_operation' in row['data']['context'] for row in self._read_tasks())) else []
-            entries = self._packet_policy_entries([operations], atomic_plans, whole_plans)
+            entry, = self._packet_policy_entries([operations], atomic_plans, whole_plans)
         else:
             _require(prepared[0] == self._packet_policy_binding(), 'cache_invalid')
-            packet_wire = _json(operations)
-            entries = tuple(entry for entry in prepared[1] if entry[0] == packet_wire)
-            _require(len(entries) == 1, 'cache_invalid')
-        _, kind, encoded_meta, cap = entries[0]
+            entry = self._prepared_packet_entry(prepared[1], operations)
+        _, kind, encoded_meta, cap = entry
         atomic = kind == 'atomic_budget'
         whole = kind == 'whole_operation'
         meta = json.loads(encoded_meta) if encoded_meta is not None else None
@@ -3749,7 +3850,14 @@ class BusinessSemanticIntegration:
             from .semantic_review_exception import POLICY as EXCEPTION_POLICY
             allowance = sum(r["policy"] in {PROPOSAL_POLICY, REVIEW_POLICY, EXCEPTION_POLICY} and r["packet_hash"] == packet_hash for r in recoveries)
             remaining += 0 if any(row["stage"] == "review" and row["status"] == "accepted" for row in members) else max(0, 4 + allowance - len(members))
-        self._preflight("semantics", remaining)
+        # Accumulate settled results only during this synchronous build preflight.
+        # A custom preflight retains the complete previous scheduling contract.
+        possible = any(r["stage"] == "review" and r["attempt"] == 1 and r["status"] == "accepted" for r in rows.values())
+        if possible and getattr(self._preflight, "__func__", None) is BusinessSemanticIntegration._preflight:
+            settled = self._preflight("semantics", remaining, ordinary_packets=list(zip(packets, packet_hashes)))
+        else:
+            self._preflight("semantics", remaining)
+            settled = {}
         from .semantic_review_recovery import pending_review_priority
         pending_packets = {r['packet_hash'] for r in recoveries if pending_review_priority(r, run, self.review_timeout_recovery_allowlist)}
         if selected_rewrite is not None:
@@ -3757,8 +3865,13 @@ class BusinessSemanticIntegration:
             if not any(row["stage"] == "review" and row["data"]["context"].get("proposal_hash") == draft_hash
                        and row["status"] != "planned" for row in rows.values()):
                 pending_packets.add(packet_hash)
-        priority = {index for index, packet_hash in enumerate(packet_hashes) if packet_hash in pending_packets}
-        results = self._run_packets(packets, priority) if priority else self._run_packets(packets)
+        pending = [i for i in range(len(packets)) if i not in settled]
+        work = [packets[i] for i in pending]
+        priority = {i for i, original in enumerate(pending) if packet_hashes[original] in pending_packets}
+        self._usage["cache_hits"] += 2 * len(settled)
+        completed = self._run_packets(work, priority) if priority else self._run_packets(work)
+        settled.update(zip(pending, completed, strict=True))
+        results = [settled[i] for i in range(len(packets))]
         claims = [claim for result in results for claim in result["claims"]]
         catalogue = [operation for result in results for operation in result["catalogue"]]
         decisions = {fid: decision for result in results for fid, decision in result["decisions"].items()}
