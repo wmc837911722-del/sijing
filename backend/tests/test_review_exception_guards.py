@@ -8,6 +8,62 @@ from businessmap.semantic_recovery import consume_recovery,held_project_lock
 from review_exception_fixture import two_review_history
 from test_review_exception_bundle import prepare_fixture,authorize_fixture,case_for
 
+@pytest.mark.parametrize('cold_proposal', (True, False), ids=('cold-proposal', 'warm-proposal'))
+def test_second_draft_saves_authenticate_the_parent_with_cold_and_warm_source(two_review_history, tmp_path, cold_proposal):
+    import sys
+    from test_business_semantics import independent_candidate, review
+
+    c = two_review_history
+    authorize_fixture(c, tmp_path)
+    c.store.config_set('full_analysis_control:' + c.run['run_id'], {'paused': False, 'cancelled': False})
+    calls = []
+
+    def complete(system, text, **kwargs):
+        kwargs['before_send']()
+        payload = json.loads(text)
+        calls.append(payload['stage'])
+        result = independent_candidate(payload) if payload['stage'] == 'proposal' else review(payload, reject=len(calls) == 1)
+        return {'text': json.dumps(result, ensure_ascii=False), 'usage': {}, 'output_limited': False}
+
+    c.service.providers.complete = complete
+    save = c.runtime._save_task_once
+    parent_reads = []
+
+    def observe_save(key, stage, status, **kwargs):
+        binding = c.runtime._task_bindings[key]
+        if status not in ('proposed', 'accepted') or binding['context'].get('revision', {}).get('draft_index') != 2:
+            return save(key, stage, status, **kwargs)
+        if stage == 'proposal' and cold_proposal:
+            c.runtime._source_material = None
+        else:
+            assert c.runtime._source_material is not None
+
+        # Observe the actual parent authentication without replacing a compiler dependency.
+        material = c.runtime._source_material
+        old_profile = sys.getprofile()
+
+        def observe(frame, event, arg):
+            if event == 'call' and frame.f_code is s._checkpoint_record.__code__ and frame.f_back.f_code is save.__func__.__code__:
+                reader = frame.f_locals['read_checkpoint']
+                parent_reads.append((stage, reader._FrozenReader__material is material))
+                sys.setprofile(old_profile)
+
+        sys.setprofile(observe)
+        try:
+            return save(key, stage, status, **kwargs)
+        finally:
+            sys.setprofile(old_profile)
+
+    c.runtime._save_task_once = observe_save
+    with held_project_lock(c.snapshot['project']['id']):
+        c.runtime._integrate_packet(c.packets[0])
+    assert parent_reads == [('proposal', True), ('review', True)]
+    assert calls == ['review', 'proposal', 'review']
+    with c.store._db() as db:
+        assert dict(db.execute('SELECT stage,status FROM business_semantic_tasks WHERE attempt=2')) == {
+            'proposal': 'proposed', 'review': 'accepted'}
+
+
 
 def test_raw_drift_missing_peer_and_nonfactory_views_fail_closed(two_review_history,tmp_path):
  c=two_review_history;plan,_,_=authorize_fixture(c,tmp_path)
@@ -221,7 +277,7 @@ def test_competing_consumers_leave_one_claim_without_resend(two_review_history,t
 
 
 @pytest.mark.parametrize('drift_stage',('proposal','review'))
-@pytest.mark.parametrize('mutation',('oldraw','strip-parent-lineage','delete-peer'))
+@pytest.mark.parametrize('mutation',('oldraw','strip-parent-lineage','delete-peer','source'))
 def test_d2_paid_drift_never_promotes(two_review_history,tmp_path,drift_stage,mutation):
  from test_business_semantics import independent_candidate,review
  c=two_review_history;plan,_,_=authorize_fixture(c,tmp_path)
@@ -234,6 +290,7 @@ def test_d2_paid_drift_never_promotes(two_review_history,tmp_path,drift_stage,mu
    with c.store._db() as db:
     if mutation=='oldraw':db.execute("UPDATE business_semantic_tasks SET data=' '||data WHERE stage_hash=?",(c.targets[0]['stage_hash'],))
     elif mutation=='delete-peer':db.execute('DELETE FROM business_semantic_recoveries WHERE recovery_id=?',(plan['members'][1]['recovery_id'],))
+    elif mutation=='source':db.execute("UPDATE full_analysis_chunks SET data=' '||data")
     else:
      key=plan['members'][0]['child_stage_hash']
      data=json.loads(db.execute('SELECT data FROM business_semantic_tasks WHERE stage_hash=?',(key,)).fetchone()[0])

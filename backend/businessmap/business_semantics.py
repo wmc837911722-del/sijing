@@ -2216,16 +2216,29 @@ class BusinessSemanticIntegration:
         operation = {'proposed': 'save_proposed', 'accepted': 'save_accepted'}.get(status)
         needs_prepared = operation is not None and ('recovery_id' in data or 'supersession_id' in data)
         if operation is not None and attempt == 2:
+            from ._source_material import SourceMaterial, bind_source_material
+            from .semantic_review_exception import POLICY as EXCEPTION_POLICY
             # Derive the promotion obligation from the authenticated parent, never
             # from an optional caller flag or a failed bundle lookup.
             with self.store._db() as parent_db:
                 parent_db.execute('BEGIN')
                 parent_reader = semantic_checkpoint_rows(parent_db, self._input_hash).read_checkpoint
-            parent = _checkpoint_record(data['context']['revision']['parent_failure_hash'],
+            parent_key = data['context']['revision']['parent_failure_hash']
+            if type(self._source_material) is SourceMaterial and any(
+                receipt.get('child_stage_hash') == parent_key and receipt.get('policy') == EXCEPTION_POLICY
+                for receipt in parent_reader.recovery_receipts(self._input_hash)
+            ):
+                # The receipt selects a Source template only. Authenticate the parent
+                # and its receipt below even if this fresh snapshot cannot use it.
+                try:
+                    parent_reader = bind_source_material(self._source_material, self._snapshot, self._run,
+                        read_checkpoint=parent_reader)
+                except SemanticValidationError:
+                    pass
+            parent = _checkpoint_record(parent_key,
                 snapshot=self._snapshot, expected_input_hash=self._input_hash, read_checkpoint=parent_reader)
             if 'recovery_id' in parent['data']:
                 from .semantic_recovery import authenticate_recovery
-                from .semantic_review_exception import POLICY as EXCEPTION_POLICY
                 parent_receipt = authenticate_recovery(parent, snapshot=self._snapshot,
                     expected_input_hash=self._input_hash, read_checkpoint=parent_reader)
                 needs_prepared = needs_prepared or parent_receipt['policy'] == EXCEPTION_POLICY
