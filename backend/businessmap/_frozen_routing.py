@@ -135,7 +135,10 @@ def _prepared_copy(value):
     """Prepare one captured raw value, without copying custom objects early."""
     metadata = _routing_copy_metadata(value)
     if metadata:
-        return lambda: marshal.loads(metadata)
+        def clone():
+            return marshal.loads(metadata)
+        clone._plain_graph = True
+        return clone
     return lambda: deepcopy(value)
 
 
@@ -144,7 +147,7 @@ class FrozenReader:
     __slots__ = ('__reader', '__route', '__sealed', '_catalogue_frontiers',
                  'catalogue_source', 'catalogue_runs', 'task_rows', 'supersession_receipts',
                  'raw_digest', 'raw_checkpoint_row', 'raw_error_code', 'recovery_receipts',
-                 'd2_retry_rows', '__view_root', '__hidden', '__views', '_source_capture', '__material', '_dynamic_capture', '__v2_proofs', '__prior_bundle_id')
+                 'd2_retry_rows', '__view_root', '__hidden', '__views', '_source_capture', '__material', '_dynamic_capture', '__v2_proofs', '__prior_bundle_id', '__packet_terminal', '__plain_capture')
 
     def __init__(self, reader):
         from .business_semantics import semantic_checkpoint_rows
@@ -154,6 +157,8 @@ class FrozenReader:
                 if inspect.iscode(code))):
             raise TypeError('reader must be created by semantic_checkpoint_rows')
         object.__setattr__(self, '_FrozenReader__reader', reader)
+        object.__setattr__(self, '_FrozenReader__packet_terminal', None)
+        object.__setattr__(self, '_FrozenReader__plain_capture', False)
         object.__setattr__(self, '_source_capture', None)
         object.__setattr__(self, '_FrozenReader__material', None)
         object.__setattr__(self, '_FrozenReader__prior_bundle_id', None)
@@ -219,6 +224,7 @@ class FrozenReader:
             name = '_FrozenReader' + slot if slot.startswith('__') else slot
             object.__setattr__(view, name, getattr(self,name))
         object.__setattr__(view,'_FrozenReader__prior_bundle_id',ancestry._V2Ancestry__bundle_id)
+        object.__setattr__(view, '_FrozenReader__packet_terminal', None)
         object.__setattr__(view,'_FrozenReader__hidden',hidden)
         object.__setattr__(view,'_FrozenReader__reader',self)
         object.__setattr__(view,'_catalogue_frontiers',{})
@@ -248,6 +254,8 @@ class FrozenReader:
             return root.__views[key]
         view = object.__new__(FrozenReader)
         object.__setattr__(view, '_FrozenReader__reader', root)
+        object.__setattr__(view, '_FrozenReader__packet_terminal', None)
+        object.__setattr__(view, '_FrozenReader__plain_capture', root.__plain_capture)
         object.__setattr__(view, '_FrozenReader__view_root', root)
         object.__setattr__(view, '_FrozenReader__hidden', hidden)
         object.__setattr__(view, '_FrozenReader__views', root.__views)

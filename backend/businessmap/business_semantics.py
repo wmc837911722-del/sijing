@@ -1426,6 +1426,13 @@ def semantic_checkpoint_rows(db, expected_input_hash):
             return clone() if clone is not None else None
         frozen._catalogue_frontiers = {}
         retry_audits = _prepared_copy(reader.d2_retry_rows(expected_input_hash))
+        # Raw SQL columns are immutable scalars. Custom decoded values keep their
+        # original copy hooks and cannot stand in for a later validation.
+        frozen._FrozenReader__plain_capture = all(getattr(clone, '_plain_graph', False) for clone in
+            (all_rows_copy, supersessions_copy, receipts_copy, retry_audits, *source_copies.values())
+        ) and all(type(value) in (str, type(None)) for value in (*raw.values(), *raw_errors.values())
+        ) and all(type(row) is tuple and all(type(value) in (str, int, type(None)) for value in row)
+                  for row in raw_rows.values())
         frozen.d2_retry_rows = lambda identity: retry_audits() if identity == expected_input_hash else []
         frozen._dynamic_capture = dynamic_capture
         def frozen_source(run_id):

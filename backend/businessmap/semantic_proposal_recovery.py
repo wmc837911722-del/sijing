@@ -52,6 +52,37 @@ def _source_material(source):
     return {**source, 'run': stable}
 
 
+def _settled_source_frontier(snapshot, run, scoped, groups):
+    """A successful terminal belongs only to this one frozen Source-only view."""
+    from ._frozen_routing import FrozenReader, _routing_copy_metadata, _copy_routing
+    from . import semantic_catalogue_frontier as frontier
+    from ._source_material import _template_material
+    identity = run['semantic_input_hash']
+    key = None
+    if (type(scoped) is FrozenReader and scoped._FrozenReader__plain_capture
+            and scoped._FrozenReader__material is not None and scoped._FrozenReader__hidden
+            and _routing_copy_metadata((snapshot, groups))
+            and _template_material(scoped, snapshot, run, groups=groups) is not None):
+        receipts = scoped.recovery_receipts(identity) + scoped.supersession_receipts(identity)
+        # Pending interrupted-catalogue authority can expire or be revoked mid-read.
+        # Preserve every clock, evidence and owner check on that path.
+        if (all(isinstance(receipt, dict) and receipt.get('consumed_at') is not None for receipt in receipts)
+                and not scoped.d2_retry_rows(identity)
+                and all(row['stage'] not in {'proposal','review'} for row in scoped.task_rows(identity))):
+            key = s._hash([identity, snapshot, groups])
+            cached = scoped._FrozenReader__packet_terminal
+            if cached is not None and cached[0] == key:
+                return _copy_routing(None, cached[1])
+    atomic, whole, repairs = groups
+    result = frontier._packet_frontier(snapshot, identity, read_checkpoint=scoped,
+        atomic_budget_chains=atomic, whole_histories=whole, partition_repair_pairs=repairs)
+    if key is not None and not result['received_to_accept']:
+        metadata = _routing_copy_metadata(result)
+        if metadata and _template_material(scoped, snapshot, run, groups=groups) is not None:
+            object.__setattr__(scoped, '_FrozenReader__packet_terminal', (key, metadata))
+    return result
+
+
 def _packet_binding(snapshot, run, parent, reader, *, atomic_budget_chains, whole_histories, partition_repair_pairs):
     from ._source_material import _packet_template
     data, context = parent['data'], parent['data']['context']
@@ -62,13 +93,10 @@ def _packet_binding(snapshot, run, parent, reader, *, atomic_budget_chains, whol
             budget_profile=context['budget_profile'], atomic_budget_chains=atomic_budget_chains,
             whole_histories=whole_histories, partition_repair_pairs=partition_repair_pairs)
     else:
-        from . import semantic_catalogue_frontier as frontier
         scoped = _without_packet(reader, run['semantic_input_hash'], '', source_only=True)
         # Current physical inventory/receipt and source-phase checks are never
         # supplied by a template. Only expensive wire/layout construction is.
-        forest = frontier._packet_frontier(snapshot, run['semantic_input_hash'], read_checkpoint=scoped,
-            atomic_budget_chains=atomic_budget_chains, whole_histories=whole_histories,
-            partition_repair_pairs=partition_repair_pairs)
+        forest = _settled_source_frontier(snapshot, run, scoped, groups)
         s._require(not forest['received_to_accept'], 'cache_invalid')
         source = reader.catalogue_source(run['run_id'])
         packet, raw_dependencies = prepared
