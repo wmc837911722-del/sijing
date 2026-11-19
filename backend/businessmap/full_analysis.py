@@ -5,9 +5,11 @@ Markdown remains the authoritative output. No repository code is executed.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import posixpath
 import re
 import threading
 import uuid
@@ -15,9 +17,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote
 
 from .analysis_output import AnalysisOutputError, normalize_markdown
 from .core import CoreError, now, revision
+from .project_analysis import _note_path_key, _other_projects_note_paths
 from .providers import ToolError, parse_json_answer, provider_destination
 
 
@@ -920,7 +924,7 @@ class FullProjectAnalysis:
                 try:
                     publication = self._publish(snapshot, run)
                 except Exception as error:
-                    run.update(status="failed", error="完整源码与业务综合断点已保存，但文档发布失败；再次分析仅继续发布，人工修改保留。", summary="完整分析结果已保存，文档发布尚未完成。")
+                    run.update(status="failed", publication_complete=False, error="完整源码与业务综合断点已保存，但文档发布失败；再次分析仅继续发布，人工修改保留。", summary="完整分析结果已保存，文档发布尚未完成。")
                     self._save(run)
                     if getattr(error, "status_code", None) == 409:
                         raise
@@ -960,6 +964,212 @@ class FullProjectAnalysis:
         temporary.write_text(_json(manifest), encoding="utf-8")
         temporary.replace(directory / "manifest.json")
 
+    def _relocation_entries(self, vault, key, destinations, state_notes):
+        """A stored revision authorizes retirement of only its recorded topic and parts."""
+        old_base = PurePosixPath(state_notes[key]["path"])
+        if old_base.parent != PurePosixPath(destinations[key]).parent or old_base.suffix != ".md":
+            return None
+        family, other_paths = {}, set()
+        for part, meta in state_notes.items():
+            if part == key:
+                expected = str(old_base)
+            elif part.startswith(key + ":part:"):
+                number = part.removeprefix(key + ":part:")
+                if not re.fullmatch("[1-9][0-9]*", number):
+                    return None
+                expected = str(old_base.with_suffix("") / f"第{number}部分.md")
+            else:
+                if meta.get("path"):
+                    other_paths.add(_note_path_key(meta["path"]))
+                continue
+            if meta.get("path") != expected:
+                return None
+            physical = self.store._path(expected, vault=vault)
+            if not physical.is_file() or physical.resolve() != vault / expected:
+                return None
+            try:
+                digest = revision(physical.read_text(encoding="utf-8-sig"))
+            except (OSError, UnicodeError):
+                return None
+            if digest != meta.get("revision"):
+                return None
+            family[expected] = digest
+        names = [*family, *destinations.values()]
+        if any(_note_path_key(name) in other_paths for name in names):
+            return None
+        for target in destinations.values():
+            physical = self.store._path(target, vault=vault)
+            if physical.exists() or physical.is_symlink() or physical.resolve() != vault / target:
+                return None
+        return family
+
+    def _linked_topics(self, vault, families, writable):
+        """Resolve local Markdown and Obsidian backlinks once for all proposed moves."""
+        from .knowledge import _prose_text
+        if not families:
+            return set()
+        owners, wiki_names = {}, {}
+        for topic, family in families.items():
+            for name in family:
+                target = _note_path_key(name)
+                owners[target] = topic
+                parts = target.split("/")
+                for start in range(len(parts)):
+                    wiki_names.setdefault("/".join(parts[start:]), set()).add(topic)
+        linked = set()
+        links = re.compile(r'\[\[([^\]\n]+)\]\]|(?:\]\(\s*|^ {0,3}\[[^\]\n]+\]:[ \t]*)(?:<([^>\n]+)>|((?:\\.|[^\s()]|\([^()]*\))+))', re.M)
+        for document in vault.rglob("*"):
+            relative = document.relative_to(vault)
+            if document.suffix.casefold() not in (".md", ".markdown") or any(part.startswith(".") for part in relative.parts):
+                continue
+            if document.is_symlink():
+                try:
+                    target = document.resolve(strict=True).relative_to(vault)
+                except (OSError, RuntimeError, ValueError):
+                    continue  # Never read through a link outside the vault.
+                if topic := owners.get(_note_path_key(target.as_posix())):
+                    linked.add(topic)
+            if not document.is_file():
+                continue
+            try:
+                content = document.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                return set(families)
+            name = relative.as_posix()
+            if name in writable and writable[name] == revision(content):
+                continue
+            own_topic = owners.get(_note_path_key(name))
+            frontmatter = re.match(r"\A---[^\S\r\n]*\r?\n.*?\r?\n---[^\S\r\n]*(?:\r?\n|$)", content, re.S)
+            prose = (frontmatter[0] if frontmatter else "") + _prose_text(content)
+            for wiki, angle, plain in links.findall(prose):
+                address = (wiki.split("|", 1)[0] if wiki else angle or plain).split("#", 1)[0].split("?", 1)[0]
+                address = re.sub(r'\\([() ])', r'\1', unquote(address)).strip()
+                if not address or re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*:", address):
+                    continue
+                if not address.casefold().endswith(".md"):
+                    address += ".md"
+                direct = _note_path_key(address.lstrip("/"))
+                relative_target = _note_path_key(posixpath.join(posixpath.dirname(name), address))
+                referenced = {owners.get(direct), owners.get(relative_target)}
+                if wiki:
+                    referenced.update(wiki_names.get(direct, ()))
+                linked.update(referenced - {None, own_topic})
+        return linked
+
+    @staticmethod
+    def _move_stage(path, manifest, name):
+        return path.with_name(f".sijing-{manifest['id']}-{name}")
+
+    @staticmethod
+    def _file_identity(path):
+        try:
+            stat = path.lstat()
+            return [stat.st_dev, stat.st_ino]
+        except FileNotFoundError:
+            return None
+
+    def _install_moved_note(self, vault, directory, manifest, entry, content):
+        """Keep a hard-link witness until the database transaction is resolved."""
+        target = self.store._path(entry["path"], vault=vault)
+        data = content.encode("utf-8")
+        if len(data) > self.store.MAX_NOTE_BYTES:
+            raise CoreError(413, "笔记过大（上限 2 MB）")
+        if self.store.vault != vault or target.resolve() != vault / entry["path"]:
+            raise CoreError(409, "主题改名期间知识库或目标位置发生变化。")
+        try:
+            target.parent.mkdir()
+            entry["created_parent"] = self._file_identity(target.parent)
+        except FileExistsError:
+            pass
+        staged = self._move_stage(target, manifest, entry["backup"] + ".new")
+        with staged.open("xb") as stream:
+            stat = os.fstat(stream.fileno())
+            entry["move_inode"] = [stat.st_dev, stat.st_ino]
+            self._manifest_write(directory, manifest)
+            stream.write(data)
+        try:
+            os.link(staged, target)
+        except FileExistsError:
+            raise CoreError(409, "主题改名目标已被占用，已保留现有文件。") from None
+        except OSError as error:
+            if error.errno not in (errno.ENOTSUP, errno.EPERM, errno.EOPNOTSUPP):
+                raise
+            raise CoreError(409, "知识库所在磁盘无法安全创建改名目标，已保留原文件。") from None
+        self.store._signature.pop(entry["path"], None)
+        return revision(content)
+
+    def _finish_moves(self, manifest, directory, committed):
+        """Resolve the two file names around the same durable publication marker."""
+        vault = Path(manifest["vault_path"])
+        conflicts = False
+        for entry in manifest["entries"]:
+            identity = entry.get("move_inode")
+            if identity is None:
+                continue
+            path = self.store._path(entry["path"], vault=vault)
+            witness = self._move_stage(path, manifest, entry["backup"] + ".new")
+            if self._file_identity(witness) != identity:
+                continue
+            if not committed and self._file_identity(path) == identity:
+                try:
+                    matches = revision(path.read_text(encoding="utf-8-sig")) == entry["after_revision"]
+                except (OSError, UnicodeError):
+                    matches = False
+                if matches and self._file_identity(path) == identity:
+                    path.unlink()
+                    self.store._signature.pop(entry["path"], None)
+            witness.unlink()
+
+        for index, entry in enumerate(manifest.get("retired", [])):
+            path = self.store._path(entry["path"], vault=vault)
+            staged = self._move_stage(path, manifest, f"{index}.previous")
+            identity = self._file_identity(staged)
+            if identity is None:
+                continue
+            committed_source = False
+            if committed and identity == entry["inode"] and staged.is_file() and not staged.is_symlink():
+                try:
+                    committed_source = revision(staged.read_text(encoding="utf-8-sig")) == entry["revision"]
+                except (OSError, UnicodeError):
+                    pass
+            if committed and not committed_source:
+                conflicts = True
+            if committed_source:
+                backup = directory / f"retired-{index}.before"
+                try:
+                    staged.replace(backup)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    data = staged.read_bytes()
+                    backup.write_bytes(data)
+                    if data != staged.read_bytes():
+                        conflicts = True
+                        continue
+                    staged.unlink()
+            else:
+                if self._file_identity(path) != identity:
+                    try:
+                        os.link(staged, path, follow_symlinks=False)
+                    except FileExistsError:
+                        conflicts = True
+                        continue
+                staged.unlink()
+            self.store._signature.pop(entry["path"], None)
+        if committed:
+            removable = [(vault / entry["path"], entry["inode"]) for entry in manifest.get("retired_page_dirs", [])]
+        else:
+            removable = [((vault / entry["path"]).parent, entry["created_parent"])
+                         for entry in manifest["entries"] if entry.get("created_parent")]
+        for folder, identity in removable:
+            if folder.resolve() == folder and self._file_identity(folder) == identity:
+                try:
+                    folder.rmdir()  # Preserve every directory that contains any other file.
+                except OSError as error:
+                    if error.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+                        raise
+        return not conflicts
+
     def _recover_publications(self, run):
         root = self.store.data_dir / "full-analysis-publications"
         if not root.exists():
@@ -976,12 +1186,17 @@ class FullProjectAnalysis:
             if manifest["status"] != "writing":
                 continue
             if self.store.config_get("full_analysis_publication:" + manifest["id"]):
+                if not self._finish_moves(manifest, target.parent, True):
+                    raise CoreError(409, "主题改名期间文件发生变化，已保留两份文件。")
                 manifest["status"] = "committed"
                 self._manifest_write(target.parent, manifest)
                 continue
             if str(self.store.vault) != manifest["vault_path"]:
                 raise ToolError("发布恢复所需知识库已切换，请回到原知识库后继续。", 409)
+            recovered = self._finish_moves(manifest, target.parent, False)
             for entry in reversed(manifest["entries"]):
+                if entry.get("skip_rollback") or entry.get("move_target"):
+                    continue
                 path = self.store._path(entry["path"], vault=Path(manifest["vault_path"]))
                 if not path.exists():
                     continue
@@ -1000,6 +1215,8 @@ class FullProjectAnalysis:
                         if error.status_code != 409:
                             raise
                 self.store._signature.pop(entry["path"], None)
+            if not recovered:
+                raise CoreError(409, "主题改名期间原位置有新内容，已保留两份文件。")
             manifest["status"] = "rolled_back"
             self._manifest_write(target.parent, manifest)
         self.store.refresh()
@@ -1036,13 +1253,15 @@ class FullProjectAnalysis:
         addenda = AnalysisAddenda(self.service, guard=lambda: self._send_guard(snapshot, run)).accepted(snapshot, run)
         validate_stored_semantic_projection(projection, snapshot=snapshot,
             expected_input_hash=semantic_input_hash(snapshot, run, chunks, addenda), store=self.store)
-        public_documents = projection.get("public_documents")
+        from .public_topic_titles import public_topic_presentation
+        public_documents, overview_body, summary_body = public_topic_presentation(projection, snapshot["project"]["name"])
         coverage = projection["semantic_coverage"]
         public_facts = {}
         for claim in coverage["claims"]:
             for fact_id in claim["support_ids"]:
                 public_facts.setdefault(fact_id, set()).add("topic:" + claim["operation_id"].partition(":")[2])
         paths, documents, module_parts, topics = {}, {}, {}, {}
+        relocated = {}
         mapped_facts = {}
         for document in public_documents:
             if (not isinstance(document, dict) or not isinstance(document.get("key"), str)
@@ -1061,6 +1280,10 @@ class FullProjectAnalysis:
                 raise CoreError(422, "公开业务主题重名，未覆盖任何文档。")
             source_paths = projection.get("source_mapping", {}).get(key, {}).get("source_paths", [])
             plan = paginate_document(key, document["title"], document["body"], source_paths, path, self.PAGE_BYTES)
+            old_path = state_notes.get(key, {}).get("path")
+            if old_path and old_path != path:
+                # Validate the entire old and new family before moving any page.
+                relocated[key] = plan["paths"]
             documents.update(plan["documents"])
             paths.update(plan["paths"])
             module_parts[key] = plan["part_keys"]
@@ -1084,8 +1307,8 @@ class FullProjectAnalysis:
                 target, _, label = match[1].partition("|")
                 target = target.removesuffix(".md")
                 return match[0] if target in allowed else label or target
-            overview = _rewrite_links(projection["overview_body"], {}, replace_link=public_link)
-            summary = _rewrite_links(projection["summary_body"], {}, replace_link=public_link)
+            overview = _rewrite_links(overview_body, {}, replace_link=public_link)
+            summary = _rewrite_links(summary_body, {}, replace_link=public_link)
             overview += "\n\n## 业务主题导航\n\n" + navigation(written) + "\n"
             summary += "\n\n## 已保存业务主题\n\n" + navigation(written) + "\n"
             if len(written) != len(module_keys):
@@ -1130,6 +1353,31 @@ class FullProjectAnalysis:
                      "after_revision": revision(rendered[key]), "backup": backup}
             entries[key] = entry
             manifest["entries"].append(entry)
+        vault = Path(snapshot["vault_path"])
+        writable_indexes = {path: state_notes[key].get("revision") for key, path in paths.items()
+                            if key.split(":", 1)[0] in ("overview", "summary") and state_notes.get(key, {}).get("path") == path}
+        source_families, blocked_moves = {}, {}
+        if relocated:
+            old_paths = {topic: [meta["path"] for key, meta in state_notes.items()
+                                 if key == topic or key.startswith(topic + ":part:")] for topic in relocated}
+            involved = {_note_path_key(path) for topic in relocated for path in [*old_paths[topic], *relocated[topic].values()]}
+            with self.store._db() as db:
+                foreign_paths = _other_projects_note_paths(db, state_key, vault, involved)
+            for topic, destinations in relocated.items():
+                if any(_note_path_key(path) in foreign_paths for path in [*old_paths[topic], *destinations.values()]):
+                    continue
+                family = self._relocation_entries(vault, topic, destinations, state_notes)
+                if family:
+                    source_families[topic] = family
+            for topic in self._linked_topics(vault, source_families, writable_indexes):
+                del source_families[topic]
+            for topic, destinations in relocated.items():
+                for part in destinations:
+                    if topic in source_families:
+                        entries[part]["move_target"] = True
+                    else:
+                        blocked_moves[part] = old_paths[topic]
+                        entries[part]["skip_rollback"] = True
         self._manifest_write(directory, manifest)
         managed = {key: {**value, "stale": True} for key, value in state_notes.items()}
         conflicts, written, created, updated = [], [], 0, 0
@@ -1137,27 +1385,37 @@ class FullProjectAnalysis:
             with self.store._lock, self.store._db() as db:
                 db.execute("BEGIN IMMEDIATE")
                 self.project_analysis.guard(snapshot)
+                if relocated:
+                    current_state = db.execute("SELECT value FROM config WHERE key=?",(state_key,)).fetchone()
+                    if not current_state or json.loads(current_state[0]) != state or _other_projects_note_paths(db, state_key, vault, involved) != foreign_paths:
+                        raise CoreError(409, '主题改名期间文档的所有权记录发生变化，请重试。')
                 row = db.execute("SELECT value FROM config WHERE key='project_analysis_candidates'").fetchone()
                 candidates = json.loads(row[0]) if row else []
                 def publish(key, force_conflict=False):
                     nonlocal created, updated, candidates
                     current, old = before[key], state_notes.get(key)
                     title, body, source_paths = documents[key]
-                    conflict = force_conflict or bool(current and (not old or current["revision"] != old.get("revision")))
+                    conflict = key in blocked_moves or force_conflict or bool(current and (not old or current["revision"] != old.get("revision")))
                     if not conflict:
                         try:
-                            saved_revision = self.store._write_note(paths[key], rendered[key], current["revision"] if current else None, vault=Path(snapshot["vault_path"]))
+                            if entries[key].get('move_target'):
+                                saved_revision = self._install_moved_note(vault, directory, manifest, entries[key], rendered[key])
+                            else:
+                                saved_revision = self.store._write_note(paths[key], rendered[key], current["revision"] if current else None, vault=vault)
                         except CoreError as error:
-                            if error.status_code != 409:
+                            if error.status_code != 409 or entries[key].get("move_target"):
                                 raise
                             conflict = True
                     cid = "project-" + run["project_id"] + "-" + key
                     candidates = [candidate for candidate in candidates if candidate["id"] != cid]
                     if conflict:
                         candidate = self.project_analysis._candidate(snapshot, key, paths[key], rendered[key], current, source_paths)
+                        if key in blocked_moves:
+                            candidate["relocation_from"] = blocked_moves[key]
                         candidates.append(candidate)
                         conflicts.append({"id": cid, "path": paths[key]})
-                        managed[key] = {**(old or {}), "path": paths[key], "stale": True, "conflict": True}
+                        managed[key] = {**(old or {}), "path": old["path"] if key in blocked_moves and old else paths[key],
+                                        "stale": True, "conflict": True}
                         return False
                     created += int(current is None)
                     updated += int(current is not None)
@@ -1178,12 +1436,41 @@ class FullProjectAnalysis:
                 for key in ("overview", "summary"):
                     parts_ok = all([publish(part) for part in families[key]])
                     publish(key, force_conflict=not parts_ok)
+                if source_families:
+                    if any(topic not in written for topic in source_families) or any(
+                            conflict['path'] in writable_indexes for conflict in conflicts):
+                        raise CoreError(409, '主题改名期间文档或索引发生变化，请重试。')
+                    if self._linked_topics(vault, source_families, {}):
+                        raise CoreError(409, '主题改名期间新增了对原位置的引用，已保留旧文档。')
+                    retired = manifest["retired"] = []
+                    manifest["retired_page_dirs"] = []
+                    for topic, family in source_families.items():
+                        if len(family) > 1:
+                            name = state_notes[topic]["path"].removesuffix(".md")
+                            manifest["retired_page_dirs"].append({"path": name, "inode": self._file_identity(vault / name)})
+                    for family in source_families.values():
+                        for name, digest in family.items():
+                            path = self.store._path(name, vault=vault)
+                            staged = self._move_stage(path, manifest, f"{len(retired)}.previous")
+                            if path.resolve() != vault / name or not path.is_file() or self._file_identity(staged) is not None:
+                                raise CoreError(409, "主题改名前原文件发生变化，请重试。")
+                            retired.append({"path": name, "revision": digest, "inode": self._file_identity(path)})
+                            self._manifest_write(directory, manifest)
+                            path.rename(staged)
+                            if staged.is_symlink() or not staged.is_file() or revision(staged.read_text(encoding="utf-8-sig")) != digest:
+                                raise CoreError(409, "主题改名期间原文件被修改，已保留人工修改。")
+                    for topic in source_families:
+                        for part in list(managed):
+                            if part.startswith(topic + ':part:') and part not in relocated[topic]:
+                                del managed[part]
                 self.project_analysis._set(db, state_key, {"vault_path": snapshot["vault_path"], "project_revision": snapshot["project"]["revision"], "source_repositories": run["source_repositories"], "notes": managed, "scope_limited": False, "auto_enabled": False, "full_run_id": run["run_id"]})
                 self.project_analysis._set(db, "project_analysis_candidates", candidates)
                 self.project_analysis._set(db, "full_analysis_publication:" + attempt, {"run_id": run["run_id"], "committed_at": now()})
         except Exception:
             self._recover_publications(run)
             raise
+        if not self._finish_moves(manifest, directory, True):
+            raise CoreError(409, "主题改名期间文件发生变化，已保留两份文件。")
         manifest["status"] = "committed"
         self._manifest_write(directory, manifest)
         self.store.refresh()

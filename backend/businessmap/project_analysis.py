@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import posixpath
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,6 +22,21 @@ repositories列出本项目各仓库的名称、角色、固定提交及实际�
 未读到的跨端接口或业务链路必须明确写为待确认；导入了全部成员仓库不等于已读取所有代码。
 输出同一套项目实体、流程、规则、数据卡与业务地图；不要把仓库名、文件名列表当成业务地图。
 """
+
+
+def _note_path_key(name):
+    return unicodedata.normalize("NFC", posixpath.normpath(name)).casefold()
+
+
+def _other_projects_note_paths(db, state_key, vault, involved):
+    rows = db.execute("SELECT value FROM config WHERE key GLOB 'project_analysis:*' AND key<>?", (state_key,))
+    occupied = set()
+    for (raw,) in rows:
+        state = json.loads(raw)
+        location = state.get("vault_path")
+        if location and _note_path_key(str(Path(location).resolve())) == _note_path_key(str(vault.resolve())):
+            occupied.update(_note_path_key(note["path"]) for note in state.get("notes", {}).values() if note.get("path"))
+    return occupied & involved
 
 
 class ProjectAnalysis:
@@ -435,9 +452,21 @@ class ProjectAnalysis:
             current = next((item for item in candidates if item["id"] == candidate_id), None)
             if current != candidate:
                 raise ToolError("项目更新建议已变化，请重新读取后确认应用。", 409)
-            saved_revision = self.store._write_note(candidate["path"], candidate["content"], revision, vault=Path(snapshot["vault_path"]))
-            row = db.execute("SELECT value FROM config WHERE key=?", (f"project_analysis:{candidate['project_id']}",)).fetchone()
+            state_key = f"project_analysis:{candidate['project_id']}"
+            row = db.execute("SELECT value FROM config WHERE key=?", (state_key,)).fetchone()
             state = json.loads(row[0]) if row else {}
+            vault = Path(snapshot["vault_path"])
+            if previous_paths := candidate.get("relocation_from"):
+                if isinstance(previous_paths, str):
+                    previous_paths = [previous_paths]
+                sources = [self.store._path(name, vault=vault) for name in previous_paths]
+                target = _note_path_key(candidate["path"])
+                other_keys = {_note_path_key(note["path"]) for key, note in state.get("notes", {}).items()
+                              if key != candidate["key"] and note.get("path")}
+                if (any(path.exists() or path.is_symlink() for path in sources) or target in other_keys
+                        or _other_projects_note_paths(db, state_key, vault, {target})):
+                    raise ToolError("原文档或目标位置仍被使用，已保留现有文件。处理文件冲突后可重新分析。", 409)
+            saved_revision = self.store._write_note(candidate["path"], candidate["content"], revision, vault=vault)
             state.update(vault_path=snapshot["vault_path"], project_revision=snapshot["project"]["revision"], source_repositories=self._sources(snapshot))
             state.setdefault("notes", {})[candidate["key"]] = {"path": candidate["path"], "revision": saved_revision,
                 "source_repositories": candidate["source_repositories"], "source_paths": candidate["source_paths"], "stale": False, "conflict": False}
