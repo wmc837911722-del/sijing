@@ -168,6 +168,13 @@ def _normalize_source_response(response, segments):
     return result
 
 
+def _public_content_kind(reason, kind):
+    from .business_content import PUBLIC_CONTENT_KINDS
+    if reason == "public_content" and type(kind) is str and kind in PUBLIC_CONTENT_KINDS:
+        return kind
+    return None
+
+
 class FullProjectAnalysis:
     VERSION = 1
     SOURCE_BYTES = 37000
@@ -407,7 +414,12 @@ class FullProjectAnalysis:
 
     @staticmethod
     def _public(run):
-        return {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "receipt_migration", "interrupted", "synthesis_failure") if key in run}
+        result = {key: run[key] for key in ("run_id", "snapshot_id", "status", "source_repositories", "coverage", "modules", "summary", "error", "exclusions", "updated_at", "conflicts", "publication_complete", "stale", "reused_chunks", "receipt_migration", "interrupted", "synthesis_failure") if key in run}
+        failure = result.get("synthesis_failure")
+        if isinstance(failure, dict) and "public_content_kind" in failure:
+            if not _public_content_kind(failure.get("reason_code"), failure["public_content_kind"]):
+                result["synthesis_failure"] = {key: value for key, value in failure.items() if key != "public_content_kind"}
+        return result
 
     def _actionable_failure(self, run):
         # Only codes emitted by our controlled failure diagnostic may select
@@ -430,9 +442,15 @@ class FullProjectAnalysis:
         for code, message in actions:
             if code in codes:
                 return message
-        if isinstance(synthesis_failure, dict) and synthesis_failure.get("reason_code") == "public_content":
+        reason = synthesis_failure.get("reason_code") if isinstance(synthesis_failure, dict) else None
+        if reason in ("public_content", "review_rejected"):
             from .business_semantics import REASONS
-            return REASONS["public_content"]
+            from .business_content import PUBLIC_CONTENT_KINDS
+            kind = _public_content_kind(reason, synthesis_failure.get("public_content_kind"))
+            message = REASONS[reason]
+            if kind:
+                message += f" 检查类别为{PUBLIC_CONTENT_KINDS[kind]}。"
+            return message
         return None
 
     def status(self, project_id):
@@ -820,6 +838,12 @@ class FullProjectAnalysis:
         from .business_semantics import SemanticValidationError
         if isinstance(error, SemanticValidationError):
             details.update(error.safe_details())
+        # Receipt diagnostics remain byte-compatible with paid recovery proofs.
+        # Only the run's reader-facing failure may carry this classification.
+        if isinstance(error, (SemanticValidationError, SynthesisValidationError)):
+            kind = _public_content_kind(details.get("reason_code"), getattr(error, "public_content_kind", None))
+            if kind:
+                details["public_content_kind"] = kind
         from .codex_provider import CODEX_FAILURE_ACTIONS
         codex_reason = getattr(error, "codex_reason", None)
         if isinstance(codex_reason, str) and codex_reason in CODEX_FAILURE_ACTIONS:
@@ -972,7 +996,7 @@ class FullProjectAnalysis:
                             run["synthesis_failure"]["status_code"] = code
                     elif not interrupted and "reason_code" in details:
                         run["synthesis_failure"] = {key: details[key] for key in
-                            ("reason_code", "fact_position", "fact_kind", "status_code") if key in details}
+                            ("reason_code", "fact_position", "fact_kind", "status_code", "public_content_kind") if key in details}
                     else:
                         run.pop("synthesis_failure", None)
                     run.update(status=("cancelled" if controls.get("cancelled") else "paused") if interrupted else "failed", error=None if interrupted else self._actionable_failure(run) or "完整源码已保存，但业务域综合尚未成功；再次分析仅继续综合步骤。", summary="源码全覆盖完成，业务域综合已暂停。" if interrupted else "源码全覆盖完成，业务域综合未完成。")

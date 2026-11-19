@@ -27,11 +27,16 @@ def test_public_proposal_failure_is_explained_on_analysis_and_historical_status(
     monkeypatch.setattr(service.providers, "complete", proposal_with_private_content)
     project_id = project["id"]
     result = full.analyze(project_id)
-    message = REASONS["public_content"]
+    message = REASONS["public_content"] + " 检查类别为文件位置或源码文件名。"
     assert result["status"] == "failed" and result["error"] == message
-    assert result["synthesis_failure"] == {"status_code": 422, "reason_code": "public_content"}
+    assert result["synthesis_failure"] == {"status_code": 422, "reason_code": "public_content", "public_content_kind": "source_location"}
     assert calls.count("proposal") == 1 and "review" not in calls
     sent = list(calls)
+    with full.store._db() as db:
+        rejected = json.loads(db.execute("SELECT data FROM business_semantic_tasks WHERE stage='proposal'").fetchone()[0])
+    assert rejected["diagnostic"] == {} and rejected["result"] is None
+    assert "Example.java" not in json.dumps(rejected, ensure_ascii=False)
+    assert "Example.java" not in json.dumps(full._load(project_id), ensure_ascii=False)
 
     run = full._load(project_id)
     run["error"] = "旧版综合提示"
@@ -42,10 +47,45 @@ def test_public_proposal_failure_is_explained_on_analysis_and_historical_status(
     assert paused["status"] == "paused" and paused["error"] == message
     assert full._load(project_id)["error"] == run["error"]
 
+    del run["synthesis_failure"]["public_content_kind"]
+    full._save(run)
+    assert full.status(project_id)["error"] == REASONS["public_content"]
     run["synthesis_failure"]["reason_code"] = "unknown-local-diagnostic"
     full._save(run)
     assert full.status(project_id)["error"] == run["error"]
     assert calls == sent
+
+
+@pytest.mark.parametrize("text, forbidden, kind", [
+    ("---\nnot-a-map\n---\n正文", (), "document_format"),
+    ("参看 https://example.invalid/fixture", (), "web_address"),
+    ("文件 fixture.java", (), "source_location"),
+    ("示例 `片段`", (), "technical_notation"),
+    ("编码片段 %252541", (), "encoded_text"),
+    ("业务 FixtureAccount", (), "implementation_identifier"),
+    ("采用示样专属条目核对", ("示样专属条目",), "private_source_reference"),
+])
+def test_public_rule_only_exposes_fixed_kind(text, forbidden, kind):
+    from businessmap.business_semantics import SemanticValidationError, _public
+    from businessmap.full_analysis import FullProjectAnalysis
+    with pytest.raises(SemanticValidationError) as error:
+        _public(text, forbidden)
+    assert FullProjectAnalysis._failure_details(error.value) == {
+        "exception_type": "ToolError", "reason_code": "public_content", "public_content_kind": kind, "status_code": 422}
+    assert error.value.safe_details() == {"reason_code": "public_content"}
+    assert text not in str(error.value) and all(word not in str(error.value) for word in forbidden)
+
+
+@pytest.mark.parametrize("reason, kind", [
+    ("public_content", "RAW-PRIVATE"), ("public_content", []), ("review_rejected", "source_location")])
+def test_unverified_public_kind_is_never_returned(reason, kind):
+    from businessmap.full_analysis import FullProjectAnalysis
+    from businessmap.business_semantics import SemanticValidationError
+    err = SemanticValidationError(reason)
+    err.public_content_kind = kind
+    assert "public_content_kind" not in FullProjectAnalysis._failure_details(err)
+    run = {"status": "failed", "synthesis_failure": {"reason_code": reason, "public_content_kind": kind}}
+    assert FullProjectAnalysis._public(run)["synthesis_failure"] == {"reason_code": reason}
 
 
 def synthesis_boundary(full, service, project, monkeypatch, failure):
@@ -163,7 +203,7 @@ def test_synthesis_untrusted_reason_and_message_are_not_persisted(full_project, 
      {"reason_code": "internal_basis_missing", "fact_position": 27, "fact_kind": "finding"}),
     ({"text": json.dumps({"assignments": [{"fact_id": "f0", "disposition": "public", "category": "rules",
         "title": "规则src/private/Rules.java"}]})},
-     {"reason_code": "public_content", "fact_position": 27, "fact_kind": "finding"}),
+     {"reason_code": "public_content", "fact_position": 27, "fact_kind": "finding", "public_content_kind": "source_location"}),
     ({"text": json.dumps({"assignments": [{"fact_id": "f0", "disposition": "public", "category": [],
         "title": "订单规则"}]})},
      {"reason_code": "public_topic", "fact_position": 27, "fact_kind": "finding"}),

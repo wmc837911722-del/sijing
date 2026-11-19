@@ -288,7 +288,7 @@ public类别仅entities|flows|rules|data；title是非空且不超过60字的中
 
     @staticmethod
     def _validate(result, units):
-        from .business_content import validate_public_business_text
+        from .business_content import PublicContentError, validate_public_business_text
         if not isinstance(result, dict) or set(result) != {"assignments"} or not isinstance(result["assignments"], list):
             raise SynthesisValidationError("assignment_format")
         mapping = {f"f{index}": unit for index, unit in enumerate(units)}
@@ -309,8 +309,11 @@ public类别仅entities|flows|rules|data；title是非空且不超过60字的中
                     raise SynthesisValidationError("public_topic", unit)
                 try:
                     validate_public_business_text(item["title"], unit.get("_forbidden", ()))
-                except ToolError:
-                    raise SynthesisValidationError("public_content", unit) from None
+                except ToolError as cause:
+                    error = SynthesisValidationError("public_content", unit)
+                    if isinstance(cause, PublicContentError):
+                        error.public_content_kind = cause.kind
+                    raise error from None
                 if basis:
                     raise SynthesisValidationError("technical_public", unit)
                 record = {key: item[key] for key in ("disposition", "category", "title")}

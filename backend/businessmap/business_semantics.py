@@ -17,7 +17,7 @@ import re
 import threading
 import time
 
-from .business_content import validate_public_business_text
+from .business_content import PublicContentError, validate_public_business_text
 from . import _codex_dispatch
 from .core import now
 from .providers import ToolError, parse_json_answer, provider_destination
@@ -554,8 +554,11 @@ def _public(text, forbidden=()):
     _require(isinstance(text, str), "public_content")
     try:
         validate_public_business_text(text, forbidden)
-    except ToolError:
-        raise SemanticValidationError("public_content") from None
+    except ToolError as cause:
+        error = SemanticValidationError("public_content")
+        if isinstance(cause, PublicContentError):
+            error.public_content_kind = cause.kind
+        raise error from None
 
 
 def _references(values, allowed, *, empty=False, **diagnostic):

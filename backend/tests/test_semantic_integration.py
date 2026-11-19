@@ -171,8 +171,15 @@ def test_rejected_review_survives_resume_without_new_calls(full_project, monkeyp
     full, service, project, calls = semantic_pipeline(full_project, monkeypatch, reject=True)
     result = full.analyze(project['id'])
     assert result['status'] == 'failed' and not result.get('publication_complete')
-    assert result['synthesis_failure']['reason_code'] == 'review_rejected'
+    from businessmap.business_semantics import REASONS
+    assert result['synthesis_failure'] == {'reason_code': 'review_rejected', 'status_code': 422}
+    assert result['error'] == REASONS['review_rejected']
     previous = list(calls)
+    saved = full._load(project['id'])
+    saved['error'] = '旧版通用综合失败'
+    full._save(saved)
+    assert full.status(project['id'])['error'] == result['error'] and calls == previous
+    assert full._load(project['id'])['error'] == '旧版通用综合失败'
     original = copy.deepcopy(full._chunks(full._load(project['id'])))
     repeated = full.analyze(project['id'])
     assert repeated['status'] == 'failed' and calls == previous

@@ -19,6 +19,15 @@ PUBLIC_FIELDS = {"title", "type", "content_role", "tags", "generated"}
 ROLES = {"business_knowledge", "business_map", "analysis_summary"}
 BUSINESS_TYPES = {"business", "rule", "entity", "process", "note", "overview", "data"}
 SOURCE_SUFFIXES = frozenset("py ts tsx js jsx java kt go rs cs php rb vue sql prisma graphql proto mjs cjs mts cts swift dart c h cpp hpp scala groovy svelte html css scss sass less wxml wxss json xml yaml yml kts gradle properties toml".split())
+PUBLIC_CONTENT_KINDS = {
+    "document_format": "文档格式",
+    "web_address": "链接地址",
+    "source_location": "文件位置或源码文件名",
+    "technical_notation": "技术语法或内部标记",
+    "encoded_text": "编码片段",
+    "implementation_identifier": "程序实现标识",
+    "private_source_reference": "来源材料中的专用标识",
+}
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
 _BUSINESS_GLOSS = re.compile(
     r"(?<![A-Za-z0-9_])([A-Z][A-Z0-9]*)[ \t]*（(?=[^（）\r\n]*[\u3400-\u9fff])"
@@ -29,15 +38,21 @@ _TECHNICAL = re.compile(
     r"`|(?m:^ {0,3}~{3,})|(?:source|file|ssh|git|data|javascript|module|topic|fact)\s*:\s*|"
     r"\b(?:repository_id|project_id|project_revision|source_commit|source_paths|source_repositories|"
     r"evidence_id|module_id|run_id|full_run_id|receipt_migration|snapshot_id|generated_key)\b|"
-    r"\b[a-f0-9]{20,64}\b|(?:/Users/|/home/|[A-Za-z]:[\\/])|"
-    r"(?:\b(?:src|node_modules|backend|frontend)/)|(?:\.(?:git|ssh|local-data|env)(?:/|\b))|"
+    r"\b[a-f0-9]{20,64}\b|(?P<source_location>(?:/Users/|/home/|[A-Za-z]:[\\/])|"
+    r"(?:\b(?:src|node_modules|backend|frontend)/)|(?:\.(?:git|ssh|local-data|env)(?:/|\b)))|"
     r"(?:提交(?:号|版本)?|commit|revision|代码版本|版本号?|SHA(?:-?\d+)?)[\s:：('\"]*[a-f0-9]{7,64}|"
     r"(?:代码索引|00-Inbox/代码资料)/|\b(?:SELECT|INSERT|CREATE|class|def|import|package|return|const)\b|"
     r"</?[a-z]", re.I | re.ASCII)
 
 
-def _reject():
-    raise ToolError("业务内容包含不适合公开的技术资料，未发布；内部分析断点已保留。", 422)
+class PublicContentError(ToolError):
+    def __init__(self, kind):
+        super().__init__("业务内容包含不适合公开的技术资料，未发布；内部分析断点已保留。", 422)
+        self.kind = kind
+
+
+def _reject(kind="document_format"):
+    raise PublicContentError(kind)
 
 
 def _canonical(text):
@@ -107,23 +122,28 @@ def public_business_metadata(text: str, forbidden_tokens=()) -> dict:
             _reject()
         text = "\n".join([raw_header, meta.get("title", ""), *meta.get("tags", []), text[front.end():]])
     canonical = _canonical(text)
-    if "://" in canonical or _TECHNICAL.search(canonical) or re.search(r"%[0-9a-f]{2}|&(?:#[xX]?[0-9a-f]+|[a-z]+);", canonical, re.I):
-        _reject()
+    if "://" in canonical:
+        _reject("web_address")
+    technical = _TECHNICAL.search(canonical)
+    if technical:
+        _reject(technical.lastgroup or "technical_notation")
+    if re.search(r"%[0-9a-f]{2}|&(?:#[xX]?[0-9a-f]+|[a-z]+);", canonical, re.I):
+        _reject("encoded_text")
     if "." in canonical and any(match[1].casefold() in SOURCE_SUFFIXES
             for match in re.finditer(r"\.([A-Za-z][A-Za-z0-9]{0,15})(?![A-Za-z0-9])", canonical, re.ASCII)):
-        _reject()
+        _reject("source_location")
     # Preserve the punctuation distinction between SKU（商品规格） and a
     # method call while keeping the normalized text for all other checks.
     identifiers = _canonical(_BUSINESS_GLOSS.sub(r"\1、\2、", text)) if "（" in text else canonical
     if next(implementation_identifiers(identifiers), None) is not None:
-        _reject()
+        _reject("implementation_identifier")
     folded = canonical.casefold()
     for token in forbidden_tokens:
         if not isinstance(token, str) or not token.strip():
             continue
         needle = _canonical(token).casefold()
         if len(needle) >= 4 and needle in folded:
-            _reject()
+            _reject("private_source_reference")
     return meta
 
 
