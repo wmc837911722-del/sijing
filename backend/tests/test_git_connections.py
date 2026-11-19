@@ -586,3 +586,16 @@ def test_secret_rotation_cleanup_failure_and_session_fallback(store, private_git
     store.update_repository_connection(repo['id'], anonymous)
     assert saved_ref not in backend.values
     assert store.config_get(f"repository_secret_cleanup:{repo['id']}") == []
+
+
+@pytest.mark.parametrize('message,expected', [
+    ("fatal: unable to access 'https://127.0.0.1:40301/company.git': The requested URL returned error: 302", 'invalid_configuration'),
+    ("fatal: unable to access 'https://127.0.0.1:40123/company.git': The requested URL returned error: 403", 'permission'),
+    ("fatal: request-id=40301999; The requested URL returned error: 401", 'authentication'),
+    ("HTTP/2 403 Forbidden; request-id=40123999", 'permission'),
+])
+def test_http_status_classification_ignores_port_and_request_number_substrings(store, message, expected):
+    with pytest.raises(GitError) as error:
+        store.git_transport.raise_failure(message + ' private-test-token')
+    assert error.value.code == expected
+    assert 'private-test-token' not in str(error.value)

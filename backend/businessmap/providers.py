@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import logging
 import math
+import sqlite3
 import threading
 import time
 import uuid
@@ -12,6 +14,9 @@ from pathlib import Path
 from urllib.parse import urlsplit, quote
 
 import httpx
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class ToolError(Exception):
@@ -410,7 +415,7 @@ class ProviderService:
 
     def complete(self, system, user, history=None, provider_id=None, max_output=2200, context=None,
                  expected_destination=None, before_send=None, _connection_test=False,
-                 _tool_messages=None, _tools=None, _deadline=None, json_mode=False):
+                 _tool_messages=None, _tools=None, _deadline=None, json_mode=False, output_schema=None):
         provider = self.get(provider_id)
         if not provider:
             raise ToolError("尚未配置并启用模型。", 409)
@@ -420,7 +425,13 @@ class ProviderService:
             if _tool_messages is not None:
                 raise ToolError("本机 Codex 当前仅支持代码分析和业务归纳，暂不支持工具问答。", 409)
             from .codex_provider import complete
-            messages = self.messages(system, user, history, context)
+            if output_schema is not None and history is None and context is None:
+                # Semantic calls budget these two complete messages plus their
+                # schema. The Codex adapter enforces the serialized byte cap;
+                # the legacy character/history policy applies to all others.
+                messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+            else:
+                messages = self.messages(system, user, history, context)
             destination = provider_destination(provider)
             def guard():
                 latest = next((p for p in self.store.config_get("providers", []) if p["id"] == provider["id"]), None)
@@ -428,11 +439,19 @@ class ProviderService:
                     raise ToolError("模型目标已变化，本次请求已停止。", 409)
                 if before_send is not None:
                     before_send()
+            structured = {"output_schema": output_schema} if output_schema is not None else {}
+            absolute = {"absolute_deadline": _deadline} if _deadline is not None else {}
             result = complete(messages, provider["model"], max_output=max_output, before_send=guard,
-                              timeout=None if _deadline is None else _deadline - time.monotonic())
+                              timeout=None, **absolute, **structured)
             usage = result["usage"]
-            config_update(self.store, "provider_usage", lambda old: _aggregate_usage(old, usage))
-            return {**result, "provider": provider["name"]}
+            usage_persisted = True
+            try:
+                config_update(self.store, "provider_usage", lambda old: _aggregate_usage(old, usage))
+            except sqlite3.OperationalError as exc:
+                usage_persisted = False
+                _LOG.warning("provider_usage_persist_failed", extra={"event": "provider_usage_persist_failed",
+                             "provider_id": provider["id"], "error_type": type(exc).__name__})
+            return {**result, "provider": provider["name"], "usage_persisted": usage_persisted}
         tools_enabled = _tool_messages is not None
         messages = self._tool_transcript(system, _tool_messages, _tools) if tools_enabled else self.messages(system, user, history, context)
         metadata = next((p for p in self.store.config_get("providers", []) if p["id"] == provider["id"]), None)

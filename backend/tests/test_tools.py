@@ -198,20 +198,23 @@ def test_data_chat_executes_real_sql_and_rejects_model_write(store, monkeypatch)
 def test_analysis_sources_git_update_and_human_conflict_preserved(store, monkeypatch):
     tools = ToolsService(store)
     provider(tools.providers)
-    repo = {"id": "repo1", "name": "Orders", "commit": "a" * 40}
+    repo = {"id": "repo1", "name": "Orders", "commit": "a" * 40, "vault_path": str(store.vault), "status": "ready", "url": "fixture", "path": "fixture"}
+    store._write_repo(repo)
     monkeypatch.setattr(store, "get_repository", lambda _repo_id: dict(repo))
     tools.bind_model("repo1", tools.providers.get()["id"])
     monkeypatch.setattr(store, "repository_context", lambda _repo_id: {"repository": dict(repo), "commit": repo["commit"], "files": [{"path": "orders.py", "content": "status = 'paid'\nif status == 'paid':\n    allow_refund = True\n"}], "truncated": False})
     response = {"notes": [{"key": "rules", "title": "退款规则", "content": "# 退款规则\n已支付订单允许退款。", "sources": [{"path": "orders.py", "line_start": 1, "line_end": 3, "quote": "if status == 'paid':\n    allow_refund = True"}]}]}
     monkeypatch.setattr(tools.providers, "complete", lambda *_args, **_kw: {"text": json.dumps(response), "usage": {}, "provider": "test"})
     assert tools.analyze("repo1")["notes_created"] == 3
-    path = "01-Wiki/业务知识/repo1/rules.md"
+    path = store.config_get("ai_analysis:repo1")["notes"]["rules"]["path"]
     note = store.read_note(path)
-    assert "代码依据" in note["content"] and "orders.py" in note["content"]
+    assert "已支付订单允许退款" in note["content"] and "orders.py" not in note["content"]
+    assert store.config_get("ai_analysis:repo1")["notes"]["rules"]["source_evidence"]
     assert store.config_get("ai_analysis:repo1")["auto_enabled"]
     assert tools.analyze("repo1", automatic=True)["notes_created"] == 0
     human = store.save_note(path, note["content"] + "\n人工补充：需审核。\n", note["revision"])
     repo["commit"] = "b" * 40
+    store._write_repo(repo)
     result = tools.analyze("repo1", automatic=True, changed_paths=["orders.py"])
     assert len(result["conflicts"]) == 1
     assert store.read_note(path)["content"] == human["content"]
@@ -352,7 +355,7 @@ def test_real_git_commit_callback_updates_map_then_preserves_human_edits(tmp_pat
         initial = client.post(f"/api/repositories/{repo_id}/analyze")
         assert initial.status_code == 200 and initial.json()["notes_created"] == 3
         assert client.get("/api/workspace").json()["repositories"][0]["ai_auto_sync"] is True
-        path = f"01-Wiki/业务知识/{repo_id}/rules.md"
+        path = store.config_get(f"ai_analysis:{repo_id}")["notes"]["rules"]["path"]
         assert "代码定义的退款上限为 100。" in store.read_note(path)["content"]
         commit(200)
         client.post(f"/api/repositories/{repo_id}/sync")

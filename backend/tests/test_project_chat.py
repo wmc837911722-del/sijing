@@ -60,39 +60,28 @@ def tool_reply(*calls):
                 "name": item["name"], "arguments": json.dumps(item["arguments"])}} for item in normalized]}}
 
 
-def test_project_question_reads_and_cites_two_repositories_with_same_path(project_sources, monkeypatch):
+def test_project_question_reads_public_business_topics_without_repository_receipts(project_sources, monkeypatch):
     service, _, repos, _ = project_sources
+    paths = ["01-Wiki/天梯赛事/流程/提交申请.md", "01-Wiki/天梯赛事/规则/受理条件.md"]
+    for path, body in zip(paths, ["# 提交申请\n申请提交后等待受理。\n", "# 受理条件\n未通过条件核验的申请不予受理。\n"]):
+        service.store.save_note(path, body)
     turns = []
-
     def turn(system, messages, tools, **kwargs):
         turns.append((system, messages, tools))
         receipts = [json.loads(item["content"]) for item in messages if item["role"] == "tool"]
         if not receipts:
-            return tool_reply(("repository_search", {"repository_id": "web", "query": "SAVE_URL"}),
-                              ("repository_search", {"repository_id": "api", "query": "POST_ROUTE"}))
-        if len(receipts) == 2:
-            return tool_reply(("repository_read", {"repository_id": "web", "path": "entry.py"}),
-                              ("repository_read", {"repository_id": "api", "path": "entry.py"}))
-        ids = [item["citation_id"] for item in receipts if "citation_id" in item]
-        return tool_reply(("finish_answer", {"answer": f"前后端使用相同路径。[前端]({ids[0]}) [后端]({ids[1]})",
+            return tool_reply(*[("knowledge_read", {"path": path}) for path in paths])
+        ids = [item["citation_id"] for item in receipts]
+        return tool_reply(("finish_answer", {"answer": f"提交后等待受理，未通过核验不受理。[申请]({ids[0]}) [条件]({ids[1]})",
             "citations": ids, "kind": "answer"}))
-
     monkeypatch.setattr(service.providers, "tool_turn", turn)
-    result = runtime(project_sources).run("保存入口的前后端如何连接？")
+    result = runtime(project_sources).run("提交申请后如何受理？")
     assert result["completion"] == "complete"
-    assert {source["repository_id"] for source in result["sources"]} == {"web", "api"}
-    assert len({source["path"] for source in result["sources"]}) == 2
-    assert all(source["source_path"] == "entry.py" for source in result["sources"])
-    assert {source["commit"] for source in result["sources"]} == {repos[0]["commit"], repos[1]["commit"]}
-    assert all(source["path"] in result["answer"] for source in result["sources"])
-    first_system = turns[0][0]
-    assert all(value in first_system for value in ("天梯赛事", "管理前端", "赛事后端", "web", "api", repos[0]["commit"]))
-    assert '"role": "frontend"' in first_system and '"role": "backend"' in first_system
-    assert "其他项目" not in first_system
-    for tool in turns[0][2]:
-        if tool["function"]["name"] in {"repository_search", "repository_read"}:
-            assert "repository_id" in tool["function"]["parameters"]["required"]
-
+    assert {source["path"] for source in result["sources"]} == set(paths)
+    assert all(set(source) == {"path", "title"} for source in result['sources'])
+    assert not {"repository_search", "repository_read"} & {tool['function']['name'] for tool in turns[0][2]}
+    public = json.dumps(result, ensure_ascii=False)
+    assert not any(value in public for value in ['source://', 'entry.py', 'source_path', *(repo['commit'] for repo in repos)])
 
 @pytest.mark.parametrize("name,args", [
     ("repository_search", {"repository_id": "outside", "query": "OUTSIDE_SECRET"}),
@@ -133,15 +122,17 @@ def test_repository_and_project_scope_cannot_be_combined(project_sources):
         runtime(project_sources, repository_id="web")
 
 
-def test_closing_context_keeps_repository_identity_for_same_named_sources(project_sources):
+def test_closing_context_keeps_business_evidence_without_source_identity(project_sources):
     exploration = runtime(project_sources)
-    exploration.execute("repository_read", {"repository_id": "web", "path": "entry.py"})
-    exploration.execute("repository_read", {"repository_id": "api", "path": "entry.py"})
-    _, messages, _ = exploration.closing_context("前后端入口", 15000)
+    for path, body in [("业务/提交.md", "# 提交\n提交后等待受理。\n"), ("业务/受理.md", "# 受理\n条件不满足时拒绝。\n")]:
+        exploration.store.save_note(path, body)
+        exploration.execute("knowledge_read", {"path": path})
+    _, messages, _ = exploration.closing_context("申请受理", 15000)
     evidence = json.loads(messages[0]["content"])["read_evidence"]
-    assert {item["repository_id"] for item in evidence} == {"web", "api"}
-    assert all(item["source_path"] == "entry.py" and len(item["commit"]) == 40 for item in evidence)
-
+    assert len(evidence) == 2
+    assert all(set(item) == {"reference", "kind", "content"} for item in evidence)
+    assert '提交后等待受理' in json.dumps(evidence, ensure_ascii=False)
+    assert '条件不满足时拒绝' in json.dumps(evidence, ensure_ascii=False)
 
 def test_legacy_chat_defaults_project_selection_to_none(project_sources):
     service, _, _, _ = project_sources
@@ -205,19 +196,26 @@ def test_invalid_project_selection_does_not_append_chat_message(persisted_projec
     assert service.chats.get(session["id"])["messages"] == []
 
 
-def test_service_project_chat_enables_both_member_sources(persisted_project, monkeypatch):
+def test_service_project_chat_uses_privately_owned_public_business_topics(persisted_project, monkeypatch):
+    from businessmap.business_content import render_public_note
     service, project = persisted_project
-
+    sources = [{"repository_id": rid, "commit": service.store.get_repository(rid)['commit']} for rid in project['repository_ids']]
+    notes = {}
+    for key, title, body in [('flow', '提交申请', '提交后等待受理。'), ('rule', '受理条件', '条件不满足时拒绝。')]:
+        path = f"01-Wiki/天梯赛事/{title}.md"
+        note = service.store.save_note(path, render_public_note(title, '# ' + title + '\n' + body))
+        notes[key] = {'path': path, 'revision': note['revision'], 'source_repositories': sources, 'stale': False, 'conflict': False}
+    service.store.config_set(f"project_analysis:{project['id']}", {'vault_path': str(service.store.vault), 'project_revision': project['revision'], 'notes': notes})
     def turn(system, messages, tools, **kwargs):
         receipts = [json.loads(item["content"]) for item in messages if item["role"] == "tool"]
+        assert not {'repository_read', 'repository_search'} & {tool['function']['name'] for tool in tools}
         if not receipts:
-            return tool_reply(("repository_read", {"repository_id": "web", "path": "entry.py"}),
-                              ("repository_read", {"repository_id": "api", "path": "entry.py"}))
-        return tool_reply(("finish_answer", {"answer": "两端调用路径一致。",
+            return tool_reply(*[("knowledge_read", {"path": note['path']}) for note in notes.values()])
+        return tool_reply(("finish_answer", {"answer": "提交后等待受理；条件不满足时拒绝。",
             "citations": [item["citation_id"] for item in receipts], "kind": "answer"}))
-
     monkeypatch.setattr(service.providers, "tool_turn", turn)
-    response = service.chats.send(service.chats.create()["id"], "完整入口", project_id=project["id"])
+    response = service.chats.send(service.chats.create()["id"], "完整申请流程", project_id=project["id"])
     answer = response["messages"][-1]
     assert not answer.get("error")
-    assert {item["repository_id"] for item in answer["sources"]} == {"web", "api"}
+    assert {item["path"] for item in answer["sources"]} == {note['path'] for note in notes.values()}
+    assert all(set(item) == {'path', 'title'} for item in answer['sources'])

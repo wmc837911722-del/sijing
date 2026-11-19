@@ -78,7 +78,7 @@ def test_failed_provider_change_does_not_overwrite_newer_concurrent_consent(full
 
 
 def test_multiple_provider_changes_describe_each_original_author(full_project, monkeypatch):
-    full, service, project, old, *_ = paused_checkpoint(full_project, monkeypatch)
+    full, service, project, old, original, *_ = paused_checkpoint(full_project, monkeypatch)
     second = service.providers.save({"name": "Second", "kind": "openai-compatible", "base_url": "http://127.0.0.1:2/v1", "model": "second"})
     full.continue_with_provider(project["id"], second["id"], old["run_id"])
     full.set_paused(project["id"], False)
@@ -93,9 +93,13 @@ def test_multiple_provider_changes_describe_each_original_author(full_project, m
     full.set_paused(project["id"], False)
     model(monkeypatch, service)
     assert full.analyze(project["id"])["status"] == "completed"
-    from businessmap.content_layout import project_summary_path
-    summary = service.store.read_note(project_summary_path(project["id"]))["content"]
-    assert "Fixture" in summary and "Second" in summary and "Third" in summary
+    from businessmap.content_layout import public_project_paths
+    summary = service.store.read_note(public_project_paths(project["name"])["summary"])["content"]
+    assert "Fixture" not in summary and "Second" not in summary and "Third" not in summary
+    private_run = full._load(project["id"])
+    authors = {chunk["origin_provider"]["id"] for chunk in full._chunks(private_run)}
+    assert authors == {original["provider"]["id"], second["id"], third["id"]}
+    assert private_run["receipt_migration"]["target_provider_name"] == "Third"
 
 
 def test_receipt_validation_reuses_sanitized_blob_across_chunks(full_project, monkeypatch):

@@ -6,6 +6,15 @@ import type { NoteSummary } from '../types';
 
 type MarkdownNode = { type: string; value?: string; url?: string; children?: MarkdownNode[] };
 const WIKI_PREFIX = '#businessmap-note=';
+function isInternalSource(target: string) {
+  let decoded = target;
+  for (let index = 0; index < 3; index += 1) {
+    if (/^source:/i.test(decoded.trim())) return true;
+    try { const next = decodeURIComponent(decoded); if (next === decoded) break; decoded = next; }
+    catch { break; }
+  }
+  return false;
+}
 function remarkWikiLinks() {
   return (tree: MarkdownNode) => {
     const visit = (node: MarkdownNode) => {
@@ -64,15 +73,16 @@ function scrollToHeading(heading: string) {
 }
 export function MarkdownView({ content, notes = [], currentPath, onOpen }: { content: string; notes?: NoteSummary[]; currentPath?: string; onOpen?: (path: string) => void }) {
   const [externalError, setExternalError] = useState('');
-  return <div className="markdown">{externalError && <p className="form-error" role="alert">{externalError}</p>}<ReactMarkdown remarkPlugins={plugins} urlTransform={(url, key) => key === 'href' && url.startsWith('source://') ? url : defaultUrlTransform(url)} components={{
+  return <div className="markdown">{externalError && <p className="form-error" role="alert">{externalError}</p>}<ReactMarkdown remarkPlugins={plugins} urlTransform={(url, key) => key === 'href' && isInternalSource(url) ? url : defaultUrlTransform(url)} components={{
     a: ({ href, children }) => {
-      if (href?.startsWith('source://')) return onOpen ? <button type="button" className="wiki-link" title="查看引用的源码" onClick={() => onOpen(href)}>{children}</button> : <span>{children}</span>;
+      if (href && isInternalSource(href)) return <span className="internal-reference">内部分析依据</span>;
       const wiki = href?.startsWith(WIKI_PREFIX);
       const markdownLink = href && !/^\w+:/.test(href) && (href.split('#')[0].endsWith('.md') || href.startsWith('#'));
-      if ((wiki || markdownLink) && onOpen) {
+      if (wiki || markdownLink) {
         let target: string;
         try { target = decodeURIComponent(wiki ? href!.slice(WIKI_PREFIX.length) : href!); } catch { target = href || ''; }
-        if (target.startsWith('source://')) return <button type="button" className="wiki-link" title="查看引用的源码" onClick={() => onOpen(target)}>{children}</button>;
+        if (isInternalSource(target)) return <span className="internal-reference">内部分析依据</span>;
+        if (!onOpen) return <span>{children}</span>;
         const { note, heading, ambiguous } = resolveNote(target, notes, currentPath);
         if (!note) return <span className="wiki-link unresolved" title={ambiguous ? `同名笔记不唯一，请使用完整路径：${target}` : `未找到笔记：${target}`}>{children}</span>;
         return <button className="wiki-link" title={`${note.path}${heading ? `#${heading}` : ''}`} onClick={() => {

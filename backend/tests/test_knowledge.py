@@ -42,9 +42,9 @@ def test_search_discovers_late_evidence_then_outline_and_paginated_section_read(
 
 
 def test_link_navigation_resolves_markdown_wikilinks_backlinks_and_ignores_code(store):
-    store.save_note("业务/入口.md", "# 入口\n[[政策/退款#付款条件|退款规则]]\n[表](../数据/订单.md#字段)\n"
-                    "`[[秘密]]`\n````md\n[[秘密]]\n```\n[[秘密]]\n````\n<!-- [[秘密]] -->\n"
-                    "    [[秘密]]\n\\[[秘密]]\n[外部](https://example.com/秘密.md)\n")
+    store.save_note("业务/入口.md", "# 入口\n[[政策/退款#付款条件|退款规则]]\n[表](../数据/订单.md#字段)\n")
+    internal = "`[[秘密]]`\n````md\n[[秘密]]\n```\n[[秘密]]\n````\n<!-- [[秘密]] -->\n    [[秘密]]\n\\[[秘密]]\n"
+    assert list(KnowledgeNavigator._raw_links(internal)) == []
     store.save_note("政策/退款.md", "# 退款\n## 付款条件\n说明。\n[返回](../业务/入口.md)\n")
     store.save_note("数据/订单.md", "# 订单\n## 字段\n金额。\n")
     store.save_note("秘密.md", "# 秘密\n")
@@ -167,54 +167,52 @@ def test_large_link_neighborhood_remains_navigable_with_pages(store):
 
 @pytest.mark.parametrize("generated_key", [True, False])
 def test_moved_business_notes_still_require_current_analysis(store, monkeypatch, generated_key):
-    current = {"id": "repo", "commit": "a" * 40}
-    monkeypatch.setattr(store, "get_repository", lambda _repo_id: dict(current))
-    key_line = "generated_key: rules\n" if generated_key else ""
-    note = store.save_note("整理/退款.md", "---\ntype: business\nrepository_id: repo\nsource_commit: " + "a" * 40
-                           + "\nsource_paths: [refunds.py]\n" + key_line + "---\n# 退款\n当前规则。\n")
-    entry = {"path": "业务地图/repo/rules.md", "revision": note["revision"], "commit": "a" * 40,
+    from businessmap.business_content import render_public_note
+    current = {"id": "repo", "name": "业务", "commit": "a" * 40, "vault_path": str(store.vault), "status": "ready", "url": "fixture"}
+    store._write_repo(current)
+    body = render_public_note("退款", "# 退款\n当前规则。") if generated_key else "# 退款\n当前规则。\n"
+    note = store.save_note("整理/退款.md", body)
+    entry = {"path": "旧业务/退款.md", "revision": note["revision"], "commit": "a" * 40,
              "source_paths": ["refunds.py"], "stale": False, "conflict": False}
     store.config_set("ai_analysis:repo", {"notes": {"rules": entry}})
     service = ToolsService(store)
     assert service._eligible(note)
-    current["commit"] = "b" * 40
+    store.update_repository("repo", {"commit": "b" * 40})
     assert not service._eligible(note)
     assert KnowledgeNavigator(store, service._eligible).search("当前规则")["notes"] == []
-    current["commit"] = "a" * 40
+    store.update_repository("repo", {"commit": "a" * 40})
     store.config_set("ai_analysis:repo", {"notes": {"rules": {**entry, "conflict": True}}})
     assert not service._eligible(note)
-    # Moving and filtering must never rewrite the user's Markdown.
     assert store.read_note(note["path"])["revision"] == note["revision"]
 
 
-def test_legacy_moved_note_source_match_must_be_unambiguous_and_manual_notes_stay_available(store, monkeypatch):
-    monkeypatch.setattr(store, "get_repository", lambda _: {"id": "repo", "commit": "a" * 40})
-    note = store.save_note("整理/旧笔记.md", "---\ntype: business\nrepository_id: repo\nsource_commit: " + "a" * 40
-                           + "\nsource_paths: [refunds.py]\n---\n# 人工补充过的生成笔记\n规则。\n")
-    entry = {"revision": "previous-revision", "commit": "a" * 40, "source_paths": ["refunds.py"]}
+def test_human_edited_generated_notes_need_private_revision_and_manual_notes_stay_available(store):
+    store._write_repo({"id": "repo", "name": "业务", "commit": "a" * 40, "vault_path": str(store.vault), "url": "fixture"})
+    note = store.save_note("整理/旧笔记.md", "# 人工补充过的生成笔记\n规则。\n")
+    entry = {"path": note["path"], "revision": "previous-revision", "commit": "a" * 40, "source_paths": ["refunds.py"]}
     service = ToolsService(store)
     store.config_set("ai_analysis:repo", {"notes": {"rules": entry}})
-    assert service._eligible(note)
+    assert not service._eligible(note)
     store.config_set("ai_analysis:repo", {"notes": {"rules": entry, "flows": dict(entry)}})
     assert not service._eligible(note)
-    manual = store.save_note("整理/人工笔记.md", "---\ntype: business\n---\n# 人工笔记\n规则。\n")
+    manual = store.save_note("整理/人工笔记.md", "# 人工笔记\n规则。\n")
     assert service._eligible(manual)
 
 
-def test_moved_code_index_uses_managed_blob_revision_not_only_latest_commit(store, monkeypatch):
-    monkeypatch.setattr(store, "get_repository", lambda _: {"id": "repo", "commit": "b" * 40})
-    note = store.save_note("整理/source.md", "---\ntype: code\nrepository_id: repo\nsource_commit: " + "a" * 40
-                           + "\nsource_path: refunds.py\n---\n# refunds.py\n代码索引。\n")
+def test_moved_legacy_code_index_is_never_public_business_evidence(store):
+    content = "---\ntype: code\nrepository_id: repo\nsource_commit: " + "a" * 40 + "\nsource_path: refunds.py\n---\n# refunds.py\n代码索引。\n"
+    path = "整理/source.md"
+    saved_revision = store._write_note(path, content)
+    store.refresh()
+    note = dict(store._cache[path])
     with store._db() as db:
-        db.execute("INSERT INTO managed_notes VALUES (?,?,?,?,?)", ("repo", "refunds.py", "代码索引/repo/hash.md", "same-blob", note["revision"]))
+        db.execute("INSERT INTO managed_notes VALUES (?,?,?,?,?)", ("repo", "refunds.py", "代码索引/repo/hash.md", "same-blob", saved_revision))
     service = ToolsService(store)
-    assert service._eligible(note)  # The tracked blob did not change between commits.
-    with store._db() as db:
-        db.execute("UPDATE managed_notes SET blob=?,revision=? WHERE repository_id=?", ("new-blob", "new-revision", "repo"))
     assert not service._eligible(note)
-    with store._db() as db:
-        db.execute("DELETE FROM managed_notes WHERE repository_id=?", ("repo",))
-    assert not service._eligible(note)
+    assert not KnowledgeNavigator(store).search("refunds")["notes"]
+    with pytest.raises(CoreError):
+        store.read_note(path)
+    assert (store.vault / path).read_text() == content
 
 
 @pytest.mark.parametrize("name,args", [

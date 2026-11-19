@@ -294,19 +294,20 @@ class GitTransport:
     def raise_failure(message: str) -> None:
         # Never expose untrusted Git stderr (URLs, headers, remote supplied text).
         message = message.lower()
+        statuses = set(re.findall(r"(?:returned error:\s*|http(?:/[0-9.]+)?\s+(?:(?:status(?: code)?|error|code|response)\s*:?\s*)?)([1-5][0-9]{2})\b", message))
         if any(word in message for word in ('host key verification failed', 'remote host identification has changed')):
             raise GitError('ssh_host_key', 'SSH 主机密钥未知或已变化。请用可信 SSH 客户端核对公司服务器指纹并登记 known_hosts。')
         if any(word in message for word in ('certificate', 'ssl peer', 'untrusted_root', 'cert_e_', 'unknown ca')):
             raise GitError('certificate', 'TLS 证书验证失败，请配置公司 CA 证书并检查服务器证书。不会跳过证书验证。')
-        if any(word in message for word in ('authentication', '401', 'could not read username', 'publickey')):
+        if '401' in statuses or any(word in message for word in ('authentication', 'could not read username', 'publickey')):
             raise GitError('authentication', 'Git 认证失败，请检查用户名、Token/密码、SSH Agent 以及公司 SSO 授权。', 401)
-        if any(word in message for word in ('403', 'permission denied', 'access denied')):
+        if '403' in statuses or any(word in message for word in ('permission denied', 'access denied')):
             raise GitError('permission', 'Git 拒绝访问，请确认账号具有仓库只读权限和公司授权。', 403)
         if any(word in message for word in ('resolve host', 'resolve proxy', 'could not resolve', 'failed to connect', 'connection refused', 'network is unreachable', 'connection timed out', 'ssl connect', 'tls', 'schannel')):
             raise GitError('network', '无法连接 Git 服务器，请检查公司网络/VPN、地址、端口和代理。')
-        if any(word in message for word in ('redirect', '301', '302', '307', '308')):
+        if statuses.intersection({'301', '302', '307', '308'}) or 'redirect' in message:
             raise GitError('invalid_configuration', 'Git 地址发生重定向。为保护凭据，请直接填写最终的 Git 克隆地址。')
-        if 'not found' in message or '404' in message:
+        if 'not found' in message or '404' in statuses:
             raise GitError('permission', '仓库不存在或当前账号无权查看，请核对克隆地址和仓库权限。')
         raise GitError('git', 'Git 操作失败，请核对仓库、分支与连接设置；已有业务地图会保留。')
 

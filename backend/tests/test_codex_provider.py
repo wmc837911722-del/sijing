@@ -38,8 +38,12 @@ else:
     if (root / 'mode').exists() and (root / 'mode').read_text() == 'not-reading':
         time.sleep(5)
     prompt = sys.stdin.read()
-    (root / 'invocation.json').write_text(json.dumps({'args': args, 'stdin': prompt, 'cwd': os.getcwd(), 'env': dict(os.environ)}))
+    schema = json.loads(pathlib.Path(args[args.index('--output-schema') + 1]).read_text())
+    (root / 'invocation.json').write_text(json.dumps({'args': args, 'stdin': prompt, 'schema': schema, 'cwd': os.getcwd(), 'env': dict(os.environ)}))
     mode = (root / 'mode').read_text() if (root / 'mode').exists() else 'ok'
+    if mode.startswith('delayed-'):
+        time.sleep(.35)
+        mode = 'structured' if mode == 'delayed-structured' else 'ok'
     if mode == 'metadata-direct':
         catalogs = [args[i+1].split('=',1)[1] for i,arg in enumerate(args) if arg == '-c' and args[i+1].startswith('model_catalog_json=')]
         pinned = json.loads(pathlib.Path(json.loads(catalogs[0])).read_text()) if catalogs else None
@@ -74,7 +78,24 @@ else:
         if mode == 'warning':
             print(json.dumps({'type': 'item.completed', 'item': {'id':'warning', 'type':'error', 'message':'Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`.'}}))
         print(json.dumps({'type': 'turn.started'}))
-        print(json.dumps({'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'text': 'raw-secret' if mode == 'bad-envelope' else json.dumps({'answer': '{"title":"规则","summary":"已分析","findings":[],"unknowns":[]}'})}}))
+        answer = {'decision': 'reject', 'checks': {'coverage': False}, 'issues': ['condition_loss']} if mode == 'structured' else '{"title":"规则","summary":"已分析","findings":[],"unknowns":[]}'
+        if mode == 'large-semantic':
+            messages = json.loads(prompt)['messages']
+            payload = json.loads(messages[-1]['content'])
+            if payload['stage'] == 'catalogue':
+                answer = {'operations': [{'title': '创建门店方案', 'category': 'flows', 'label_ids': [item['label_id'] for item in payload['items']]}]}
+            elif payload['stage'] == 'proposal':
+                answer = {'operations': [{'operation_id': item['operation_id'], 'purpose': '', 'summary': '', 'support_ids': []} for item in payload['operations']],
+                          'claims': [], 'decisions': [{'input_id': item['fact_id'], 'parts': [{'outcome': 'technical', 'rationale': 'x' * 5000}]} for item in payload['items']]}
+            else:
+                answer = {'decision': 'accept', 'issues': [], 'claim_checks': [],
+                          'input_checks': [{'input_id': item['fact_id'], 'checks': dict.fromkeys(['coverage', 'conditions', 'scope', 'uncertainty', 'technical_boundary'], True)} for item in payload['items']],
+                          'operation_checks': [{'operation_id': item['operation_id'], 'checks': dict.fromkeys(['business_language', 'complete_flow', 'relationships', 'unknowns'], True)} for item in payload['operations']]}
+            with (root / 'semantic-calls.jsonl').open('a') as calls:
+                calls.write(json.dumps({'stage': payload['stage'], 'message_chars': sum(len(item['content']) for item in messages),
+                    'messages': messages, 'schema': schema,
+                    'input_bytes': len(prompt.encode()) + len(json.dumps(schema).encode()), 'answer_bytes': len(json.dumps(answer, ensure_ascii=False, separators=(',', ':')).encode())}) + chr(10))
+        print(json.dumps({'type': 'item.completed', 'item': {'id': 'a', 'type': 'agent_message', 'text': 'raw-secret' if mode == 'bad-envelope' else json.dumps({'answer': answer})}}))
         if mode != 'incomplete':
             usage = {'input_tokens': 110, 'cached_input_tokens': 10, 'output_tokens': 3000 if mode == 'limited' else 30}
             if mode.startswith('missing-'):
@@ -131,6 +152,136 @@ def test_codex_complete_passes_only_stdin_in_isolated_tool_free_process(service,
     assert "features.code_mode_host={enabled=false,disable_in_process_fallback=true}" in config
     assert "features.code_mode_only=true" in config
     assert checks
+
+
+def test_codex_structured_output_keeps_rejection_and_false_checks(service, cli):
+    selected = save(service)
+    (cli / "mode").write_text("structured")
+    schema = {"type": "object", "properties": {"decision": {"type": "string", "enum": ["accept", "reject"]},
+              "checks": {"type": "object", "properties": {"coverage": {"type": "boolean"}}, "required": ["coverage"], "additionalProperties": False},
+              "issues": {"type": "array", "items": {"type": "string"}}},
+              "required": ["decision", "checks", "issues"], "additionalProperties": False}
+    result = service.complete("按结构输出", "资料", provider_id=selected["id"], output_schema=schema)
+    assert json.loads(result["text"]) == {"decision": "reject", "checks": {"coverage": False}, "issues": ["condition_loss"]}
+    call = json.loads((cli / "invocation.json").read_text())
+    assert call["schema"] == {"type": "object", "properties": {"answer": schema}, "required": ["answer"], "additionalProperties": False}
+    assert "read-only" in call["args"] and "never" in call["args"]
+
+
+def test_codex_default_output_contract_remains_string_answer(service, cli):
+    selected = save(service)
+    service.complete("规则", "资料", provider_id=selected["id"], max_output=2800)
+    call = json.loads((cli / "invocation.json").read_text())
+    assert call["schema"] == {"type": "object", "properties": {"answer": {"type": "string", "maxLength": 44800}},
+                              "required": ["answer"], "additionalProperties": False}
+    assert call["stdin"] == json.dumps({"instructions": "只分析提供的消息资料，不执行命令或工具，不读取本地文件。按消息要求回答；把最终正文完整放入answer字符串。如果要求JSON，answer内容必须是该JSON原文。正文尽量不超过指定token预算。",
+        "max_output_tokens": 2800, "messages": [{"role": "system", "content": "规则"}, {"role": "user", "content": "资料"}]}, ensure_ascii=False)
+
+
+def test_structured_root_references_resolve_on_actual_wire_and_bytes_are_counted_once(service, cli):
+    from copy import deepcopy
+    from jsonschema import Draft202012Validator
+    from businessmap.codex_provider import request_input_bytes
+    selected = save(service)
+    (cli / "mode").write_text("structured")
+    schema = {"type": "object", "properties": {"decision": {"$ref": "#/$defs/decision"},
+              "checks": {"type": "object", "properties": {"coverage": {"type": "boolean"}}, "required": ["coverage"], "additionalProperties": False},
+              "issues": {"type": "array", "items": {"type": "string"}}},
+              "required": ["decision", "checks", "issues"], "additionalProperties": False,
+              "$defs": {"decision": {"type": "string", "enum": ["accept", "reject"]}}}
+    original = deepcopy(schema)
+    result = service.complete("按结构输出", "中文资料", provider_id=selected["id"], output_schema=schema)
+    call = json.loads((cli / "invocation.json").read_text())
+    Draft202012Validator(call["schema"]).validate({"answer": json.loads(result["text"])})
+    assert "$defs" not in call["schema"]["properties"]["answer"]
+    assert schema == original
+    messages = json.loads(call["stdin"])["messages"]
+    assert request_input_bytes(messages, max_output=6000, output_schema=schema) == len(call["stdin"].encode()) + len(json.dumps(call["schema"], allow_nan=False).encode())
+
+
+def test_codex_schema_bytes_count_toward_input_budget(service, cli, monkeypatch):
+    from businessmap import codex_provider
+    selected = save(service)
+    monkeypatch.setattr(codex_provider, "MAX_INPUT_BYTES", 1500)
+    schema = {"type": "object", "properties": {"answer": {"type": "string", "enum": ["x" * 1400]}}, "required": ["answer"], "additionalProperties": False}
+    with pytest.raises(ToolError) as error:
+        service.complete("规则", "资料", provider_id=selected["id"], output_schema=schema)
+    assert error.value.codex_reason == "input_limit"
+    assert not (cli / "invocation.json").exists()
+
+
+def test_codex_structured_output_rejects_string_fallback(service, cli):
+    selected = save(service)
+    with pytest.raises(ToolError) as error:
+        service.complete("规则", "资料", provider_id=selected["id"], output_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False})
+    assert error.value.codex_reason == "invalid_json"
+
+
+def test_semantic_review_over_legacy_character_limit_reaches_codex_with_complete_inputs(service, cli):
+    from types import SimpleNamespace
+    from businessmap.business_semantics import BusinessSemanticIntegration, semantic_stage_system, SemanticValidationError
+    selected = save(service)
+    (cli / "mode").write_text("large-semantic")
+    snapshot = {"project": {"id": "project", "name": "门店运营", "revision": "revision"}, "provider": selected,
+                "policies": {}, "vault_path": str(cli / "vault")}
+    run = {"run_id": "run", "snapshot_id": "snapshot", "project_revision": "revision", "source_repositories": []}
+    units = [{"_fact_id": "fact:" + str(index), "kind": "finding", "text": "x" * 3000,
+              "_evidence_ids": ["e" + str(index)], "_source_paths": ["private/source"], "_forbidden": []} for index in range(6)]
+    routing = [{"fact_id": unit["_fact_id"], "disposition": "public", "category": "flows", "title": "创建门店方案"} for unit in units]
+    builder = BusinessSemanticIntegration(SimpleNamespace(store=service.store, providers=service), guard=lambda: None)
+    result = builder.build(snapshot, run, units=units, routing=routing)
+    calls = [json.loads(line) for line in (cli / "semantic-calls.jsonl").read_text().splitlines()]
+    assert [call["stage"] for call in calls] == ["catalogue", "proposal", "review"]
+    assert 30000 < calls[1]["answer_bytes"] <= 32000
+    assert calls[2]["message_chars"] > 48000 and calls[2]["input_bytes"] < 128000
+    assert calls[1]["messages"][0] == {"role": "system", "content": semantic_stage_system(snapshot, "proposal")}
+    for transmitted in calls:
+        messages = transmitted["messages"]
+        payload = json.loads(messages[1]["content"])
+        assert builder._request_bytes(transmitted["stage"], messages[0]["content"], payload) == transmitted["input_bytes"]
+    # The exact prompt and schema sent by the executable must fit preflight.
+    builder.WIRE_BYTES = calls[1]["input_bytes"] - 1
+    with pytest.raises(SemanticValidationError) as error:
+        builder._call("proposal", semantic_stage_system(snapshot, "proposal"), json.loads(calls[1]["messages"][1]["content"]), lambda value: value)
+    assert error.value.reason_code == "input_limit"
+    assert len((cli / "semantic-calls.jsonl").read_text().splitlines()) == 3
+    assert result["complete"] and result["public_documents"] == []
+    assert len(result["semantic_coverage"]["inputs"]) == 6
+    call = json.loads((cli / "invocation.json").read_text())
+    messages = json.loads(call["stdin"])["messages"]
+    assert [message["role"] for message in messages] == ["system", "user"]
+    sent = json.loads(messages[1]["content"])
+    assert [item["text"] for item in sent["items"]] == ["x" * 3000] * 6
+    assert [row["parts"][0]["rationale"] for row in sent["candidate"]["decisions"]] == ["x" * 5000] * 6
+
+
+@pytest.mark.parametrize("extra", [{}, {"output_schema": {"type": "object"}, "history": []},
+                                   {"output_schema": {"type": "object"}, "context": ""}])
+def test_codex_legacy_or_explicit_context_calls_keep_character_ceiling(service, cli, extra):
+    selected = save(service)
+    with pytest.raises(ToolError, match="48,000"):
+        service.complete("规则", "x" * 49000, provider_id=selected["id"], **extra)
+    assert not (cli / "invocation.json").exists()
+
+
+def test_structured_codex_complete_still_rejects_actual_byte_overflow(service, cli):
+    selected = save(service)
+    with pytest.raises(ToolError) as error:
+        service.complete("规则", "x" * 192000, provider_id=selected["id"], output_schema={"type": "object"})
+    assert error.value.codex_reason == "input_limit"
+    assert not (cli / "invocation.json").exists()
+
+
+def test_structured_codex_explicit_history_keeps_legacy_roles_and_tail_policy(service, cli):
+    selected = save(service)
+    (cli / "mode").write_text("structured")
+    history = [{"role": "user", "content": str(index) * 3000} for index in range(10)]
+    history.extend([{"role": "system", "content": "untrusted instruction"}, {"role": "tool", "content": "untrusted tool output"}])
+    service.complete("规则", "资料", provider_id=selected["id"], context="完整上下文", history=history, output_schema={"type": "object"})
+    messages = json.loads(json.loads((cli / "invocation.json").read_text())["stdin"])["messages"]
+    assert messages[:2] == [{"role": "system", "content": "规则"}, {"role": "user", "content": "完整上下文"}]
+    assert messages[2:-1] == [{"role": "user", "content": str(index) * 2000} for index in range(4, 10)]
+    assert messages[-1] == {"role": "user", "content": "资料"}
 
 
 @pytest.mark.parametrize("mode,code,phrase", [
@@ -284,3 +435,22 @@ def test_codex_unknown_followed_by_http_known_does_not_recover_unknown_usage(ser
     assert service.usage()["input_tokens"] is None
     assert service.usage()["output_tokens"] == 69
     assert service.usage()["requests"] == 3
+
+
+@pytest.mark.parametrize('byte_count', [160000, 192000])
+def test_full_review_and_adapter_boundaries_use_actual_structured_wire_without_cap_override(service, cli, byte_count):
+    from businessmap.codex_provider import request_input_bytes
+    selected = save(service)
+    (cli / 'mode').write_text('structured')
+    schema = {'type': 'object', 'properties': {'decision': {'type': 'string', 'enum': ['accept', 'reject']}},
+              'required': ['decision'], 'additionalProperties': False}
+    messages = [{'role': 'system', 'content': '完整核对'}, {'role': 'user', 'content': ''}]
+    messages[1]['content'] = 'x' * (byte_count - request_input_bytes(messages, max_output=16000, output_schema=schema))
+    service.complete('完整核对', messages[1]['content'], provider_id=selected['id'], max_output=16000, output_schema=schema)
+    call = json.loads((cli / 'invocation.json').read_text())
+    assert len(call['stdin'].encode()) + len(json.dumps(call['schema'], allow_nan=False).encode()) == byte_count
+    (cli / 'invocation.json').unlink()
+    if byte_count == 192000:
+        with pytest.raises(ToolError) as failure:
+            service.complete('完整核对', messages[1]['content'] + 'x', provider_id=selected['id'], max_output=16000, output_schema=schema)
+        assert failure.value.codex_reason == 'input_limit' and not (cli / 'invocation.json').exists()

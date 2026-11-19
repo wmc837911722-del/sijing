@@ -14,7 +14,8 @@ def project_store(tmp_path, monkeypatch):
     for rid in ("frontend", "backend", "unrelated"):
         store._write_repo({"id": rid, "name": rid, "vault_path": str(store.vault),
                            "commit": "a" * 40, "status": "ready", "connection": {"auth_type": "none"}})
-    project = {"id": "arena", "name": "Arena", "repository_ids": ["frontend", "backend"], "revision": "v1"}
+    project = {"id": "arena", "name": "Arena", "repository_ids": ["frontend", "backend"], "revision": "v1", "vault_path": str(store.vault)}
+    store.config_set("business_projects", [project])
     monkeypatch.setattr(store, "get_project", lambda _id: project, raising=False)
     monkeypatch.setattr(store, "project_for_repository", lambda rid: project if rid in project["repository_ids"] else None, raising=False)
     yield store, ToolsService(store), project
@@ -22,12 +23,12 @@ def project_store(tmp_path, monkeypatch):
 
 
 def project_note(store):
-    path = "02-Areas/业务地图/项目/arena/业务地图.md"
-    meta = {"type": "business", "project_id": "arena", "generated_key": "overview",
-            "source_repositories": [{"repository_id": rid, "commit": "a" * 40} for rid in ("frontend", "backend")]}
-    note = store.save_note(path, "---\n" + yaml.safe_dump(meta) + "---\n\n# 业务地图\n")
+    from businessmap.business_content import render_public_note
+    path = "02-Areas/业务地图/天梯赛事/业务地图.md"
+    note = store.save_note(path, render_public_note("业务地图", "# 业务地图\n公开业务主题。", content_role="business_map"))
+    sources = [{"repository_id": rid, "commit": "a" * 40} for rid in ("frontend", "backend")]
     store.config_set("project_analysis:arena", {"vault_path": str(store.vault), "project_revision": "v1",
-        "notes": {"overview": {"path": path, "revision": note["revision"], "source_repositories": meta["source_repositories"],
+        "notes": {"overview": {"path": path, "revision": note["revision"], "source_repositories": sources,
                                "stale": False, "conflict": False}}})
     return store.read_note(path)
 

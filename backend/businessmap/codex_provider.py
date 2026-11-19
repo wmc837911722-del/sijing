@@ -1,7 +1,9 @@
 """Bounded text-only Codex subprocesses; credentials remain owned by Codex."""
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -13,8 +15,10 @@ import threading
 import time
 
 from .providers import ToolError
+from . import _codex_dispatch
 
 TIMEOUT_SECONDS = 180
+STRUCTURED_TIMEOUT_SECONDS = 360
 MAX_EVENT_BYTES = 512_000
 MAX_INPUT_BYTES = 192_000
 _STATUS_CACHE = {}
@@ -196,27 +200,66 @@ def _failure(event):
     return _codex_error("provider_error", "本机 Codex 调用失败，未接受不完整结果。")
 
 
-def complete(messages, model, *, max_output, before_send, timeout=None):
+def _request_payload(messages, max_output, output_schema=None):
+    budget = min(128_000, max(1024, max_output * 16))
+    instructions = "只分析提供的消息资料，不执行命令或工具，不读取本地文件。按消息要求回答；把最终正文完整放入answer字符串。如果要求JSON，answer内容必须是该JSON原文。正文尽量不超过指定token预算。"
+    schema = {"type": "object", "properties": {"answer": {"type": "string", "maxLength": budget}},
+              "required": ["answer"], "additionalProperties": False}
+    if output_schema is not None:
+        if not isinstance(output_schema, dict) or output_schema.get("type") != "object":
+            raise _codex_error("config", "Codex 结构化输出配置无效。", 400)
+        instructions = "只分析提供的消息资料，不执行命令或工具，不读取本地文件。按消息要求回答；把完整JSON对象放入answer对象，严格遵守输出结构。正文尽量不超过指定token预算。"
+        answer_schema = deepcopy(output_schema)
+        if "$defs" in answer_schema:
+            schema["$defs"] = answer_schema.pop("$defs")
+        schema["properties"]["answer"] = answer_schema
+    try:
+        prompt = json.dumps({"instructions": instructions, "max_output_tokens": max_output, "messages": messages}, ensure_ascii=False)
+        schema_wire = json.dumps(schema, allow_nan=False)
+    except (TypeError, ValueError):
+        raise _codex_error("config", "Codex 结构化输出配置无效。", 400) from None
+    return prompt, schema_wire, budget
+
+
+def request_input_bytes(messages, *, max_output, output_schema):
+    """Exact serialized structured prompt plus the schema sent to Codex."""
+    prompt, schema_wire, _ = _request_payload(messages, max_output, output_schema)
+    return len(prompt.encode()) + len(schema_wire.encode())
+
+
+def complete(messages, model, *, max_output, before_send, timeout=None, output_schema=None, absolute_deadline=None):
+    with _codex_dispatch.native_attempt() as dispatch:
+        return _complete(messages, model, max_output=max_output, before_send=before_send, timeout=timeout,
+                         output_schema=output_schema, absolute_deadline=absolute_deadline, dispatch=dispatch)
+
+
+def _complete(messages, model, *, max_output, before_send, timeout, output_schema, absolute_deadline, dispatch):
     if not isinstance(max_output, int) or isinstance(max_output, bool) or not 1 <= max_output <= 16000:
         raise _codex_error("config", "Codex 输出额度无效。", 400)
-    timeout = TIMEOUT_SECONDS if timeout is None else min(TIMEOUT_SECONDS, timeout)
-    if timeout <= 0:
-        raise _codex_error("timeout", "Codex 调用已达到时间限制。", 408)
+    for value in (timeout, absolute_deadline):
+        if value is not None and (type(value) not in (int, float) or value <= 0
+                                  or not math.isfinite(value)):
+            raise _codex_error("timeout", "Codex 调用已达到时间限制。", 408)
+    entry = time.monotonic()
+    ceiling = STRUCTURED_TIMEOUT_SECONDS if output_schema is not None else TIMEOUT_SECONDS
+    duration = TIMEOUT_SECONDS if timeout is None and absolute_deadline is None else ceiling
+    if timeout is not None:
+        duration = min(duration, timeout)
+    deadline = entry + duration
+    if absolute_deadline is not None:
+        deadline = min(deadline, absolute_deadline)
     state = status()
     if state["status"] != "ready":
         raise _codex_error("login" if state["status"] == "login_required" else "config", state["detail"], 409)
     executable = find_codex()
-    budget = min(128_000, max(1024, max_output * 16))
-    prompt = json.dumps({"instructions": "只分析提供的消息资料，不执行命令或工具，不读取本地文件。按消息要求回答；把最终正文完整放入answer字符串。如果要求JSON，answer内容必须是该JSON原文。正文尽量不超过指定token预算。",
-                         "max_output_tokens": max_output, "messages": messages}, ensure_ascii=False)
-    if len(prompt.encode()) > MAX_INPUT_BYTES:
+    prompt, schema_wire, budget = _request_payload(messages, max_output, output_schema)
+    input_bytes = len(prompt.encode()) + (len(schema_wire.encode()) if output_schema is not None else 0)
+    if input_bytes > MAX_INPUT_BYTES:
         raise _codex_error("input_limit", "Codex 输入超过大小上限，未发送。", 422)
-    schema = {"type": "object", "properties": {"answer": {"type": "string", "maxLength": budget}},
-              "required": ["answer"], "additionalProperties": False}
     with tempfile.TemporaryDirectory(prefix="sijing-codex-") as directory:
         root = Path(directory)
         schema_path = root / "answer.schema.json"
-        schema_path.write_text(json.dumps(schema), encoding="utf-8")
+        schema_path.write_text(schema_wire, encoding="utf-8")
         catalog_path = root / "text-only-models.json"
         catalog_path.write_text(_text_only_catalog(executable, state["version"]), encoding="utf-8")
         # Source content stays on stdin, out of process argv and config overrides.
@@ -238,21 +281,23 @@ def complete(messages, model, *, max_output, before_send, timeout=None):
         with (root / "events.jsonl").open("w+b") as output, (root / "events.jsonl").open("rb") as reader, tempfile.TemporaryFile() as prompt_input:
             prompt_input.write(prompt.encode())
             prompt_input.seek(0)
-            before_send()
+            dispatch.check_control(before_send)
+            if time.monotonic() >= deadline:
+                raise _codex_error("timeout", "Codex 调用已达到时间限制。", 408)
+            environment = _environment()
+            # Once process creation is attempted, zero dispatch is no longer proven.
+            dispatch.launch_attempted = True
             try:
-                process = subprocess.Popen(arguments, cwd=directory, env=_environment(), shell=False,
+                process = subprocess.Popen(arguments, cwd=directory, env=environment, shell=False,
                                            stdin=prompt_input, stdout=output, stderr=subprocess.DEVNULL,
                                            start_new_session=os.name == "posix")
             except OSError:
                 raise _codex_error("config", "无法启动本机 Codex，请检查安装。") from None
-            started = checked_at = time.monotonic()
+            checked_at = time.monotonic()
             offset, pending, final, usage, completed = 0, b"", None, {}, False
             try:
                 while True:
-                    if time.monotonic() - checked_at >= .5:
-                        before_send()
-                        checked_at = time.monotonic()
-                    if time.monotonic() - started > timeout:
+                    if time.monotonic() >= deadline:
                         raise _codex_error("timeout", "Codex 调用超时，已终止本次分析进程，成功断点保留。", 408)
                     size = os.fstat(output.fileno()).st_size
                     if size > MAX_EVENT_BYTES:
@@ -265,6 +310,8 @@ def complete(messages, model, *, max_output, before_send, timeout=None):
                         lines = pending.split(b"\n")
                         pending = lines.pop()
                         for line in lines:
+                            if completed:
+                                raise _codex_error("invalid_event", "Codex 完成后返回额外事件，未接受结果。")
                             try:
                                 event = json.loads(line)
                             except (ValueError, UnicodeError):
@@ -292,29 +339,52 @@ def complete(messages, model, *, max_output, before_send, timeout=None):
                                     raise _codex_error("invalid_event", "Codex 返回结果格式无效，未接受结果。")
                             elif kind not in {"thread.started", "turn.started"}:
                                 raise _codex_error("invalid_event", "Codex 返回未支持的事件，未接受结果。")
-                    if process.poll() is not None:
-                        if os.fstat(output.fileno()).st_size > offset:
-                            continue
-                        break
+                    # The full event stream, answer and clean process exit must all
+                    # be observed before the fixed deadline. A slow guard cannot
+                    # turn an already observed completion into a late result.
+                    if time.monotonic() >= deadline:
+                        raise _codex_error("timeout", "Codex 调用超时，已终止本次分析进程，成功断点保留。", 408)
+                    exited = process.poll() is not None
+                    candidate = None
+                    if exited and os.fstat(output.fileno()).st_size == offset:
+                        if process.returncode != 0:
+                            raise _codex_error("process_exit", "本机 Codex 调用失败，请检查登录、版本或额度；成功断点保留。")
+                        if not completed or pending or not isinstance(final, str):
+                            raise _codex_error("incomplete", "Codex 调用未正常完成，未接受结果。")
+                        try:
+                            answer = json.loads(final)["answer"]
+                            if output_schema is not None:
+                                if not isinstance(answer, dict):
+                                    raise ValueError()
+                                answer = json.dumps(answer, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                        except (KeyError, TypeError, ValueError):
+                            raise _codex_error("invalid_json", "Codex 返回结果格式无效，未接受结果。") from None
+                        if not isinstance(answer, str) or not answer.strip():
+                            raise _codex_error("empty_response", "Codex 未返回有效结果。")
+                        safe_usage = {target: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+                                      for target, value in (("input_tokens", usage.get("input_tokens")), ("output_tokens", usage.get("output_tokens")),
+                                                            ("cached_tokens", usage.get("cached_input_tokens")))}
+                        limited = len(answer.encode()) > budget or (safe_usage["output_tokens"] or 0) >= max_output
+                        candidate = {"text": answer.strip(), "usage": safe_usage, "output_limited": limited,
+                                     "runtime": {"kind": "codex-local", "version": state["version"], "model": model}}
+                        if time.monotonic() >= deadline:
+                            raise _codex_error("timeout", "Codex 调用超时，已终止本次分析进程，成功断点保留。", 408)
+                    if time.monotonic() - checked_at >= .5:
+                        dispatch.check_control(before_send)
+                        checked_at = time.monotonic()
+                    if candidate is not None:
+                        dispatch.check_control(before_send)
+                        # Never add bytes observed after capture; even a trailing
+                        # partial event invalidates the captured prefix.
+                        if os.fstat(output.fileno()).st_size != offset:
+                            raise _codex_error("incomplete", "Codex 调用未正常完成，未接受结果。")
+                        return candidate
+                    if exited:
+                        continue
                     time.sleep(.05)
-                if process.returncode != 0:
-                    raise _codex_error("process_exit", "本机 Codex 调用失败，请检查登录、版本或额度；成功断点保留。")
-                if not completed or pending or not isinstance(final, str):
-                    raise _codex_error("incomplete", "Codex 调用未正常完成，未接受结果。")
-                try:
-                    answer = json.loads(final)["answer"]
-                except (KeyError, TypeError, ValueError):
-                    raise _codex_error("invalid_json", "Codex 返回结果格式无效，未接受结果。") from None
-                if not isinstance(answer, str) or not answer.strip():
-                    raise _codex_error("empty_response", "Codex 未返回有效结果。")
-                safe_usage = {target: value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
-                              for target, value in (("input_tokens", usage.get("input_tokens")), ("output_tokens", usage.get("output_tokens")),
-                                                    ("cached_tokens", usage.get("cached_input_tokens")))}
-                limited = len(answer.encode()) > budget or (safe_usage["output_tokens"] or 0) >= max_output
-                before_send()
-                return {"text": answer.strip(), "usage": safe_usage, "output_limited": limited,
-                        "runtime": {"kind": "codex-local", "version": state["version"], "model": model}}
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError) as error:
+                if dispatch.control_error is error:
+                    raise
                 raise _codex_error("communication", "本机 Codex 进程通信失败，未接受结果。") from None
             finally:
                 _stop(process)

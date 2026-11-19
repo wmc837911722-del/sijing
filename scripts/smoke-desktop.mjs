@@ -65,7 +65,7 @@ try {
   const settings = await api('GET', '/api/settings');
   assert.equal(settings.active_provider_id, null);
   const navigation = page.getByRole('navigation', { name: '应用导航' });
-  assert.deepEqual(await navigation.locator('.navigation-item').allTextContents(), ['模型配置', '仓库', '数据库', 'AI 问答', '业务地图']);
+  assert.deepEqual(await navigation.locator('.navigation-item').allTextContents(), ['模型配置', '项目与仓库', '数据库', 'AI 问答', '业务地图']);
   await page.getByRole('button', { name: '浅色主题', exact: true }).click();
   assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'light');
   await screenshot('desktop-chat-light.png');
@@ -106,8 +106,8 @@ try {
   await navigation.getByRole('button', { name: 'AI 问答', exact: true }).click();
   const input = page.locator('#bm-chat-input');
   await input.fill('退款规则是什么？');
-  await navigation.getByRole('button', { name: '仓库', exact: true }).click();
-  await page.getByRole('heading', { name: '仓库', exact: true }).waitFor();
+  await navigation.getByRole('button', { name: '项目与仓库', exact: true }).click();
+  await page.getByRole('heading', { name: '项目与仓库', exact: true }).waitFor();
   await navigation.getByRole('button', { name: 'AI 问答', exact: true }).click();
   assert.equal(await input.inputValue(), '退款规则是什么？', 'navigation preserves the conversation draft');
   await page.getByRole('button', { name: '发送问题', exact: true }).click();

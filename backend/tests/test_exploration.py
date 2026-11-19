@@ -71,7 +71,8 @@ def test_search_summary_cannot_be_submitted_as_read_evidence(service, monkeypatc
                         ("knowledge_read", {"path": "业务/退款规则.md"}), finish("业务/退款规则.md", "退款需满足规则。")])
     result = service.chat("退款规则是什么？")
     assert result["activities"][1]["status"] == "error"
-    assert result["sources"][0]["revision"]
+    assert result["sources"][0]["path"] == "业务/退款规则.md"
+    assert "revision" not in result["sources"][0]
 
 
 def test_data_tools_require_schema_and_read_evidence_and_execute_once(service, monkeypatch):
@@ -180,37 +181,32 @@ def code_repository(service, tmp_path):
     return repo
 
 
-def test_selected_repository_can_read_and_cite_source_beyond_markdown_index(service, code_repository, monkeypatch):
+def test_selected_repository_exposes_business_documents_without_source_tools(service, code_repository, monkeypatch):
     repo = code_repository
-    reference = f"source://{repo['id']}/{repo['commit']}/z-business/Stars.py#L1-L3"
-    requests = model(monkeypatch, [
-        ("repository_search", {"query": "LOSER_STARS"}),
-        ("repository_read", {"path": "z-business/Stars.py", "line_start": 1, "line_end": 3}),
-        finish(reference, f"代码定义败者扣1星，优先使用保星。[结算源码]({reference})"),
-    ])
-    result = service.chat("结算源码如何定义？", repository_id=repo["id"])
+    path = "01-Wiki/赛事/规则/扣星条件.md"
+    note = service.store.save_note(path, "# 扣星条件\n败者扣一星，保护条件适用时维持原星数。\n")
+    service.store.config_set(f"ai_analysis:{repo['id']}", {"vault_path": str(service.store.vault), "notes": {
+        "rules": {"path": path, "revision": note["revision"], "commit": repo["commit"], "stale": False, "conflict": False}}})
+    requests = model(monkeypatch, [("knowledge_read", {"path": path}), finish(path, "败者扣一星，保护条件适用时维持原星数。")])
+    result = service.chat("扣星规则如何定义？", repository_id=repo["id"])
     assert result["completion"] == "complete"
-    assert result["sources"][0]["path"] == reference
-    assert result["sources"][0]["kind"] == "code"
-    assert result["sources"][0]["commit"] == repo["commit"]
-    assert f"]({reference})" in result["answer"]
-    assert "2: LOSER_STARS = -1" in json.dumps(requests[2], ensure_ascii=False)
-    assert result["activities"][0]["detail"].find("502") >= 0
+    assert result["sources"] == [{"path": path, "title": "扣星条件"}]
+    assert not {"repository_read", "repository_search"} & {tool["function"]["name"] for tool in requests[0]["tools"]}
+    assert "LOSER_STARS" not in json.dumps(requests) and repo['commit'] not in json.dumps(result)
 
+def test_source_tools_cannot_create_public_read_receipts(service, code_repository):
+    from businessmap.exploration import Exploration
+    exploration = Exploration(service, service.providers.get(), "knowledge", None, lambda _: True, lambda: None,
+                              repository_id=code_repository["id"])
+    for name, arguments in (("repository_search", {"query": "LOSER_STARS"}), ("repository_read", {"path": "z-business/Stars.py"})):
+        with pytest.raises(ToolError) as error:
+            exploration.execute(name, arguments)
+        assert error.value.status_code == 403
+    assert not exploration.reads
 
-def test_source_search_excerpt_is_not_a_read_receipt(service, code_repository, monkeypatch):
-    repo = code_repository
-    reference = f"source://{repo['id']}/{repo['commit']}/z-business/Stars.py#L1-L3"
-    model(monkeypatch, [("repository_search", {"query": "LOSER_STARS"}), finish(reference),
-                        ("repository_read", {"path": "z-business/Stars.py", "line_start": 1, "line_end": 3}), finish(reference, "依据已读源码")])
-    result = service.chat("结算", repository_id=repo["id"])
-    assert result["activities"][1]["status"] == "error"
-    assert result["sources"][0]["revision"]
-
-
-def test_missing_source_can_finish_with_honest_clarification(service, code_repository, monkeypatch):
-    model(monkeypatch, [("repository_search", {"query": "UNKNOWN_POLICY"}),
-                       ("finish_answer", {"answer": "当前源码未找到该规则，需要补充对应模块。", "citations": [], "kind": "clarification"})])
+def test_missing_business_knowledge_can_finish_with_honest_clarification(service, code_repository, monkeypatch):
+    model(monkeypatch, [("knowledge_search", {"query": "未知的业务规则"}),
+                       ("finish_answer", {"answer": "现有业务知识未找到该规则，需要补充已确认说明。", "citations": [], "kind": "clarification"})])
     result = service.chat("未知规则", repository_id=code_repository["id"])
     assert result["completion"] == "complete" and not result["sources"]
     assert result["activities"][0]["status"] == "complete"
@@ -230,50 +226,38 @@ def test_budget_reserves_a_bounded_finish_call_instead_of_dropping_read_evidence
     assert result["sources"][0]["path"] == "业务/退款规则.md"
 
 
-def test_source_viewer_requires_auth_and_rejects_forged_references(service, code_repository):
+def test_source_viewer_is_disabled_for_authenticated_business_api(service, code_repository):
     from fastapi.testclient import TestClient
     from businessmap.app import create_app
-    repo = code_repository
-    app = create_app(service.store.data_dir, "test-session-token-123")
-    headers = {"authorization": "Bearer test-session-token-123"}
-    reference = f"source://{repo['id']}/{repo['commit']}/z-business/Stars.py#L1-L3"
-    with TestClient(app) as client:
-        assert client.get("/api/source-evidence", params={"reference": reference}).status_code == 401
-        response = client.get("/api/source-evidence", params={"reference": reference}, headers=headers)
-        assert response.status_code == 200
-        assert "2: LOSER_STARS = -1" in response.json()["content"]
-        assert response.json()["commit"] == repo["commit"]
-        for invalid in ("https://example.invalid/source.py", reference.replace("z-business/Stars.py", "../escape.py"),
-                        reference.replace(repo["commit"], "0" * 40)):
-            assert client.get("/api/source-evidence", params={"reference": invalid}, headers=headers).status_code in {400, 404, 409}
-        service.store.config_set(f"ai_analysis_status:{repo['id']}",
-            {"status": "failed", "summary": "模型引用校验失败，未写入。", "category": "citation",
-             "vault_path": str(service.store.vault), "raw_response": "must-not-leak"})
-        state = client.get("/api/analysis-status", headers=headers).json()
-        assert state["statuses"][repo["id"]]["category"] == "citation"
-        assert "raw_response" not in json.dumps(state)
+    app = create_app(service.store.data_dir, "source-boundary-token-long-enough")
+    reference = f"source://{code_repository['id']}/{code_repository['commit']}/z-business/Stars.py#L1-L3"
+    try:
+        with TestClient(app) as client:
+            assert client.get("/api/source-evidence", params={"reference": reference}).status_code == 401
+            client.headers['Authorization'] = 'Bearer source-boundary-token-long-enough'
+            result = client.get("/api/source-evidence", params={"reference": reference})
+            assert result.status_code == 403 and 'Stars.py' not in result.text
+    finally:
+        app.state.store.close()
 
-
-def test_canonical_material_folders_keep_repository_model_authorization(service, code_repository):
-    repo = code_repository
-    note = service.store.save_note(f"00-Inbox/代码资料/{repo['id']}/版本-fixture.md", "# 代码资料\nprivate material")
-    other = service.providers.save({"name": "Other", "kind": "openai-compatible",
-                                    "base_url": "http://127.0.0.1:2/v1", "model": "other"})
-    assert service.note_repositories(note) == {repo["id"]}
-    assert service.note_allowed(note, other) is False
-
+def test_canonical_material_folders_are_not_public_business_evidence(service, code_repository):
+    from businessmap.knowledge import KnowledgeNavigator
+    path = f"00-Inbox/代码资料/{code_repository['id']}/资料.md"
+    service.store._write_note(path, "# 内部资料\n不可作为业务知识公开。\n")
+    service.store.refresh()
+    assert service.search("内部资料") == []
+    assert KnowledgeNavigator(service.store).search("内部资料")["notes"] == []
 
 @pytest.mark.parametrize("note_type", ["code", "raw"])
 def test_moved_source_material_cannot_alone_prove_a_business_answer(service, monkeypatch, note_type):
-    path = "01-Wiki/整理/代码资料.md"
-    service.store.save_note(path, f"---\ntype: {note_type}\n---\n# 原始资料\n此处只是文件定位，未读取实现。")
-    model(monkeypatch, [("knowledge_read", {"path": path}), finish(path, "已核实业务规则。"),
-                       ("finish_answer", {"answer": "索引不足以核实业务规则，需要读取具体实现。",
-                                          "citations": [], "kind": "clarification"})])
+    path = "整理/来源材料.md"
+    service.store._write_note(path, f"---\ntype: {note_type}\n---\n# 原始材料\n尚未提炼业务事实。\n")
+    service.store.refresh()
+    model(monkeypatch, [("knowledge_read", {"path": path}),
+                       ("finish_answer", {"answer": "缺少可查阅的业务知识，请补充已确认规则。", "citations": [], "kind": "clarification"})])
     result = service.chat("请核实业务规则")
-    assert result["activities"][1]["status"] == "error"
-    assert "需要补充或确认" in result["answer"]
-
+    assert result["activities"][0]["status"] == "error"
+    assert not result['sources'] and "需要补充或确认" in result["answer"]
 
 def test_closing_does_not_drop_a_late_exception_and_then_claim_a_complete_answer(service, monkeypatch):
     monkeypatch.setattr("businessmap.exploration.MAX_TOTAL_TOKENS", 15000)
@@ -290,63 +274,32 @@ def test_closing_does_not_drop_a_late_exception_and_then_claim_a_complete_answer
     assert "补充" in result["answer"]
 
 
-def test_reported_prompt_usage_leaves_budget_to_read_late_english_source_helper(service, code_repository, monkeypatch):
-    """Actual source receipts grow in bytes much faster than reported prompt tokens."""
-    import subprocess
-    from pathlib import Path
-
-    repo = code_repository
-    source = Path(repo["path"])
-    path = "arena/JdbcStarServiceImpl.java"
-    (source / "arena").mkdir()
-    lines = ["package arena.settlement;", "public final class JdbcStarServiceImpl {",
-             "    public void settle(StarAdjustment adjustment) {"]
-    lines += [f'        settlementSteps.add(new StarAdjustment("round-{index:03d}", adjustment.getOriginalStars(), adjustment.getProtectionCard()));'
-              for index in range(150)]
-    lines.append("    }")
-    helper_start = len(lines) + 1
-    lines += ["    private int deductAfterProtection(StarAdjustment adjustment) {",
-              "        if (adjustment.consumeProtectionCard()) return adjustment.getOriginalStars();",
-              "        return Math.max(0, adjustment.getOriginalStars() - 1);", "    }", "}"]
-    (source / path).write_text("\n".join(lines) + "\n")
-    for index in range(7):
-        (source / f"arena/SettlementPlan{index}.java").write_text(
-            "package arena.settlement;\npublic final class SettlementPlan {\n" +
-            "    // settlement operation follows the configured business rule and preserves original adjustment details.\n" * 12 + "}\n")
-    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                    "commit", "-qm", "Large English implementation with a later helper"], check=True)
-    repo["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    service.store._write_repo(repo)
-    reference = f"source://{repo['id']}/{repo['commit']}/{path}#L{helper_start}-L{len(lines)}"
-
-    def read_helper(payload):
-        assert "repository_read" in {tool["function"]["name"] for tool in payload["tools"]}, \
-            "full English transcript bytes must not force synthesis before the helper can be read"
-        return "repository_read", {"path": path, "line_start": helper_start, "line_end": len(lines)}
-
+def test_reported_prompt_usage_leaves_budget_to_read_late_business_exception(service, monkeypatch):
+    path = "规则/结算说明.md"
+    service.store.save_note(path, "# Settlement rules\n" + "Ordinary settlement follows the configured business condition and retains the original amount.\n" * 240 +
+                            "\n## Special protection\n保护条件成立时维持原星数，否则扣一星且不低于零。\n")
+    for index in range(20):
+        service.store.save_note(f"规则/结算参考{index}.md", f"# Settlement policy {index}\n" + "Ordinary settlement business condition. " * 20)
+    def read_exception(payload):
+        assert "knowledge_read" in {tool["function"]["name"] for tool in payload["tools"]}
+        return "knowledge_read", {"path": path, "heading": "Special protection"}
     def final(payload):
-        assert "consumeProtectionCard" in json.dumps(payload["messages"], ensure_ascii=False)
-        return finish(reference, "实际实现先消耗保星卡，否则扣一星且不低于零。")
-
+        assert "保护条件成立时维持原星数" in json.dumps(payload['messages'], ensure_ascii=False)
+        return finish(path, "保护条件成立时维持原星数，否则扣一星且不低于零。")
     reported_inputs = (4000, 6000, 8000, 10000, 12000, 13500)
-    requests = model(monkeypatch, [("repository_search", {"query": "settlement"}),
-        ("repository_read", {"path": path, "line_start": 1, "line_end": 43}),
-        ("repository_read", {"path": path, "line_start": 44, "line_end": 86}),
-        ("repository_read", {"path": path, "line_start": 87, "line_end": 129}), read_helper, final],
-        usage=lambda count: {"prompt_tokens": reported_inputs[count - 1], "completion_tokens": 100})
-    result = service.chat("从结算实际实现和后部helper解释保星与扣星顺序。", repository_id=repo["id"])
+    requests = model(monkeypatch, [("knowledge_search", {"query": "settlement", "limit": 20}),
+        ("knowledge_read", {"path": path, "offset": 0, "limit": 6000}),
+        ("knowledge_read", {"path": path, "offset": 6000, "limit": 6000}),
+        ("knowledge_read", {"path": path, "offset": 12000, "limit": 6000}), read_exception, final],
+        usage=lambda count: {"prompt_tokens": reported_inputs[count-1], "completion_tokens": 100})
+    result = service.chat("完整解释结算条件与后面的保护例外。")
     assert len(requests) == 6 and result["completion"] == "complete"
-    assert result["sources"][0]["path"] == reference
-    assert result["usage"]["input_tokens"] == sum(reported_inputs)
-    assert result["usage"]["input_tokens"] + result["usage"]["output_tokens"] < 60000
-    # This must exercise the original failure, not a tiny synthetic tool result.
+    assert result['sources'] == [{"path": path, "title": "Settlement rules"}]
+    assert result['usage']['input_tokens'] == sum(reported_inputs)
     fifth = requests[4]
-    full_bytes = len(json.dumps({"system": fifth["messages"][0]["content"],
-        "messages": fifth["messages"][1:], "tools": fifth["tools"]}, ensure_ascii=False).encode())
+    full_bytes = len(json.dumps({"system": fifth["messages"][0]["content"], "messages": fifth["messages"][1:], "tools": fifth["tools"]}, ensure_ascii=False).encode())
     remaining = 60000 - sum(reported_inputs[:4]) - 400
     assert full_bytes + 2300 >= remaining
-
 
 @pytest.mark.parametrize("change", ["unknown", "zero", "boolean", "negative", "system", "tools", "message", "removed"])
 def test_prompt_estimate_falls_back_to_full_wire_when_usage_or_append_contract_is_unknown(change):
@@ -368,43 +321,13 @@ def test_prompt_estimate_falls_back_to_full_wire_when_usage_or_append_contract_i
     assert _prompt_input_bound(current, (previous, actual)) == current["bytes"]
 
 
-def test_short_source_citation_uses_actual_returned_range_instead_of_retyping_long_uri(service, code_repository, monkeypatch):
-    import subprocess
-    from pathlib import Path
-    from urllib.parse import quote
-
-    repo = code_repository
-    source = Path(repo["path"])
-    path = "src/" + "arena/settlement/" * 12 + "DeductionRule.java"
-    target = source / path
-    target.parent.mkdir(parents=True)
-    target.write_text("public final class DeductionRule {\n" +
-                      "    public int deductedStars(int originalStars) { return Math.max(0, originalStars - 1); }\n" * 20 + "}\n")
-    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(source), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                    "commit", "-qm", "Long receipt with a bounded returned range"], check=True)
-    repo["commit"] = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
-    service.store._write_repo(repo)
-    base = f"source://{repo['id']}/{repo['commit']}/{quote(path, safe='/')}"
-    actual = base + "#L1-L1"
-
-    def short_finish(payload):
-        receipt = json.loads(next(m["content"] for m in payload["messages"] if m["role"] == "tool"))
-        assert receipt["reference"] == actual and receipt["line_end"] == 1
-        assert "citation_id" in receipt, "successful source reads must grant a short citation receipt"
-        citation_id = receipt["citation_id"]
-        assert len(citation_id) < 25
-        return finish(citation_id, f"已读取实际返回的行段。[原文]({citation_id})")
-
-    model(monkeypatch, [("repository_read", {"path": path, "line_start": 1, "line_end": 22, "max_chars": 90}),
-                       finish(base + "#L1-L22"), short_finish])
-    result = service.chat("查看对应源码行段", repository_id=repo["id"])
-    assert result["completion"] == "complete" and result["activities"][1]["status"] == "error"
-    assert result["sources"][0]["path"] == actual
-    assert result["sources"][0]["commit"] == repo["commit"]
-    assert result["sources"][0]["line_start"] == result["sources"][0]["line_end"] == 1
-    assert f"]({actual})" in result["answer"]
-
+def test_technical_answers_are_rejected_without_automatic_paid_rewrite(service, monkeypatch):
+    from businessmap.exploration import Exploration
+    exploration = Exploration(service, service.providers.get(), "knowledge", None, lambda _: True, lambda: None)
+    with pytest.raises(ToolError) as error:
+        exploration.response("详见 source://private/" + "a" * 40 + "/src/RefundServiceImpl.java#L1-L2")
+    assert error.value.status_code == 422
+    assert not exploration.requests
 
 def test_short_note_links_expand_only_citations_selected_for_the_answer(service, monkeypatch):
     from urllib.parse import quote
@@ -414,10 +337,10 @@ def test_short_note_links_expand_only_citations_selected_for_the_answer(service,
         receipts = [json.loads(m["content"]) for m in payload["messages"] if m["role"] == "tool"]
         assert all("citation_id" in receipt for receipt in receipts)
         chosen, unused = (receipt["citation_id"] for receipt in receipts)
-        return finish(chosen, f"[已引用]({chosen}) [未引用]({unused}) [不存在](r_unknown_9) [伪造范围]({chosen}#L1-L99)")
+        return finish(chosen, f"[已引用]({chosen}) [未引用]({unused}) [不存在](不存在.md)")
     model(monkeypatch, [("knowledge_read", {"path": first}), ("knowledge_read", {"path": second}), final])
     result = service.chat("读取业务规则")
-    assert result["answer"] == f"[已引用]({quote(first, safe='/')}) 未引用 不存在 伪造范围"
+    assert result["answer"] == f"[已引用]({quote(first, safe='/')}) 未引用 不存在"
     assert [receipt["path"] for receipt in result["sources"]] == [first]
 
 

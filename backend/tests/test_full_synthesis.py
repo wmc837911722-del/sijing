@@ -33,6 +33,11 @@ def synthesis_project(tmp_path, monkeypatch):
     run = {"run_id": "fixture-run", "modules": [{"id": f"module-{i}", "name": f"src/internal/folder-{i}", "directory": f"src/internal/folder-{i}", "repository_ids": ["front" if i % 2 else "back"]} for i in range(11)]}
     chunks = [{"id": f"chunk-{i}", "module_id": f"module-{i % 11}", "status": "completed", "result": {
         "title": "订单支付", "summary": f"已核对业务批次 {i}", "findings": [{"text": f"订单在条件 {i} 下允许支付", "evidence_ids": [f"evidence-{i}"]}], "unknowns": ["跨端调用链尚未核对"]}} for i in range(31)]
+    # These regressions exercise the real L0/cache boundary. Independent
+    # semantic proposal/review behavior has its own integration tests.
+    from businessmap.business_semantics import BusinessSemanticIntegration
+    from business_projection_fixture import projection_from_units
+    monkeypatch.setattr(BusinessSemanticIntegration, "build", lambda self, snapshot, run, **kwargs: projection_from_units(snapshot, run, **kwargs))
     yield service, snapshot, run, chunks
     store.close()
 
@@ -46,17 +51,17 @@ def fake_model(monkeypatch, service, callback=None, omit=False):
         sent.append(payload)
         if callback:
             callback(payload, len(sent))
-        ids = [item["module_id"] for item in payload["items"]]
+        items = payload["items"]
         if omit:
-            ids = ids[:1]
+            items = items[:1]
         # A second real database connection can acquire a write transaction:
         # provider calls must not be inside the checkpoint transaction.
         with sqlite3.connect(service.store.db_path, timeout=0.1) as db:
             db.execute("BEGIN IMMEDIATE")
             db.rollback()
-        return {"text": json.dumps({"domains": [{"name": "订单与支付", "summary": "订单受状态与金额条件约束后进入支付处理。", "module_ids": ids}],
-                                   "flows": [{"text": "订单状态校验后处理支付结果。", "module_ids": ids}], "unknowns": ["前后端接口对应关系待核验"]}, ensure_ascii=False),
-                "usage": {"input_tokens": 100, "output_tokens": 80}}
+        return {"text": json.dumps({"assignments": [{"fact_id": item["fact_id"], "disposition": "public", "category": "rules",
+            "title": "订单与支付"} for item in items]}, ensure_ascii=False),
+            "usage": {"input_tokens": 100, "output_tokens": 80}}
     monkeypatch.setattr(service.providers, "complete", complete)
     return sent
 
@@ -71,12 +76,14 @@ def test_all_chunks_semantically_synthesized_with_bounded_wire_and_durable_reuse
     assert result["complete"]
     assert {item["chunk_id"] for request in sent for item in request["items"] if "chunk_id" in item} == {chunk["id"] for chunk in chunks}
     assert all(len(json.dumps(request, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()) + len(synthesis.SYSTEM.encode()) <= synthesis.WIRE_BYTES for request in sent)
-    assert {mid for domain in result["domains"] for mid in domain["module_ids"]} == {module["id"] for module in run["modules"]}
-    assert set(result["module_titles"]) == {module["id"] for module in run["modules"]}
-    assert "订单与支付" in result["overview_body"]
-    assert "src/internal/folder" not in result["overview_body"]
-    assert "前后端接口对应关系待核验" in result["overview_body"]
-    assert all(f"[[module:{module['id']}|" in result["overview_body"] for module in run["modules"])
+    assert len(result["semantic_coverage"]["input_ids"]) == 93
+    assert set(result["semantic_coverage"]["input_ids"]) == set(result["semantic_coverage"]["decisions"])
+    assert len(result["public_documents"]) == 1
+    text = result["public_documents"][0]["body"]
+    assert "跨端调用链尚未核对" in text
+    for chunk in chunks:
+        assert chunk["result"]["findings"][0]["text"] in text
+    assert "module:" not in result["overview_body"] and "src/internal/folder" not in result["overview_body"]
     previous = len(sent)
     resumed_service = FullBusinessSynthesis(service)
     resumed_service.MAX_ITEMS = synthesis.MAX_ITEMS
@@ -104,19 +111,17 @@ def test_failed_synthesis_has_no_automatic_retry_and_only_failed_inputs_are_rese
     assert first_request not in new_calls
 
 
-def test_unknown_ids_are_rejected_but_missing_modules_get_explicit_semantic_fallback(synthesis_project, monkeypatch):
+def test_unknown_or_missing_fact_assignments_are_rejected_without_semantic_fallback(synthesis_project, monkeypatch):
     from businessmap.full_synthesis import FullBusinessSynthesis
     service, snapshot, run, chunks = synthesis_project
     def forged(system, user, **kwargs):
-        return {"text": json.dumps({"domains": [{"name": "伪造", "summary": "无来源", "module_ids": ["foreign"]}], "flows": [], "unknowns": []})}
+        return {"text": json.dumps({"assignments": [{"fact_id": "foreign", "disposition": "internal", "classification": "technical", "reason": "伪造"}]})}
     monkeypatch.setattr(service.providers, "complete", forged)
     with pytest.raises(ToolError):
         FullBusinessSynthesis(service).build(snapshot, run, chunks)
     fake_model(monkeypatch, service, omit=True)
-    result = FullBusinessSynthesis(service).build(snapshot, run, chunks)
-    assert result["complete"]
-    assert set(result["module_titles"]) == {module["id"] for module in run["modules"]}
-    assert any(domain["name"] == "待归类/技术支撑" for domain in result["domains"])
+    with pytest.raises(ToolError, match="事实"):
+        FullBusinessSynthesis(service).build(snapshot, run, chunks)
 
 
 def test_snapshot_changes_and_pause_preserve_cache_without_publishing(synthesis_project, monkeypatch):
@@ -161,8 +166,9 @@ def test_empty_only_modules_are_explicit_without_paid_requests(synthesis_project
     calls = fake_model(monkeypatch, service)
     result = FullBusinessSynthesis(service).build(snapshot, run, [])
     assert result["complete"] and not calls
-    assert len(result["module_titles"]) == len(run["modules"])
-    assert "空文件/技术占位" in result["overview_body"]
+    assert result["semantic_coverage"]["input_ids"] == []
+    assert result["public_documents"] == []
+    assert "空文件" not in result["overview_body"]
 
 
 def test_runtime_epoch_does_not_invalidate_persisted_semantic_cache(synthesis_project, monkeypatch):
@@ -177,6 +183,147 @@ def test_runtime_epoch_does_not_invalidate_persisted_semantic_cache(synthesis_pr
     assert first["overview_body"] == resumed["overview_body"] and len(calls) == previous
 
 
+def test_version_four_internal_cache_is_not_reused_after_classification_fix(synthesis_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis, _hash, _json
+    service, snapshot, run, _ = synthesis_project
+    run["snapshot_id"] = "fixture-snapshot"
+    synthesis = FullBusinessSynthesis(service)
+    text = "订单仅在已支付且未退款时允许退款；退款金额不得超过已支付金额；该规则尚无测试覆盖。"
+    units = [{"kind": "finding", "text": text, "_fact_id": "private-fact", "_module_ids": ["private-module"],
+              "_source_paths": ["back/service/RefundService.java"]}]
+    old_key = _hash({"version": 4, "system": synthesis.SYSTEM, "wire": synthesis._wire(snapshot, units, 0),
+                     "members": [unit["_module_ids"] for unit in units], "snapshot_id": run["snapshot_id"]})
+    old_result = {"assignments": [{"fact_id": "private-fact", "disposition": "internal", "classification": "test",
+                                  "reason": "测试说明", "classification_basis": {"supported_categories": ["test"], "evidence_ids": []}}]}
+    with service.store._lock, service.store._db() as db:
+        db.execute("INSERT INTO full_analysis_synthesis VALUES (?,?,?,?)", (old_key, old_key, _json(old_result), "2026-10-27"))
+    calls = fake_model(monkeypatch, service)
+    usage = {"requests": 0, "cache_hits": 0, "input_tokens": 0, "output_tokens": 0}
+    result = synthesis._request(snapshot, run, units, 0, usage)
+    assert len(calls) == 1 and usage["requests"] == 1 and usage["cache_hits"] == 0
+    assert result["assignments"][0]["disposition"] == "public"
+    assert "text" not in result["assignments"][0]
+    next_usage = {key: 0 for key in usage}
+    assert synthesis._request(snapshot, run, units, 0, next_usage) == result
+    assert len(calls) == 1 and next_usage["cache_hits"] == 1 and next_usage["requests"] == 0
+    with service.store._db() as db:
+        assert json.loads(db.execute("SELECT data FROM full_analysis_synthesis WHERE cache_key=?", (old_key,)).fetchone()[0]) == old_result
+        assert db.execute("SELECT count(*) FROM full_analysis_synthesis").fetchone()[0] == 2
+
+
+def test_version_five_forced_public_style_cache_is_not_reused(synthesis_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis, _hash, _json
+    service, snapshot, run, _ = synthesis_project
+    run["snapshot_id"] = "fixture-snapshot"
+    synthesis = FullBusinessSynthesis(service)
+    text = "选中选项以橙色突出。"
+    units = [{"kind": "finding", "text": text, "_fact_id": "private-fact", "_module_ids": ["private-module"],
+              "_source_paths": ["front/styles/theme.css"], "_evidence_ids": ["private-evidence"]}]
+    old_key = _hash({"version": 5, "system": synthesis.SYSTEM, "wire": synthesis._wire(snapshot, units, 0),
+                     "members": [["private-module"]], "snapshot_id": run["snapshot_id"]})
+    old_result = {"assignments": [{"fact_id": "private-fact", "disposition": "public", "category": "rules",
+                                  "title": "界面配色", "text": text}]}
+    with service.store._db() as db:
+        db.execute("INSERT INTO full_analysis_synthesis VALUES (?,?,?,?)", (old_key, old_key, _json(old_result), "2026-10-27"))
+    def complete(system, user, **kwargs):
+        kwargs["before_send"]()
+        return {"text": json.dumps({"assignments": [{"fact_id": "f0", "disposition": "internal",
+            "classification": "technical", "reason": "纯呈现样式"}]})}
+    monkeypatch.setattr(service.providers, "complete", complete)
+    usage = {"requests": 0, "cache_hits": 0, "input_tokens": 0, "output_tokens": 0}
+    result = synthesis._request(snapshot, run, units, 0, usage)
+    assert result["assignments"][0]["disposition"] == "internal"
+    assert usage["requests"] == 1 and usage["cache_hits"] == 0
+    assert synthesis._request(snapshot, run, units, 0, usage) == result
+    assert usage["requests"] == 1 and usage["cache_hits"] == 1
+    with service.store._db() as db:
+        assert json.loads(db.execute("SELECT data FROM full_analysis_synthesis WHERE cache_key=?", (old_key,)).fetchone()[0]) == old_result
+
+
+def test_version_six_cache_is_not_reused_for_source_owned_text(synthesis_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis, _hash, _json
+    service, snapshot, run, _ = synthesis_project
+    run["snapshot_id"] = "fixture-snapshot"
+    synthesis = FullBusinessSynthesis(service)
+    text = "退款条件尚未确认。"
+    units = [{"kind": "unknown", "text": text, "_fact_id": "private-fact", "_module_ids": ["private-module"]}]
+    old_key = _hash({"version": 6, "system": synthesis.SYSTEM, "wire": synthesis._wire(snapshot, units, 0),
+                     "members": [["private-module"]], "snapshot_id": run["snapshot_id"]})
+    old_result = {"assignments": [{"fact_id": "private-fact", "disposition": "public", "category": "rules", "title": "退款条件", "text": text}]}
+    with service.store._db() as db:
+        db.execute("INSERT INTO full_analysis_synthesis VALUES (?,?,?,?)", (old_key, old_key, _json(old_result), "2026-10-27"))
+    fake_model(monkeypatch, service)
+    usage = {"requests": 0, "cache_hits": 0, "input_tokens": 0, "output_tokens": 0}
+    result = synthesis._request(snapshot, run, units, 0, usage)
+    assert "text" not in result["assignments"][0]
+    assert usage["requests"] == 1 and usage["cache_hits"] == 0
+    assert synthesis._request(snapshot, run, units, 0, usage) == result
+    assert usage["requests"] == 1 and usage["cache_hits"] == 1
+    with service.store._db() as db:
+        assert json.loads(db.execute("SELECT data FROM full_analysis_synthesis WHERE cache_key=?", (old_key,)).fetchone()[0]) == old_result
+
+
+def test_source_owned_unknown_is_preserved_in_output_cache_and_original_coverage(synthesis_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis
+    service, snapshot, run, _ = synthesis_project
+    run["modules"] = [run["modules"][0]]
+    text = "尚未看到业务入口及调用方，无法确认段位写操作和超管专属操作是否均接入对应守卫，也无法确认门店可写校验的具体规则。"
+    chunks = [{"id": "unknown-chunk", "module_id": run["modules"][0]["id"], "status": "completed",
+        "input_hash": "original-source-receipt", "segments": [],
+        "result": {"title": "段位业务", "summary": "", "findings": [], "unknowns": [text]}}]
+    original = json.loads(json.dumps(chunks))
+    calls = []
+    def complete(system, user, **kwargs):
+        kwargs["before_send"]()
+        item = json.loads(user)["items"][0]
+        assert "text_policy" not in item and item["internal_categories"] == []
+        assert item["kind"] == "unknown" and item["text"] == text
+        calls.append(True)
+        return {"text": json.dumps({"assignments": [{"fact_id": "f0", "disposition": "public", "category": "rules",
+            "title": "段位权限"}]})}
+    monkeypatch.setattr(service.providers, "complete", complete)
+    synthesis = FullBusinessSynthesis(service)
+    result = synthesis.build(snapshot, run, chunks)
+    assert result["complete"] and chunks == original and len(calls) == 1
+    assert "## 待确认\n\n- " + text in result["public_documents"][0]["body"]
+    assert "## 业务说明" not in result["public_documents"][0]["body"]
+    assert next(iter(result["semantic_coverage"]["inputs"].values()))["text"] == text
+    assert synthesis.build(snapshot, run, chunks)["public_documents"] == result["public_documents"]
+    assert len(calls) == 1
+
+
+def test_stylesheet_projection_retains_originals_and_receipts_in_private_coverage(synthesis_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis
+    service, snapshot, run, _ = synthesis_project
+    run["modules"] = [run["modules"][0]]
+    style = "内部界面规范以橙色作为主色，统一配置文字、背景、间距与字号，并提供六种标签配色；未见配色与具体业务状态的对应关系。"
+    unknown = "退款条件尚未确认。"
+    chunks = [{"id": "style-chunk", "module_id": run["modules"][0]["id"], "status": "completed",
+        "input_hash": "original-source-receipt", "origin_provider": {"id": "original-source-provider"},
+        "segments": [{"evidence_id": "style-evidence", "repository_id": "front", "path": "src/styles/base.css"}],
+        "result": {"title": "界面样式", "summary": "", "findings": [{"text": style, "evidence_ids": ["style-evidence"]}],
+                   "unknowns": [unknown]}}]
+    original = json.loads(json.dumps(chunks))
+    def complete(system, user, **kwargs):
+        kwargs["before_send"]()
+        items = json.loads(user)["items"]
+        assert [item["internal_categories"] for item in items] == [["configuration", "technical"], []]
+        assert "src/styles" not in user and "style-evidence" not in user
+        return {"text": json.dumps({"assignments": [
+            {"fact_id": "f0", "disposition": "internal", "classification": "configuration", "reason": "纯呈现配置"},
+            {"fact_id": "f1", "disposition": "public", "category": "rules", "title": "退款条件"}]})}
+    monkeypatch.setattr(service.providers, "complete", complete)
+    result = FullBusinessSynthesis(service).build(snapshot, run, chunks)
+    assert result["complete"] and chunks == original
+    coverage = result["semantic_coverage"]
+    assert len(coverage["input_ids"]) == 2 and len(coverage["claims"]) == 1
+    internal_id = next(fid for fid, decision in coverage["decisions"].items() if decision["parts"][0]["outcome"] == "technical")
+    assert {key: value for key, value in coverage["inputs"][internal_id].items() if key != "observation"} == {"chunk_id": "style-chunk", "kind": "finding", "text": style,
+        "evidence_ids": ["style-evidence"], "source_paths": ["front/src/styles/base.css"]}
+    assert style not in json.dumps(result["public_documents"], ensure_ascii=False)
+    assert unknown in result["public_documents"][0]["body"]
+
+
 def test_all_leaf_business_domains_survive_parent_reduction_and_keep_specific_titles(synthesis_project, monkeypatch):
     from businessmap.full_synthesis import FullBusinessSynthesis
     service, snapshot, run, _ = synthesis_project
@@ -189,44 +336,41 @@ def test_all_leaf_business_domains_survive_parent_reduction_and_keep_specific_ti
         kwargs["before_send"]()
         payload = json.loads(user)
         levels.append(payload["level"])
-        grouped = {}
-        for item in payload["items"]:
-            name = item["title"] if payload["level"] == 0 else "赛事经营"
-            grouped.setdefault(name, []).append(item["module_id"])
-        return {"text": json.dumps({"domains": [{"name": name, "summary": f"{name}的业务职责", "module_ids": ids} for name, ids in grouped.items()], "flows": [], "unknowns": []}, ensure_ascii=False), "usage": {}}
+        return {"text": json.dumps({"assignments": [{"fact_id": item["fact_id"], "disposition": "public", "category": "rules",
+            "title": item["title"]} for item in payload["items"]]}, ensure_ascii=False), "usage": {}}
     monkeypatch.setattr(service.providers, "complete", complete)
     synthesis = FullBusinessSynthesis(service)
     synthesis.MAX_ITEMS = 4
     result = synthesis.build(snapshot, run, chunks)
-    assert max(levels) > 0  # A broad parent layer must not erase its children.
-    assert {domain["name"] for domain in result["domains"]} == set(topics)
-    assert len(result["domains"]) == 15
-    for index, name in enumerate(topics):
-        assert f"### {name}\n" in result["overview_body"]
-        assert result["module_titles"][f"module-{index}"] == name
-        assert f"[[module:module-{index}|{name}]]" in result["overview_body"]
-    assert "src/technical" not in result["overview_body"]
+    assert {document["title"] for document in result["public_documents"]} == set(topics)
+    assert len(result["public_documents"]) == 15
+    text = "\n".join(document["body"] for document in result["public_documents"])
+    for chunk in chunks:
+        assert chunk["result"]["findings"][0]["text"] in text
+    assert len(result["semantic_coverage"]["claims"]) == len(chunks) * 2
+    assert "src/technical" not in text and "module:" not in result["overview_body"]
 
 
 def test_full_permitted_schema_has_sufficient_bounded_output_budget(synthesis_project, monkeypatch):
     from businessmap.full_synthesis import FullBusinessSynthesis
     service, snapshot, run, chunks = synthesis_project
+    for chunk in chunks:
+        chunk["result"]["summary"] += "业务说明" * 30
     budgets = []
     def complete(system, user, **kwargs):
         kwargs["before_send"]()
         budgets.append(kwargs["max_output"])
         assert kwargs["max_output"] == 6000
         payload = json.loads(user)
-        ids = [item["module_id"] for item in payload["items"]]
-        result = {"domains": [{"name": f"领域{index}" + "名" * 37, "summary": "业" * 140, "module_ids": ids} for index in range(8)],
-                  "flows": [{"text": str(index) + "流" * 139, "module_ids": ids} for index in range(6)],
-                  "unknowns": [str(index) + "疑" * 139 for index in range(6)]}
+        result = {"assignments": [{"fact_id": item["fact_id"], "disposition": "public", "category": "rules",
+                  "title": "业务主题" + str(item["position"])} for item in payload["items"]]}
         return {"text": json.dumps(result, ensure_ascii=False), "usage": {"output_tokens": 3100}, "output_limited": False}
     monkeypatch.setattr(service.providers, "complete", complete)
     result = FullBusinessSynthesis(service).build(snapshot, run, chunks)
-    assert result["complete"] and len(result["domains"]) == 8
+    assert result["complete"] and len(result["public_documents"]) == 93
     assert result["usage"]["output_tokens"] == len(budgets) * 3100
-    assert all(str(index) + "疑" * 139 in result["overview_body"] for index in range(6))
+    text = "\n".join(document["body"] for document in result["public_documents"])
+    assert "业务说明" * 30 in text
 
 
 def test_output_limited_synthesis_stops_without_cache_or_automatic_retry(synthesis_project, monkeypatch):
@@ -239,19 +383,18 @@ def test_output_limited_synthesis_stops_without_cache_or_automatic_retry(synthes
     monkeypatch.setattr(service.providers, "complete", limited)
     synthesis = FullBusinessSynthesis(service)
     synthesis.CONCURRENCY = 1
-    with pytest.raises(ToolError, match="6000"):
+    with pytest.raises(ToolError) as error:
         synthesis.build(snapshot, run, chunks)
+    assert error.value.reason_code == "output_limit"
     assert len(calls) == 1
     with service.store._db() as db:
         assert db.execute("SELECT count(*) FROM full_analysis_synthesis").fetchone()[0] == 0
 
 
 def _semantic_answer(payload):
-    first = payload["items"][0]
-    name = "业务" + first["chunk_id"].split("-")[-1].zfill(2) if payload["level"] == 0 else "项目总览"
-    return {"text": json.dumps({"domains": [{"name": name, "summary": "保留业务条件。", "module_ids": [item["module_id"] for item in payload["items"]]}],
-                               "flows": [], "unknowns": []}, ensure_ascii=False),
-            "usage": {"input_tokens": 7, "output_tokens": 3}}
+    return {"text": json.dumps({"assignments": [{"fact_id": item["fact_id"], "disposition": "public", "category": "rules",
+        "title": "业务" + item["chunk_id"].split("-")[-1].zfill(2)} for item in payload["items"]]}, ensure_ascii=False),
+        "usage": {"input_tokens": 7, "output_tokens": 3}}
 
 
 def test_synthesis_runs_bounded_parallel_requests_and_aggregates_usage(synthesis_project, monkeypatch):
@@ -290,15 +433,16 @@ def test_reverse_completion_preserves_serial_business_order_and_cache_fingerprin
     from businessmap.full_synthesis import FullBusinessSynthesis
     service, snapshot, run, chunks = synthesis_project
     parallel = False
-    barriers = [threading.Barrier(4), threading.Barrier(4)]
-    completed, events, lock = [], [threading.Event() for _ in range(8)], threading.Lock()
+    batch_count = (sum(1 + len(chunk["result"]["findings"]) + len(chunk["result"]["unknowns"]) for chunk in chunks) + 3) // 4
+    barriers = [threading.Barrier(min(4, batch_count - start)) for start in range(0, batch_count, 4)]
+    completed, events, lock = [], [threading.Event() for _ in range(batch_count)], threading.Lock()
     def complete(system, user, **kwargs):
         kwargs["before_send"]()
         payload = json.loads(user)
         if parallel and payload["level"] == 0:
-            index = int(payload["items"][0]["chunk_id"].split("-")[-1]) // 4
+            index = payload["items"][0]["position"] // 4
             barriers[index // 4].wait(timeout=3)
-            if index % 4 != 3:
+            if index % 4 != min(4, batch_count - index // 4 * 4) - 1:
                 assert events[index + 1].wait(timeout=3)
             with lock:
                 completed.append(index)
@@ -317,7 +461,7 @@ def test_reverse_completion_preserves_serial_business_order_and_cache_fingerprin
     result = synthesis.build(snapshot, run, chunks)
     assert completed[:4] == [3, 2, 1, 0]
     assert result["overview_body"] == serial["overview_body"]
-    assert result["domains"] == serial["domains"] and result["module_titles"] == serial["module_titles"]
+    assert result["public_documents"] == serial["public_documents"] and result["semantic_coverage"] == serial["semantic_coverage"]
     with service.store._db() as db:
         assert {row[0] for row in db.execute("SELECT cache_key FROM full_analysis_synthesis")} == serial_keys
 
@@ -331,7 +475,7 @@ def test_parallel_failure_or_pause_stops_new_dispatch_drains_and_reuses_cache(sy
     def complete(system, user, **kwargs):
         kwargs["before_send"]()
         payload = json.loads(user)
-        index = int(payload["items"][0]["chunk_id"].split("-")[-1]) // 4
+        index = payload["items"][0]["position"] // 4
         with sent_lock:
             sent.append(index)
         barrier.wait(timeout=3)
@@ -364,7 +508,7 @@ def test_parallel_failure_or_pause_stops_new_dispatch_drains_and_reuses_cache(sy
         kwargs["before_send"]()
         payload = json.loads(user)
         if payload["level"] == 0:
-            resumed.append(int(payload["items"][0]["chunk_id"].split("-")[-1]) // 4)
+            resumed.append(payload["items"][0]["position"] // 4)
         return _semantic_answer(payload)
     monkeypatch.setattr(service.providers, "complete", recover)
     assert synthesis.build(snapshot, run, chunks)["complete"]
@@ -382,10 +526,11 @@ def test_identical_inflight_inputs_share_one_paid_dispatch(synthesis_project, mo
             calls.append(user)
         time.sleep(0.1)
         payload = json.loads(user)
-        return {"text": json.dumps({"domains": [{"name": "订单", "summary": "相同输入归纳。", "module_ids": [item["module_id"] for item in payload["items"]]}], "flows": [], "unknowns": []}), "usage": {"input_tokens": 7, "output_tokens": 3}}
+        return {"text": json.dumps({"assignments": [{"fact_id": item["fact_id"], "disposition": "public", "category": "rules",
+            "title": "订单"} for item in payload["items"]]}), "usage": {"input_tokens": 7, "output_tokens": 3}}
     monkeypatch.setattr(service.providers, "complete", complete)
     synthesis = FullBusinessSynthesis(service)
-    batch = [{"title": "订单", "summary": "相同业务输入。", "findings_texts": [], "unknowns": [], "_module_ids": ["module-0"]}]
+    batch = [{"kind": "finding", "text": "相同业务输入。", "_fact_id": "stable-fact", "_module_ids": ["module-0"]}]
     usage = {"requests": 0, "cache_hits": 0, "input_tokens": 0, "output_tokens": 0}
     results = synthesis._level_results(snapshot, run, [batch] * 8, 1, usage)
     assert len(calls) == 1 and len(results) == 8

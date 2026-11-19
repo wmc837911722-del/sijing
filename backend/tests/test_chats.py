@@ -59,14 +59,14 @@ def repository(store, name):
     commit = ("a" if name == "first" else "b") * 40
     store._write_repo({"id": repo_id, "name": name, "vault_path": str(store.vault), "commit": commit,
                        "status": "ready", "auto_sync": False, "url": "fixture", "path": "fixture"})
-    path = f"业务地图/{repo_id}/rules.md"
+    path = f"业务/订单/{name}/规则.md"
     saved = store.save_note(path, f"# 订单业务规则 {name}\n订单规则 {name}-only-evidence\n")
     store.config_set(f"ai_analysis:{repo_id}", {"notes": {"rules": {
         "path": path, "commit": commit, "revision": saved["revision"], "stale": False, "conflict": False}}})
-    store.save_note(f"代码索引/{repo_id}/fixture.md", f"# 订单代码 {name}\nsource_commit: older-unchanged-blob\n")
-    store.save_note(f"代码索引/{repo_id}/版本-{commit[:12]}.md", "# 订单当前版本\n")
-    store.save_note(f"代码索引/{repo_id}/版本-old.md", "# 订单历史版本不可用于当前依据\n")
-    store.save_note(f"代码索引/{repo_id}/更新建议/proposal.md", "# 订单未确认建议不可用于当前依据\n")
+    store._write_note(f"代码索引/{repo_id}/fixture.md", f"# 订单代码 {name}\nsource_commit: older-unchanged-blob\n")
+    store._write_note(f"代码索引/{repo_id}/版本-{commit[:12]}.md", "# 订单当前版本\n")
+    store._write_note(f"代码索引/{repo_id}/版本-old.md", "# 订单历史版本不可用于当前依据\n")
+    store._write_note(f"代码索引/{repo_id}/更新建议/proposal.md", "# 订单未确认建议不可用于当前依据\n")
     return repo_id
 
 
@@ -136,13 +136,13 @@ def test_repository_selection_scopes_real_notes_and_code_index(store, monkeypatc
     monkeypatch.setattr(tools.providers, "tool_turn", turn)
     response = tools.chat("订单", repository_id=first)
     assert len(response["sources"]) == 1  # Code inventories are locators, not business evidence.
-    assert all(f"/{first}/" in source["path"] for source in response["sources"])
+    assert all("/first/" in source["path"] for source in response["sources"])
     assert "first-only-evidence" in captured[0] and "older-unchanged-blob" not in captured[0]
     assert "second-only-evidence" not in captured[0] and "manual-outside-repository" not in captured[0]
     assert "未确认建议" not in captured[0] and "历史版本" not in captured[0]
-    assert "older-unchanged-blob" in tools.search("fixture", repository_id=first)[0]["content"]
+    assert tools.search("fixture", repository_id=first) == []
     unrestricted = tools.chat("订单")
-    assert any(f"/{second}/" in source["path"] for source in unrestricted["sources"])
+    assert any("/second/" in source["path"] for source in unrestricted["sources"])
     assert any(source["path"] == "手工/订单.md" for source in unrestricted["sources"])
 
 
@@ -265,6 +265,7 @@ def test_crashed_pending_request_recovers_on_reload(store):
 
 def test_progress_is_live_persisted_and_cancel_survives_concurrent_receipts(store, monkeypatch):
     primary = ToolsService(store)
+    store.save_note("业务/规则.md", "# 规则\n退款需要审批。\n")
     second_store = Store(store.data_dir)
     secondary = ToolsService(second_store)
     session = primary.chats.create()

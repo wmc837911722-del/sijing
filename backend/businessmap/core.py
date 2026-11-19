@@ -45,112 +45,113 @@ def slug(value: str) -> str:
 DEMO_NOTES = {
     "开始阅读.md": """---
 title: 业务知识库 · 示例空间
-type: overview
-tags: [示例, 开始]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 业务知识库 · 示例空间
 
-> **演示内容**：这里的电商流程与数据库都是本地生成的示例，不来自你的真实代码或业务数据。
-
-这个空间由真实的 Markdown 文件组成。你可以编辑笔记、使用 `[[双向链接]]`，也可以用其他编辑器修改文件。
+> 演示内容：这里的电商流程和示例数据不来自你的真实业务。
 
 从 [[业务/订单流程]] 开始，沿着 [[业务/支付与成交额]]、[[业务/退款规则]] 探索业务。
 
-[[数据/订单表]] 与 [[数据/退款表]] 说明了本地示例数据库的字段。要使用自己的业务知识，请接入仓库，或打开自己的知识库目录。
-
-仓库接入先生成明确标记的代码文件索引。选择并配置模型后，才可主动发起 AI 业务分析。
+知识库中的业务文档可以编辑，并通过双向链接互相连接。接入项目并完成分析后，可阅读自己的业务地图。
 """,
     "业务/订单流程.md": """---
 title: 订单流程
-type: process
-tags: [示例, 订单]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 订单流程
 
-> 示例业务规则，不代表真实项目。
+> 示例业务，不代表真实项目。
 
-订单的示例状态为 `pending`（待支付）、`paid`（已支付）、`completed`（已完成）、`cancelled`（已取消）。
+创建订单 → 等待支付 → 已支付 → 完成订单。未完成的订单可以取消，已取消订单不计入有效销售。
 
-创建订单 → 等待支付 → [[业务/支付与成交额]] → 完成订单。已取消订单不计入有效销售。
-
-订单保存在 [[数据/订单表]]。退款流程见 [[业务/退款规则]]。
+支付及收入说明见 [[业务/支付与成交额]]。退款流程见 [[业务/退款规则]]，订单信息见 [[数据/订单表]]。
 """,
     "业务/支付与成交额.md": """---
 title: 支付与成交额
-type: rule
-tags: [示例, 支付, 统计口径]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 支付与成交额
 
-> 示例统计口径；上线使用前应由实际代码和业务负责人确认。
+> 示例统计口径，实际使用前应由业务负责人确认。
 
-示例成交额为状态 `paid` 或 `completed` 的订单 `amount` 之和，金额单位为人民币元。
+成交额为已支付或已完成订单的金额之和，单位为人民币元。
 
-示例净成交额 = 成交额 − 状态 `completed` 的退款金额。退款按退款记录的创建时间统计时，与按原订单时间统计的口径不同，查询时需明确。
+净成交额为成交额减去已完成退款的金额。按退款发生时间统计，与按原订单创建时间统计可能得出不同结果，必须明确时间范围。
 
-数据来自 [[数据/订单表]] 和 [[数据/退款表]]，业务背景见 [[业务/订单流程]] 与 [[业务/退款规则]]。
+数据含义见 [[数据/订单表]] 和 [[数据/退款表]]，业务背景见 [[业务/订单流程]] 与 [[业务/退款规则]]。
 """,
     "业务/退款规则.md": """---
 title: 退款规则
-type: rule
-tags: [示例, 退款]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 退款规则
 
-> 这是人工编写的演示规则，不是 AI 对真实仓库的分析结论。
+> 人工编写的演示规则，不代表真实项目分析结论。
 
-示例中已支付或已完成的订单可以提交退款申请。退款状态 `pending` 表示处理中，`completed` 表示退款完成。
+已支付或已完成的订单可以提交退款申请。退款处理中不扣减净成交额，退款完成后才扣减。
 
-退款金额应不超过对应订单支付金额；同一订单可能存在多条退款记录，因此汇总时应先按订单聚合退款，避免 JOIN 导致金额重复。
+退款金额不能超过对应订单的支付金额。同一订单可能存在多笔退款，关联订单前应先汇总该订单的退款，避免收入重复计算。
 
-关联：[[业务/订单流程]]、[[业务/支付与成交额]]、[[数据/退款表]]。
+关联 [[业务/订单流程]]、[[业务/支付与成交额]]、[[数据/退款表]]。
 """,
     "数据/订单表.md": """---
 title: 订单表
-type: entity
-tags: [示例, 数据模型]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 订单表
 
-> 本地示例数据库的 `orders` 表，无真实客户数据。
+> 本地演示数据，没有真实客户信息。
 
-| 字段 | 含义 |
-| --- | --- |
-| id | 订单编号 |
-| status | pending / paid / completed / cancelled |
-| channel | web / app / store |
-| amount | 金额（人民币元） |
-| created_at | 创建时间，示例固定为 2026 年 9 月 |
+每笔订单记录订单编号、业务状态、下单渠道、金额和创建时间。金额单位为人民币元；示例渠道包含线上、应用和门店，示例创建时间固定在九月。
 
-业务说明：[[业务/订单流程]]、[[业务/支付与成交额]]。通过 `orders.id = refunds.order_id` 关联 [[数据/退款表]]。
+订单可处于待支付、已支付、已完成或已取消状态。状态与收入关系见 [[业务/支付与成交额]]。
+
+业务流程见 [[业务/订单流程]]，订单对应的退款见 [[数据/退款表]]。
 """,
     "数据/退款表.md": """---
 title: 退款表
-type: entity
-tags: [示例, 数据模型]
-demo: true
+type: business
+content_role: business_knowledge
+tags: [示例]
 ---
+
 # 退款表
 
-> 本地示例数据库的 `refunds` 表。
+> 本地演示数据，没有真实客户信息。
 
-| 字段 | 含义 |
-| --- | --- |
-| id | 退款编号 |
-| order_id | 对应 orders.id |
-| amount | 退款金额（人民币元） |
-| status | pending / completed |
-| created_at | 退款记录创建时间 |
+每笔退款记录退款编号、对应订单、退款金额、退款状态和创建时间。同一订单可能有多笔退款。
 
-关联 [[数据/订单表]]，规则见 [[业务/退款规则]]。仅已完成退款计入示例 [[业务/支付与成交额|净成交额]] 扣减。
+只有已完成的退款计入净成交额扣减，处理中的退款不扣减。
+
+关联 [[数据/订单表]]，规则见 [[业务/退款规则]]。业务统计口径见 [[业务/支付与成交额]]。
 """,
 }
 
+# Original shipped demo bytes on Unix and Windows, respectively.
+LEGACY_DEMO_DIGESTS = {
+    "开始阅读.md": ("fd397f79fa15c72527b28cbbce16bb588ec79128285c5b64b1580012bb381df6", "f7388da84557d067dbdc19260801c8fc336e44010f22145afca0f816d2f653e2"),
+    "业务/订单流程.md": ("ce0351527fa102031cf6d3bcb6ee1ce5e6775094dc11ed696a5098026512e5be", "163595d9c28cb70d974f2af5236ccfe5e1649c150bcc4a4cb54f038e968c030e"),
+    "业务/支付与成交额.md": ("ee3cecfca27ae11442baa72e0de55b7cc2d02bc37d44fe0c1f9970f862968b80", "c0cd6f03e294c2ad4768500cb80a566f7074c696572fd988526ef94c12efbb1e"),
+    "业务/退款规则.md": ("2ad88febf293f45e78009d0a6ddd11ea48ef26b3baa45458a7da1e9081e30eee", "2f2f5c740591a1c12d2b7d1c35c95ed5d45784c544b25dbe39b627a67e8544bb"),
+    "数据/订单表.md": ("da3f8e3f310080320b698581895f80f8089bcc528a136d5e6a7bc88999bea6c6", "8347dce36c437ade625e69ea4017a98c8dae46b5c523f271ee1bcd2cc67dc907"),
+    "数据/退款表.md": ("48c5ba7228aa8a7dc54fb57c3d32158f3862af4cd722d221390a65d665587eba", "29efd3d8aab79283c9335ee8131473c75ad1d1d3f734efb73421ca61f790a523"),
+}
 
 class Store:
     MAX_NOTE_BYTES = 2 * 1024 * 1024
@@ -160,7 +161,7 @@ class Store:
         ".cs", ".php", ".rb", ".vue", ".sql", ".prisma", ".graphql", ".proto",
     }
 
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str | Path, *, refresh_index_on_init: bool = True):
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -199,7 +200,8 @@ class Store:
                 self.config_set("demo_vault_path", str(self.vault))
                 self.activity("示例知识库已创建", "所有业务笔记和数据库均为演示数据", "success")
         self._init_demo_db()
-        self.refresh()
+        if refresh_index_on_init:
+            self.refresh()
         from .git_transport import GitTransport
         self.git_transport = GitTransport(self)
 
@@ -322,9 +324,24 @@ class Store:
             "excerpt": excerpt, "content": content, "revision": revision(content),
         }
 
+    def _is_default_demo_vault(self, vault: Path) -> bool:
+        return vault == self.data_dir / "vault" and self.config_get("demo_vault_path") == str(vault)
+
+    def _index_note(self, target: Path, name: str, modified: float, demo_seed: bool) -> dict:
+        if demo_seed:
+            digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if digest in LEGACY_DEMO_DIGESTS[name]:
+                note = self._summarize(name, DEMO_NOTES[name], modified)
+                # The editor displays the current example but owns only the
+                # version of the original file that was actually read.
+                note["revision"] = digest
+                return note
+        return self._summarize(name, target.read_text(encoding="utf-8-sig"), modified)
+
     def refresh(self) -> None:
         with self._lock:
             vault = self.vault
+            demo_vault = self._is_default_demo_vault(vault)
             signature = {}
             for target in vault.rglob("*.md"):
                 relative = target.relative_to(vault)
@@ -337,11 +354,11 @@ class Store:
                     if stat.st_size > self.MAX_NOTE_BYTES:
                         continue
                     name = relative.as_posix()
-                    fingerprint = (stat.st_mtime_ns, stat.st_size)
+                    demo_seed = demo_vault and name in LEGACY_DEMO_DIGESTS
+                    fingerprint = (stat.st_mtime_ns, stat.st_size, demo_seed)
                     signature[name] = fingerprint
                     if self._signature.get(name) != fingerprint:
-                        content = target.read_text(encoding="utf-8-sig")
-                        self._cache[name] = self._summarize(name, content, stat.st_mtime)
+                        self._cache[name] = self._index_note(target, name, stat.st_mtime, demo_seed)
                 except (OSError, UnicodeError):
                     continue
             # A separate process can select another vault while this scan runs.
@@ -363,12 +380,103 @@ class Store:
     def _summary(note: dict) -> dict:
         return {key: value for key, value in note.items() if key not in {"content", "revision"}}
 
+    @staticmethod
+    def _public_business_metadata(note: dict) -> dict | None:
+        from .content_layout import is_source_document
+        from .business_content import public_business_metadata, validate_public_business_text
+        from .providers import ToolError
+        if is_source_document(note):
+            return None
+        try:
+            validate_public_business_text(note["path"])
+            validate_public_business_text(note["title"])
+            return public_business_metadata(note.get("content", ""))
+        except ToolError:
+            return None
+
+    @staticmethod
+    def public_business_note(note: dict) -> bool:
+        return Store._public_business_metadata(note) is not None
+
+    def business_owner_index(self) -> dict:
+        """One request-scoped ownership/version snapshot, never a global cache."""
+        vault = str(self.vault)
+        with self._lock, self._db() as db:
+            db.execute("BEGIN")
+            rows = db.execute("SELECT key,value FROM config WHERE key LIKE 'project_analysis:%' OR key LIKE 'ai_analysis:%'").fetchall()
+            project_row = db.execute("SELECT value FROM config WHERE key='business_projects'").fetchone()
+            projects = json.loads(project_row[0]) if project_row else []
+            repositories = [json.loads(row[0]) for row in db.execute("SELECT data FROM repositories")]
+        context = {"vault_path": vault,
+                   "projects": {project["id"]: project for project in projects if project.get("vault_path") == vault},
+                   "repositories": {repo["id"]: repo for repo in repositories if repo.get("vault_path") == vault}}
+        index = {"path": {}, "revision": {}}
+        for config_key, value in rows:
+            state = json.loads(value)
+            if state.get("vault_path") not in (None, vault):
+                continue
+            kind, owner_id = config_key.split(":", 1)
+            for key, entry in state.get("notes", {}).items():
+                owner = {"kind": kind, "id": owner_id, "key": key, "state": state, "entry": entry, "context": context}
+                if entry.get("path"):
+                    index["path"].setdefault(entry["path"], []).append(owner)
+                if entry.get("revision"):
+                    index["revision"].setdefault(entry["revision"], []).append(owner)
+        if str(self.vault) != vault:
+            raise CoreError(409, "知识库已切换，请重新读取业务资料")
+        return index
+
+    def business_note_owners(self, note: dict, index: dict | None = None) -> list[dict]:
+        """Private ownership survives removing public YAML or moving unchanged files."""
+        if "_business_owners" in note:
+            return note["_business_owners"]
+        index = self.business_owner_index() if index is None else index
+        owners = list(index["path"].get(note["path"], []))
+        known = {(owner["kind"], owner["id"], owner["key"]) for owner in owners}
+        for owner in index["revision"].get(note.get("revision"), []):
+            if (owner["kind"], owner["id"], owner["key"]) not in known:
+                owners.append(owner)
+        return owners
+
+    def current_business_note(self, note: dict, owners: list[dict] | None = None) -> bool:
+        meta = self._public_business_metadata(note)
+        if meta is None:
+            return False
+        owners = self.business_note_owners(note) if owners is None else owners
+        if not owners:
+            # A generated marker with no private owner can never become manual evidence.
+            return meta.get("generated") is not True
+        for owner in owners:
+            state, entry = owner["state"], owner["entry"]
+            if (entry.get("revision") != note.get("revision") or entry.get("stale") or entry.get("conflict")):
+                return False
+            try:
+                if owner["kind"] == "project_analysis":
+                    project = owner["context"]["projects"][owner["id"]]
+                    if state.get("project_revision") != project["revision"]:
+                        return False
+                    expected = {rid: owner["context"]["repositories"][rid].get("commit") for rid in project["repository_ids"]}
+                    sources = entry.get("source_repositories", state.get("source_repositories", []))
+                    actual = {source["repository_id"]: source["commit"] for source in sources}
+                    if len(actual) != len(sources) or actual != expected:
+                        return False
+                else:
+                    repository = owner["context"]["repositories"][owner["id"]]
+                    sources = entry.get("source_repositories")
+                    actual = ({source["repository_id"]: source["commit"] for source in sources} if sources else
+                              {owner["id"]: entry.get("commit", state.get("last_analyzed_commit"))})
+                    if (sources and len(actual) != len(sources)) or actual != {owner["id"]: repository.get("commit")}:
+                        return False
+            except (CoreError, KeyError, TypeError):
+                return False
+        return True
+
     def notes(self, query: str = "") -> list[dict]:
         self.refresh()
         with self._lock:
             terms = query.casefold().split()
             result = [self._summary(note) for note in self._cache.values()
-                      if all(term in (note["title"] + " " + note["content"] + " " + note["path"]).casefold() for term in terms)]
+                      if self.public_business_note(note) and all(term in (note["title"] + " " + note["content"] + " " + note["path"]).casefold() for term in terms)]
             return sorted(result, key=lambda item: (item["updated_at"], item["path"]), reverse=True)
 
     def _links(self, source: str, content: str) -> list[str]:
@@ -395,12 +503,12 @@ class Store:
         self._path(path)
         self.refresh()
         with self._lock:
-            if path not in self._cache:
-                raise CoreError(404, "笔记不存在或不是可读取的 UTF-8 Markdown 文件")
+            if path not in self._cache or not self.public_business_note(self._cache[path]):
+                raise CoreError(404, "业务文档不存在或不在公开读取范围内")
             note = dict(self._cache[path])
-            note["links"] = [self._summary(self._cache[name]) for name in self._links(path, note["content"])]
+            note["links"] = [self._summary(self._cache[name]) for name in self._links(path, note["content"]) if self.public_business_note(self._cache[name])]
             note["backlinks"] = [self._summary(other) for name, other in self._cache.items()
-                                 if name != path and path in self._links(name, other["content"])]
+                                 if name != path and self.public_business_note(other) and path in self._links(name, other["content"])]
             return note
 
     def _write_note(self, path: str, content: str, revision: str | None = None,
@@ -413,9 +521,13 @@ class Store:
             if vault is not None and selected != vault:
                 raise CoreError(409, "知识库已切换，请重新发起仓库同步")
             target = self._path(path, vault=selected)
+            demo_revision = revision in LEGACY_DEMO_DIGESTS.get(path, ()) and self._is_default_demo_vault(selected)
+            def disk_revision():
+                if demo_revision:
+                    return hashlib.sha256(target.read_bytes()).hexdigest()
+                return globals()["revision"](target.read_text(encoding="utf-8-sig"))
             if target.exists():
-                current = target.read_text(encoding="utf-8-sig")
-                if revision is None or globals()["revision"](current) != revision:
+                if revision is None or disk_revision() != revision:
                     raise CoreError(409, "笔记已变化，请重新读取并合并修改后保存")
             elif revision is not None:
                 raise CoreError(409, "笔记已被删除，请重新确认后创建")
@@ -426,8 +538,7 @@ class Store:
                 temporary.write_text(content, encoding="utf-8", newline="")
                 if self.vault != selected:
                     raise CoreError(409, "知识库已切换，请重新读取后保存")
-                current_revision = (globals()["revision"](target.read_text(encoding="utf-8-sig"))
-                                    if target.exists() else None)
+                current_revision = disk_revision() if target.exists() else None
                 if current_revision != revision:
                     raise CoreError(409, "保存期间笔记发生外部变化，请重新读取")
                 temporary.replace(target)
@@ -437,6 +548,17 @@ class Store:
             return globals()["revision"](content)
 
     def save_note(self, path: str, content: str, revision: str | None = None) -> dict:
+        from .business_content import validate_public_business_text
+        from .providers import ToolError
+        from .content_layout import is_source_document
+        self._path(path)
+        if is_source_document({"path": path}):
+            raise CoreError(422, "此目录仅供内部资料管理，不能保存公开业务文档。")
+        try:
+            validate_public_business_text(path)
+            validate_public_business_text(content)
+        except ToolError as error:
+            raise CoreError(error.status_code, error.message) from None
         with self._lock:
             self._write_note(path, content, revision)
             self.refresh()
@@ -459,7 +581,7 @@ class Store:
         self.refresh()
         from .content_layout import is_source_document
         with self._lock:
-            visible = {path: note for path, note in self._cache.items() if not is_source_document(note)}
+            visible = {path: note for path, note in self._cache.items() if self.public_business_note(note)}
             return {
                 "nodes": [{key: note[key] for key in ("id", "title", "type", "tags")} for note in visible.values()],
                 "edges": [{"source": name, "target": dest} for name, note in visible.items()
@@ -501,8 +623,17 @@ class Store:
             db.execute("DELETE FROM activities WHERE rowid NOT IN (SELECT rowid FROM activities ORDER BY rowid DESC LIMIT 200)")
 
     def activities(self) -> list[dict]:
+        from .business_content import validate_public_business_text
+        from .providers import ToolError
         with self._lock, self._db() as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT data FROM activities ORDER BY rowid DESC LIMIT 50")]
+            activities = [json.loads(row[0]) for row in db.execute("SELECT data FROM activities ORDER BY rowid DESC LIMIT 50")]
+        for activity in activities:
+            for key in ("title", "detail"):
+                try:
+                    validate_public_business_text(activity.get(key, ""))
+                except ToolError:
+                    activity[key] = "后台维护记录" if key == "title" else "后台资料已更新；内部技术信息不在业务界面展示。"
+        return activities
 
     def repositories(self) -> list[dict]:
         with self._lock, self._db() as db:
@@ -579,8 +710,8 @@ class Store:
         projects = self.projects()
         from .content_layout import is_source_document
         with self._lock:
-            note_count = len(self._cache)
-            source_count = sum(is_source_document(note) for note in self._cache.values())
+            note_count = sum(self.public_business_note(note) for note in self._cache.values())
+            source_count = 0
         return {"name": "业务知识库", "vault_path": str(self.vault), "version": self.version,
                 "demo": self.config_get("demo_vault_path") == str(self.vault),
                 "stats": {"notes": note_count, "business_notes": note_count - source_count,
@@ -800,14 +931,14 @@ class Store:
             changed_paths = None
             if commit != repo.get("commit"):
                 all_files = self._source_files(repo, commit)
-                files = all_files[:self.MAX_REPO_FILES]
-                with self._db() as db:
-                    previous = dict(db.execute("SELECT source_path,blob FROM managed_notes WHERE repository_id=?", (repo_id,)))
+                files = all_files
+                previous_index = self.config_get(f"repository_file_index:{repo_id}", {})
+                previous = {item["path"]: item["blob"] for item in previous_index.get("files", [])}
                 current = {item["path"]: item["blob"] for item in files}
                 changed_paths = sorted(name for name in previous.keys() | current.keys() if previous.get(name) != current.get(name))
                 self.update_task(task_id, 35, "正在更新代码文件索引（未调用 AI）")
                 self._publish_code_index(repo, commit, files, len(all_files), task_id)
-                self.activity("代码索引已更新", f"{repo['name']} · {commit[:8]} · {len(files)} 个源文件；未进行 AI 业务分析", "success")
+                self.activity("后台资料已更新", "业务知识将在主动分析完成后更新。", "success")
             repo.update(branch=branch, commit=commit, status="ready", last_sync=now(), last_error=None)
             self._write_repo(repo)
             self.update_task(task_id, 95, "索引完成")
@@ -824,78 +955,16 @@ class Store:
 
     def _publish_code_index(self, repo: dict, commit: str, files: list[dict], total: int,
                             task_id: str | None = None) -> None:
-        from .content_layout import source_note_path
+        """Store source discovery metadata privately; Git sync never publishes Markdown."""
         vault = Path(repo["vault_path"]).resolve()
         with self._lock:
             if self.vault != vault:
                 raise CoreError(409, "知识库已切换，请重新发起仓库同步")
-            with self._db() as db:
-                existing = {row[0]: {"note_path": row[1], "blob": row[2], "revision": row[3]}
-                            for row in db.execute("SELECT source_path,note_path,blob,revision FROM managed_notes WHERE repository_id=?", (repo["id"],))}
-        new_paths = {item["path"] for item in files}
-        preserved = []
-        written = 0
-        for old, info in existing.items():
-            if old in new_paths:
-                continue
-            with self._lock:
-                if self.vault != vault:
-                    raise CoreError(409, "知识库已切换，请重新发起仓库同步")
-                target = self._path(info["note_path"], vault=vault)
-                if target.exists():
-                    content = target.read_text(encoding="utf-8-sig")
-                    if revision(content) == info["revision"]:
-                        target.unlink()
-                    else:
-                        preserved.append(old)
-                        marker = "\n\n> 系统提示：源文件已删除、重命名或不再属于当前索引范围；本笔记因包含人工修改而保留。\n"
-                        if marker not in content:
-                            self._write_note(info["note_path"], content + marker, revision(content), vault=vault)
-                            written += 1
-                with self._db() as db:
-                    db.execute("DELETE FROM managed_notes WHERE repository_id=? AND source_path=?", (repo["id"], old))
-        links = []
-        for index, item in enumerate(files, 1):
-            source = item["path"]
-            old = existing.get(source)
-            note_path = source_note_path(repo["id"], hashlib.sha256(source.encode()).hexdigest()[:16] + ".md")
-            links.append(f"- [[{note_path[:-3]}|{source}]]")
-            meta = yaml.safe_dump({"title": source, "type": "code", "tags": ["代码索引", "非AI分析"],
-                                   "source_path": source, "source_commit": commit, "repository_id": repo["id"]},
-                                  allow_unicode=True, sort_keys=False).strip()
-            content = f"---\n{meta}\n---\n# {source}\n\n> 自动生成的代码文件索引，**不是 AI 业务分析结论**。\n\n- 仓库：{repo['name']}\n- 源文件：`{source}`\n- 提交：`{commit}`\n- 文件大小：{item['size']} 字节\n\n请在仓库面板主动发起 AI 分析，或人工补充业务含义。\n"
-            with self._lock:
-                if self.vault != vault:
-                    raise CoreError(409, "知识库已切换，请重新发起仓库同步")
-                target = self._path(note_path, vault=vault)
-                if not (old and old["blob"] == item["blob"] and target.exists()):
-                    previous = target.read_text(encoding="utf-8-sig") if target.exists() else None
-                    if previous is not None and (not old or revision(previous) != old["revision"]):
-                        preserved.append(source)
-                        proposal = source_note_path(repo["id"], f"更新建议/{hashlib.sha256(source.encode()).hexdigest()[:16]}-{commit[:8]}.md")
-                        if not self._path(proposal, vault=vault).exists():
-                            self._write_note(proposal, content + f"\n原笔记包含人工修改，未覆盖：[[{note_path[:-3]}]]。\n", vault=vault)
-                            written += 1
-                    else:
-                        saved_revision = self._write_note(note_path, content, revision(previous) if previous is not None else None, vault=vault)
-                        written += 1
-                        with self._db() as db:
-                            db.execute("INSERT OR REPLACE INTO managed_notes VALUES (?,?,?,?,?)",
-                                       (repo["id"], source, note_path, item["blob"], saved_revision))
-            if task_id and (index % 10 == 0 or index == len(files)):
-                self.update_task(task_id, 35 + 55 * index // len(files),
-                                 f"已处理 {index} / {len(files)} 个源文件，写入 {written} 篇笔记（未调用 AI）")
-        # Each commit has an immutable summary so manual edits are never overwritten.
-        summary_path = source_note_path(repo["id"], f"版本-{commit[:12]}.md")
-        with self._lock:
-            if self.vault != vault:
-                raise CoreError(409, "知识库已切换，请重新发起仓库同步")
-            if not self._path(summary_path, vault=vault).exists():
-                text = f"# {repo['name']} · 代码索引 {commit[:8]}\n\n> 非 AI 分析：这里只记录 Git 提交中的文件清单，不推断业务规则。\n\n版本：`{commit}`\n\n已索引 {len(files)} / {total} 个符合条件的源文件。排除隐藏、敏感命名、依赖目录和大文件。\n\n" + "\n".join(links)
-                if preserved:
-                    text += "\n\n## 保留人工编辑\n\n以下笔记包含人工修改，未覆盖；变化内容另存更新建议或保留删除提示：\n" + "\n".join(f"- `{name}`" for name in preserved)
-                self._write_note(summary_path, text + "\n", vault=vault)
-            self.refresh()
+            self.config_set(f"repository_file_index:{repo['id']}", {
+                "vault_path": str(vault), "commit": commit, "files": files,
+                "total_files": total, "updated_at": now()})
+        if task_id:
+            self.update_task(task_id, 90, f"已更新 {len(files)} 个文件的私有索引；未发布业务文档")
 
     def repository_context(self, repo_id: str) -> dict:
         repo = self.get_repository(repo_id)

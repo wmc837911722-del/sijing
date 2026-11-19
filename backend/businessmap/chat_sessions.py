@@ -64,12 +64,23 @@ class ChatSessions:
             raise ToolError("会话不存在于当前知识库。", 404)
         return session
 
-    @staticmethod
-    def _public(session):
+    def _public(self, session):
         result = {key: value for key, value in session.items() if not key.startswith("_")}
         result.setdefault("project_id", None)
-        result["messages"] = [{key: value for key, value in message.items() if not key.startswith("_")}
-                              for message in session["messages"]]
+        result["title"] = self.service.public_text(result.get("title", ""), "业务对话")
+        result["messages"] = []
+        context = {}
+        for message in session["messages"]:
+            item = {key: value for key, value in message.items() if not key.startswith("_")}
+            item["content"] = self.service.public_text(item.get("content", ""))
+            if "error" in item:
+                item["error"] = self.service.public_text(item["error"], "回复未完成，请重试。")
+            if "sources" in item:
+                item["sources"] = self.service.public_sources(item["sources"], context)
+            if "activities" in item:
+                item["activities"] = self.service.public_activities(item["activities"], context)
+            result["messages"].append(item)
+        result["pending_activity"] = self.service.public_activities(session.get("pending_activity", []), context)
         return result
 
     @staticmethod
@@ -110,8 +121,13 @@ class ChatSessions:
             if entry.get("pending"):
                 self.get(entry["id"])
         entries = [entry for entry in self.store.config_get("chat_index", []) if entry.get("_vault_path") == vault]
-        return [{"project_id": None, **{key: value for key, value in entry.items() if not key.startswith("_")}}
-                for entry in sorted(entries, key=lambda item: item["updated_at"], reverse=True)]
+        result = []
+        for entry in sorted(entries, key=lambda item: item["updated_at"], reverse=True):
+            item = {"project_id": None, **{key: value for key, value in entry.items() if not key.startswith("_")}}
+            item["title"] = self.service.public_text(item.get("title", ""), "业务对话")
+            item["preview"] = self.service.public_text(item.get("preview", ""))
+            result.append(item)
+        return result
 
     def _recover(self, session):
         if session.get("pending"):
@@ -168,7 +184,8 @@ class ChatSessions:
             scope = self.service.history_scope(mode, repository_id, datasource_id, provider_id, project_id=project_id)
             history = []
             for previous in reversed(session["messages"]):
-                if previous.get("_scope") != scope or previous.get("error"):
+                if (previous.get("_scope") != scope or previous.get("error")
+                        or self.service.public_text(previous.get("content", ""), None) is None):
                     break
                 history.append({"role": previous["role"], "content": previous["content"][:2000]})
                 if len(history) == 8:
@@ -189,7 +206,10 @@ class ChatSessions:
                         if isinstance(receipt.get(key), str)}
                 if not all(item.get(key) for key in ("id", "tool", "label")) or item.get("status") not in ("running", "complete", "error"):
                     return
-                item = {key: value[:1000] for key, value in item.items()}
+                projected = self.service.public_activities([item])
+                if not projected:
+                    return
+                item = {key: value[:1000] for key, value in projected[0].items()}
 
                 def update(current):
                     activities = current.get("pending_activity", [])

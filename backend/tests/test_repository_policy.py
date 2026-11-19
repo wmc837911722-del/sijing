@@ -33,8 +33,11 @@ def repository(tools, name="company"):
                             "url": "fixture", "path": "fixture"})
     # This is business evidence. File inventories are now discovery-only and
     # deliberately cannot supply factual business answers.
-    path = f"01-Wiki/业务知识/{repo_id}/手工证据.md"
-    tools.store.save_note(path, f"---\nrepository_id: {repo_id}\n---\n# 订单 {name}\n{name}-private-evidence\n")
+    path = f"01-Wiki/{name}/手工证据.md"
+    note = tools.store.save_note(path, f"# 订单 {name}\n{name}-private-evidence\n")
+    tools.store.config_set(f"ai_analysis:{repo_id}", {"vault_path": str(tools.store.vault), "notes": {
+        "manual-evidence": {"path": path, "revision": note["revision"], "commit": "a" * 40,
+                            "source_paths": ["rules.py"], "stale": False, "conflict": False}}})
     return repo_id
 
 
@@ -169,7 +172,9 @@ def test_full_vault_chat_filters_unbound_wrong_model_and_moved_derived_notes(too
     secret, public, legacy = repository(tools), repository(tools, "public"), repository(tools, "legacy")
     tools.bind_model(secret, company["id"])
     tools.bind_model(public, other["id"])
-    tools.store.save_note("归档/订单.md", f"---\nrepository_id: {secret}\n---\n# 订单\ncompany-moved-secret\n")
+    moved = tools.store.save_note("归档/订单.md", "# 订单\ncompany-moved-secret\n")
+    tools.store.config_update(f"ai_analysis:{secret}", lambda state: {**state, "notes": {**state["notes"],
+        "moved": {"path": moved["path"], "revision": moved["revision"], "commit": "a" * 40, "stale": False, "conflict": False}}})
     tools.store.save_note("手工/订单.md", "# 订单\nmanual-allowed\n")
     requests = network(monkeypatch)
     reply = tools.chat("订单", provider_id=other["id"])
@@ -185,7 +190,7 @@ def test_full_vault_chat_filters_unbound_wrong_model_and_moved_derived_notes(too
     with pytest.raises(ToolError, match="未获此仓库授权"):
         tools.chat("订单", provider_id=other["id"], repository_id=secret)
     assert len(requests) == request_count
-    assert any(secret in n["path"] for n in tools.search("订单"))  # Local/MCP retrieval remains local read access.
+    assert any(n["path"] == "01-Wiki/company/手工证据.md" for n in tools.search("订单"))  # Local/MCP retrieval remains local read access.
 
 
 def test_data_chat_filters_repository_evidence_before_sql_planning(tools, monkeypatch):

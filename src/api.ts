@@ -18,5 +18,5 @@ export function cellValue(value: unknown): string {
   return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 export function noteTypeLabel(type: string): string {
-  return ({ overview: '业务概览', process: '业务流程', rule: '业务规则', entity: '数据模型', code: '代码依据', note: '知识笔记' } as Record<string, string>)[type] || type || '知识笔记';
+  return ({ business: '业务知识', overview: '业务概览', process: '业务流程', rule: '业务规则', entity: '业务对象', data: '数据口径', code: '内部资料', note: '知识笔记' } as Record<string, string>)[type] || type || '知识笔记';
 }

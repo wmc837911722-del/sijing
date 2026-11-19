@@ -29,7 +29,17 @@ def test_complete_source_without_final_newline_remains_readable():
     from businessmap.analysis_output import prepare_file
     item, _ = prepare_file({"path": "value.py", "content": "VALUE = 1"}, 100, 37000)
     assert item["content"] == "VALUE = 1" and item["truncated"] is False
-from businessmap.content_layout import business_paths, summary_path
+from businessmap.content_layout import public_project_paths, public_topic_path
+
+
+def business_paths(name):
+    return {"overview": public_project_paths(name)["overview"],
+            **{key: public_topic_path(name, key, title) for key, title in
+               {"entities": "实体概览", "flows": "流程概览", "rules": "退款规则", "data": "数据口径概览"}.items()}}
+
+
+def summary_path(name):
+    return public_project_paths(name)["summary"]
 
 
 CODE = "class RefundServiceImpl {\n    boolean refund(int amount) {\n        return amount > 0;\n    }\n}\n"
@@ -75,24 +85,25 @@ def model(monkeypatch, response):
     return requests
 
 
-def answer(content="# 退款规则\n金额为正时返回true。", quote="return amount > 0;", **source):
+def answer(content="# 退款规则\n金额必须为正；实际退款执行待确认。", quote="return amount > 0;", **source):
     return {"notes": [{"key": "rules", "title": "退款规则", "content": content,
         "sources": [{"path": PATH, "line_start": 1, "line_end": 1, "quote": quote, **source}]}]}
 
 
 def assert_no_business_output(tools, repo_id):
     assert all(not (tools.store.vault / path).exists()
-               for path in [*business_paths(repo_id).values(), summary_path(repo_id)])
+               for path in [*business_paths(tools.store.get_repository(repo_id)["name"]).values(), summary_path(tools.store.get_repository(repo_id)["name"])])
 
 
 def test_analysis_locates_exact_quote_instead_of_trusting_in_range_wrong_lines(analysis, monkeypatch):
     tools, repo = analysis
     requests = model(monkeypatch, answer())
     tools.analyze(repo["id"])
-    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
-    assert "L3–L3" in note
-    assert "return amount > 0;" in note
-    assert f"commit `{tools.store.get_repository(repo['id'])['commit']}`" in note
+    note = tools.store.read_note(business_paths(repo["name"])["rules"])["content"]
+    assert PATH not in note and "return amount > 0;" not in note and "source://" not in note
+    private = tools.store.config_get(f"ai_analysis:{repo['id']}")["notes"]["rules"]
+    assert private["commit"] == tools.store.get_repository(repo["id"])["commit"]
+    assert private["source_evidence"] == [{"path": PATH, "line_start": 3, "line_end": 3, "excerpt": "        return amount > 0;"}]
     supplied = json.loads(requests[0]["messages"][-1]["content"])["files"][0]
     assert supplied["line_count"] == 5
     assert "3:         return amount > 0;" in supplied["content"]
@@ -109,22 +120,24 @@ def test_analysis_rejects_unverifiable_evidence_before_writing(analysis, monkeyp
     assert_no_business_output(tools, repo["id"])
 
 
-def test_model_markdown_repairs_structure_but_preserves_code_and_escapes(analysis, monkeypatch):
+def test_normalizer_preserves_internal_code_but_publication_rejects_it(analysis, monkeypatch):
     tools, repo = analysis
     content = r'# 退款规则\n\n## 条件\n- 金额为正\n- 例外待确认\n\n```json\n{"newline":"\n","path":"C:\\new"}\n```\n\n路径 `C:\notes\new`；正则 `\n+`。'
     model(monkeypatch, answer(content=content))
-    tools.analyze(repo["id"])
-    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
-    assert "# 退款规则\n\n## 条件\n- 金额为正\n- 例外待确认\n\n```json\n" in note
-    assert r'{"newline":"\n","path":"C:\\new"}' in note
-    assert r'路径 `C:\notes\new`；正则 `\n+`。' in note
+    from businessmap.analysis_output import normalize_markdown
+    normalized = normalize_markdown(content)
+    assert "# 退款规则\n\n## 条件" in normalized
+    assert r'路径 `C:\notes\new`；正则 `\n+`。' in normalized
+    with pytest.raises(ToolError):
+        tools.analyze(repo["id"])
+    assert_no_business_output(tools, repo["id"])
 
 
 def test_markdown_heading_to_prose_separator_is_repaired_without_decoding_paths(analysis, monkeypatch):
     tools, repo = analysis
     model(monkeypatch, answer(content=r"# 退款规则\n金额为正。\n\n## 待确认\n接口声明不能证明已实现。"))
     tools.analyze(repo["id"])
-    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
+    note = tools.store.read_note(business_paths(repo["name"])["rules"])["content"]
     assert "# 退款规则\n金额为正。\n\n## 待确认\n接口声明不能证明已实现。" in note
 
 
@@ -136,8 +149,11 @@ def test_markdown_heading_to_prose_separator_is_repaired_without_decoding_paths(
 def test_valid_markdown_escapes_and_unclosed_code_are_not_reinterpreted(analysis, monkeypatch, content):
     tools, repo = analysis
     model(monkeypatch, answer(content=content))
-    tools.analyze(repo["id"])
-    assert content.strip() in tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
+    from businessmap.analysis_output import normalize_markdown
+    assert normalize_markdown(content).strip() == content.strip()
+    with pytest.raises(ToolError):
+        tools.analyze(repo["id"])
+    assert_no_business_output(tools, repo["id"])
 
 
 def test_analysis_failure_is_persisted_safely_and_success_clears_it(analysis, monkeypatch):
@@ -185,8 +201,10 @@ def test_model_can_cite_only_a_current_request_evidence_id(analysis, monkeypatch
         return response
     requests = model(monkeypatch, reply)
     tools.analyze(repo["id"])
-    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
-    assert "boolean refund(int amount)" in note and "return amount > 0;" in note and "L1–L5" in note
+    note = tools.store.read_note(business_paths(repo["name"])["rules"])["content"]
+    assert "boolean refund" not in note and "return amount" not in note and "source://" not in note
+    evidence = tools.store.config_get(f"ai_analysis:{repo['id']}")["notes"]["rules"]["source_evidence"]
+    assert evidence == [{"path": PATH, "line_start": 1, "line_end": 5, "excerpt": CODE.rstrip("\n")}]
     assert len(requests) == 1
 
 
@@ -307,41 +325,43 @@ def test_analysis_separates_business_cards_map_and_summary_from_raw_source(analy
     tools, repo = analysis
     requests = model(monkeypatch, answer())
     result = tools.analyze(repo["id"])
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     rules = tools.store.read_note(paths["rules"])["content"]
     business_map = tools.store.read_note(paths["overview"])["content"]
-    summary = tools.store.read_note(summary_path(repo["id"]))["content"]
+    summary = tools.store.read_note(summary_path(repo["name"]))["content"]
     commit = tools.store.get_repository(repo["id"])["commit"]
     assert result["notes_created"] == 3
     assert "content_role: business_knowledge" in rules
     assert "content_role: business_map" in business_map
     assert "content_role: analysis_summary" in summary
-    assert f"source://{repo['id']}/{commit}/{PATH}#L3-L3" in rules
+    assert "source://" not in rules and PATH not in rules
     assert "[[代码索引/" not in rules
     assert f"[[{paths['rules'][:-3]}|退款规则]]" in business_map
     map_body = business_map.split("---", 2)[-1]
     assert "代码文件清单" not in map_body and PATH not in map_body
     assert f"[[{paths['rules'][:-3]}|退款规则]]" in summary
-    assert commit in summary and "1 / 1" in summary and "待确认" in summary
+    assert commit not in summary and PATH not in summary and "待确认" in summary
     assert "return amount > 0;" not in summary and "```" not in summary
     state = tools.store.config_get(f"ai_analysis:{repo['id']}")
-    assert state["notes"]["summary"]["path"] == summary_path(repo["id"])
+    assert state["notes"]["summary"]["path"] == summary_path(repo["name"])
+    assert state["notes"]["rules"]["source_evidence"][0]["line_start"] == 3
     assert set(state["notes"]) == {"rules", "overview", "summary"}
     supplied = json.loads(requests[0]["messages"][-1]["content"])
-    assert supplied["note_paths"] == paths
+    assert supplied["note_paths"]["overview"] == paths["overview"]
+    assert all(repo["id"] not in path for path in supplied["note_paths"].values())
 
 
 def test_model_overview_keeps_verified_business_meaning_and_links_only_written_cards(analysis, monkeypatch):
     tools, repo = analysis
     response = answer()
     response["notes"].insert(0, {**response["notes"][0], "key": "overview", "title": "退款业务地图",
-                                  "content": "# 退款业务地图\n正金额是退款方法返回true的条件。"})
+                                  "content": "# 退款业务地图\n退款金额必须为正，实际执行流程待确认。"})
     model(monkeypatch, response)
     tools.analyze(repo["id"])
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     business_map = tools.store.read_note(paths["overview"])["content"]
-    assert "正金额是退款方法返回true的条件。" in business_map
-    assert "source://" in business_map
+    assert "退款金额必须为正，实际执行流程待确认。" in business_map
+    assert "source://" not in business_map
     assert f"[[{paths['rules'][:-3]}|退款规则]]" in business_map
     assert f"[[{paths['entities'][:-3]}" not in business_map
     assert "知识阅读关系" in business_map
@@ -349,9 +369,9 @@ def test_model_overview_keeps_verified_business_meaning_and_links_only_written_c
 
 def test_analysis_preserves_human_map_and_summary_and_offers_revision_guarded_candidates(analysis, monkeypatch):
     tools, repo = analysis
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     originals = {paths["overview"]: "# 我的业务地图\n人工关系。\n",
-                 summary_path(repo["id"]): "# 我的总结\n人工结论。\n"}
+                 summary_path(repo["name"]): "# 我的总结\n人工结论。\n"}
     revisions = {path: tools.store.save_note(path, content)["revision"] for path, content in originals.items()}
     model(monkeypatch, answer())
     result = tools.analyze(repo["id"])
@@ -361,12 +381,12 @@ def test_analysis_preserves_human_map_and_summary_and_offers_revision_guarded_ca
     candidates = {candidate["path"]: candidate for candidate in tools.candidates()}
     assert set(candidates) == set(originals)
     assert all(candidate["current_revision"] == revisions[path] for path, candidate in candidates.items())
-    assert "退款规则" in candidates[summary_path(repo["id"])]["content"]
+    assert "退款规则" in candidates[summary_path(repo["name"])]["content"]
 
 
 def test_map_and_summary_do_not_claim_conflicting_card_was_generated(analysis, monkeypatch):
     tools, repo = analysis
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     human = "# 我的退款规则\n人工业务口径。\n"
     tools.store.save_note(paths["rules"], human)
     model(monkeypatch, answer())
@@ -374,7 +394,7 @@ def test_map_and_summary_do_not_claim_conflicting_card_was_generated(analysis, m
     assert len(result["conflicts"]) == 1
     assert tools.store.read_note(paths["rules"])["content"] == human
     business_map = tools.store.read_note(paths["overview"])["content"]
-    summary = tools.store.read_note(summary_path(repo["id"]))["content"]
+    summary = tools.store.read_note(summary_path(repo["name"]))["content"]
     assert f"[[{paths['rules'][:-3]}" not in business_map
     assert f"[[{paths['rules'][:-3]}" not in summary
     assert "未成功保存业务知识卡片" in business_map
@@ -385,10 +405,10 @@ def test_map_and_summary_detect_human_edits_during_model_request(analysis, monke
     tools, repo = analysis
     model(monkeypatch, answer())
     tools.analyze(repo["id"])
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     edited = {}
     def response(_payload):
-        for path in (paths["overview"], summary_path(repo["id"])):
+        for path in (paths["overview"], summary_path(repo["name"])):
             previous = tools.store.read_note(path)
             edited[path] = previous["content"] + "\n人工请求期间修改。\n"
             tools.store.save_note(path, edited[path], previous["revision"])
@@ -406,9 +426,9 @@ def test_overview_without_cards_does_not_invent_business_knowledge(analysis, mon
     model(monkeypatch, response)
     result = tools.analyze(repo["id"])
     assert result["notes_created"] == 2
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     business_map = tools.store.read_note(paths["overview"])["content"]
-    assert "完整业务流程待确认" in business_map and "source://" in business_map
+    assert "完整业务流程待确认" in business_map and "source://" not in business_map
     assert "未成功保存业务知识卡片" in business_map
     assert not (tools.store.vault / f"01-Wiki/业务知识/{repo['id']}").exists()
     assert set(tools.store.config_get(f"ai_analysis:{repo['id']}")["notes"]) == {"overview", "summary"}
@@ -416,7 +436,7 @@ def test_overview_without_cards_does_not_invent_business_knowledge(analysis, mon
 
 def test_map_removes_prospective_model_links_to_conflicting_or_missing_cards(analysis, monkeypatch):
     tools, repo = analysis
-    paths = business_paths(repo["id"])
+    paths = business_paths(repo["name"])
     tools.store.save_note(paths["rules"], "# 人工规则\n保留。\n")
     response = answer()
     response["notes"].append({**response["notes"][0], "key": "overview", "title": "退款业务地图",
@@ -458,8 +478,11 @@ def test_analysis_evidence_uses_git_lf_lines_not_unicode_paragraph_breaks(analys
     assert supplied["line_count"] == 3
     assert "2: " + physical_line in supplied["content"]
     assert "3: }" in supplied["content"]
-    note = tools.store.read_note(business_paths(repo["id"])["rules"])["content"]
-    assert "#L2-L2" in note and physical_line in note
+    note = tools.store.read_note(business_paths(repo["name"])["rules"])["content"]
+    assert "#L2-L2" not in note and physical_line not in note
+    private = tools.store.config_get(f"ai_analysis:{repo['id']}")["notes"]["rules"]["source_evidence"]
+    assert private[0]["line_start"] == private[0]["line_end"] == 2
+    assert private[0]["excerpt"] == physical_line
     assert tools.store.config_get(f"ai_analysis_status:{repo['id']}")["scope"]["line_count"] == 3
 
 
@@ -472,7 +495,7 @@ def test_analysis_summary_distinguishes_cards_map_and_summary_documents(analysis
     assert "3 篇" in summary and "3 篇业务知识卡片" not in summary
 
 
-def test_overview_filters_only_prose_links_without_changing_metadata_or_verified_code(analysis, monkeypatch):
+def test_business_overview_filters_unavailable_links_and_keeps_sources_private(analysis, monkeypatch):
     from pathlib import Path
     import yaml
     tools, repo = analysis
@@ -487,9 +510,8 @@ def test_overview_filters_only_prose_links_without_changing_metadata_or_verified
     while next(task for task in tools.store.tasks() if task["id"] == task_id)["status"] != "completed":
         assert time.monotonic() < deadline
         time.sleep(0.01)
-    paths = business_paths(repo["id"])
-    protected = ('`[[inline literal]]`\n\n~~~text\n[[fenced literal]]\n~~~~\n\n'
-                 '    [[indented literal]]\n\n> ```text\n> [[quoted literal]]\n> ```\n')
+    paths = business_paths(repo["name"])
+    protected = "完整业务条件仍待确认。\n"
     body = f"# 业务地图\n\n主题[[{paths['entities'][:-3]}|实体]]待确认。\n\n" + protected
     response = answer(quote=literal)
     response["notes"].append({**response["notes"][0], "key": "overview", "title": "[[原始标题]]", "content": body})
@@ -498,9 +520,12 @@ def test_overview_filters_only_prose_links_without_changing_metadata_or_verified
     overview = tools.store.read_note(paths["overview"])["content"]
     assert literal not in overview  # The map navigates topics; source opens on demand.
     current_commit = tools.store.get_repository(repo["id"])["commit"]
-    evidence = tools.source_evidence(f"source://{repo['id']}/{current_commit}/{PATH}#L2-L2")
-    assert literal in evidence["content"]
-    assert literal in tools.store.read_note(paths["rules"])["content"]
+    with pytest.raises(ToolError) as denied:
+        tools.source_evidence(f"source://{repo['id']}/{current_commit}/{PATH}#L2-L2")
+    assert denied.value.status_code == 403
+    evidence = tools.store.config_get(f"ai_analysis:{repo['id']}")["notes"]["rules"]["source_evidence"]
+    assert literal in evidence[0]["excerpt"]
+    assert literal not in tools.store.read_note(paths["rules"])["content"]
     assert yaml.safe_load(overview.split("---", 2)[1])["title"] == "[[原始标题]]"
     assert "主题实体待确认。" in overview
     assert f"[[{paths['entities'][:-3]}" not in overview

@@ -48,11 +48,13 @@ def full_project(tmp_path, monkeypatch):
     # Exercise source planning/publication; synthesis has its own complete reduction tests.
     from businessmap.full_synthesis import FullBusinessSynthesis
     def synthesis(_self, snapshot, run, chunks):
-        return {"complete": True, "overview_body": "# 完整赛事业务地图\n\n订单与退款业务的实现规则。\n" + "\n".join(
-            "- [[module:" + module["id"] + "|业务知识]]" for module in run["modules"]),
-            "module_titles": {module["id"]: "业务知识 · " + str(index) for index, module in enumerate(run["modules"], 1)},
-            "domains": [], "usage": {}}
+        from business_projection_fixture import public_result
+        from businessmap.analysis_addenda import AnalysisAddenda
+        addenda = AnalysisAddenda(service, guard=lambda: None).accepted(snapshot, run)
+        return public_result(snapshot, run, chunks, addenda)
     monkeypatch.setattr(FullBusinessSynthesis, "build", synthesis)
+    from business_projection_fixture import isolate_stubbed_semantic_receipts
+    isolate_stubbed_semantic_receipts(monkeypatch)
     yield full, service, project
     store.close()
 
@@ -66,7 +68,7 @@ def model(monkeypatch, service, callback=None):
         if callback:
             callback(payload, len(sent))
         first = payload["files"][0]
-        return {"text": json.dumps({"title": "订单知识", "summary": "代码声明信息", "findings": [
+        return {"text": json.dumps({"title": "订单知识", "summary": "订单业务说明", "findings": [
             {"text": "此片段声明订单或业务规则。", "evidence_ids": [first["evidence_id"]]}], "unknowns": ["运行行为待核验"]}),
             "usage": {"input_tokens": 100, "output_tokens": 30}, "provider": {"id": "fixture"}}
     monkeypatch.setattr(service.providers, "complete", complete)
@@ -154,20 +156,21 @@ def test_pause_prevents_new_paid_dispatch_and_resume_keeps_completed_receipts(fu
     assert first[0]["chunk_id"] not in {payload["chunk_id"] for payload in second}
 
 
-def test_module_documents_and_map_preserve_human_edits(full_project, monkeypatch):
+def test_semantic_topics_and_map_preserve_human_edits(full_project, monkeypatch):
     full, service, project = full_project
     model(monkeypatch, service)
     result = full.analyze(project["id"])
-    module_notes = list((service.store.vault / "01-Wiki" / "业务知识" / "项目" / project["id"] / "模块").glob("*.md"))
-    assert len(module_notes) == result["coverage"]["total_modules"]
+    module_notes = list((service.store.vault / "01-Wiki" / "完整赛事" / "规则").glob("*.md"))
+    assert len(module_notes) == 1 and result["coverage"]["total_modules"] > 1
     note = service.store.read_note(str(module_notes[0].relative_to(service.store.vault)))
     human = service.store.save_note(note["path"], note["content"] + "\n人工确认的补充。\n", note["revision"])
     result = full.analyze(project["id"])
     assert service.store.read_note(note["path"])["content"] == human["content"]
     assert any(item["path"] == note["path"] for item in result["conflicts"])
-    from businessmap.content_layout import project_business_paths
-    overview = service.store.read_note(project_business_paths(project["id"])["overview"])["content"]
-    assert "完整源码" in overview and "5 / 5" in overview
+    from businessmap.content_layout import public_project_paths
+    overview = service.store.read_note(public_project_paths(project["name"])["overview"])["content"]
+    assert "完整源码" not in overview and "source://" not in overview
+    assert "[[" + note["path"][:-3] not in overview
     assert "前端调用后端" not in overview
 
 
@@ -247,15 +250,64 @@ def test_synthesis_failure_resumes_after_full_source_without_repaying(full_proje
     assert not second
 
 
+def test_version_four_complete_projection_is_rebuilt_without_repaying_source(full_project, monkeypatch):
+    from businessmap.full_synthesis import FullBusinessSynthesis
+    from business_projection_fixture import public_result
+    full, service, project = full_project
+    first = model(monkeypatch, service)
+    original = service.providers.complete
+    text = "订单仅在已支付且未退款时允许退款；退款金额不得超过已支付金额；该规则尚无测试覆盖。"
+    def source_with_mixed_business_fact(system, user, **kwargs):
+        response = original(system, user, **kwargs)
+        data = json.loads(response["text"])
+        data["summary"] = text
+        response["text"] = json.dumps(data, ensure_ascii=False)
+        return response
+    monkeypatch.setattr(service.providers, "complete", source_with_mixed_business_fact)
+    initial = full.analyze(project["id"])
+    assert initial["status"] == "completed" and first
+    run = full._load(project["id"])
+    receipts = full._chunks(run)
+    assert all(chunk["status"] == "completed" and chunk["input_hash"] for chunk in receipts)
+    # A prior permissive v4 projection hid the entire statement as a test note.
+    old_projection = run["synthesis"]
+    old_projection["public_documents"] = []
+    old_projection["source_mapping"] = {}
+    old_projection["fact_coverage"] = {"input_ids": old_projection["semantic_coverage"]["input_ids"], "public": {}, "internal": {
+        fid: {"classification": "test", "reason": "测试说明", "classification_basis": {"supported_categories": ["test"], "evidence_ids": []}}
+        for fid in old_projection["semantic_coverage"]["input_ids"]}}
+    old_projection.pop("semantic_coverage")
+    old_projection.pop("verification")
+    run["synthesis_version"] = 4
+    full._save(run)
+    synthesis_calls = []
+    def rebuild(_self, snapshot, current_run, chunks):
+        synthesis_calls.append(current_run["run_id"])
+        return public_result(snapshot, current_run, chunks)
+    monkeypatch.setattr(FullBusinessSynthesis, "build", rebuild)
+    source_calls = model(monkeypatch, service)
+    resumed = full.analyze(project["id"])
+    assert resumed["status"] == "completed" and resumed["run_id"] == initial["run_id"]
+    assert synthesis_calls == [initial["run_id"]]
+    assert not source_calls and full._chunks(full._load(project["id"])) == receipts
+    current = full._load(project["id"])
+    assert current["synthesis_version"] == FullBusinessSynthesis.VERSION
+    assert all(row["parts"][0]["outcome"] in {"claim", "retained"} for row in current["synthesis"]["semantic_coverage"]["decisions"].values())
+    assert text in "\n".join(document["body"] for document in current["synthesis"]["public_documents"])
+    assert full.VERSION == 1
+
+
 def test_publication_pages_preserve_all_batches_and_homepage_navigation(full_project, monkeypatch):
     full, service, project = full_project
     full.PAGE_BYTES = 1400
     sent = model(monkeypatch, service)
     original = service.providers.complete
+    import itertools
+    sequence = itertools.count(1)
     def verbose(system, user, **kwargs):
         response = original(system, user, **kwargs)
         data = json.loads(response["text"])
-        data["findings"][0]["text"] = "唯一批次:" + json.loads(user)["chunk_id"] + "业务规则" * 80
+        data["findings"][0]["text"] = "唯一业务说明第" + str(next(sequence)) + "项：" + "业务规则" * 80
         response["text"] = json.dumps(data)
         return response
     monkeypatch.setattr(service.providers, "complete", verbose)
@@ -264,9 +316,9 @@ def test_publication_pages_preserve_all_batches_and_homepage_navigation(full_pro
     state = service.store.config_get("project_analysis:" + project["id"])
     parts = [value for key, value in state["notes"].items() if ":part:" in key]
     assert parts
-    text = "\n".join(service.store.read_note(value["path"])["content"] for key, value in state["notes"].items() if key.startswith("module:"))
-    for payload in sent:
-        assert text.count("唯一批次:" + payload["chunk_id"]) == 1
+    text = "\n".join(service.store.read_note(value["path"])["content"] for key, value in state["notes"].items() if key.startswith("topic:"))
+    for number in range(1, len(sent) + 1):
+        assert text.count("唯一业务说明第" + str(number) + "项：") == 1
     for part in parts:
         assert "[[" + part["path"][:-3] in text
         assert len(service.store.read_note(part["path"])["content"].encode()) <= service.store.MAX_NOTE_BYTES
@@ -315,7 +367,7 @@ def test_publication_failure_does_not_rollback_concurrent_human_change(full_proj
 def test_publication_size_preflight_performs_zero_writes(full_project, monkeypatch):
     full, service, project = full_project
     model(monkeypatch, service)
-    service.store.MAX_NOTE_BYTES = 1200
+    service.store.MAX_NOTE_BYTES = 300
     original = service.store._write_note
     writes = []
     def tracked(path, *args, **kwargs):
@@ -359,7 +411,9 @@ def test_failed_publication_restores_previous_managed_versions(full_project, mon
     state_before = service.store.config_get("project_analysis:" + project["id"])
     contents = {value["path"]: service.store.read_note(value["path"])["content"] for value in state_before["notes"].values()}
     run = full._load(project["id"])
-    run["synthesis"]["module_titles"] = {key: title + "新版本" for key, title in run["synthesis"]["module_titles"].items()}
+    run["synthesis"]["public_documents"][0]["body"] += "\n新的业务归纳。\n"
+    from business_projection_fixture import seal
+    seal(run["synthesis"])
     full._save(run)
     chunks = full._chunks(run)
     chunks[0]["result"]["findings"][0]["text"] += "新的机器归纳。"
@@ -597,9 +651,11 @@ def test_explicit_provider_continuation_preserves_verified_original_receipts(ful
     continued = model(monkeypatch, service)
     assert full.analyze(project["id"])["status"] == "completed"
     assert not {value["chunk_id"] for value in continued} & {value["id"] for value in reused}
-    from businessmap.content_layout import project_summary_path
-    summary = service.store.read_note(project_summary_path(project["id"]))["content"]
-    assert "混合模型" in summary and "Second model" in summary and "Fixture" in summary
+    from businessmap.content_layout import public_project_paths
+    summary = service.store.read_note(public_project_paths(project["name"])["summary"])["content"]
+    assert "混合模型" not in summary and "Second model" not in summary and "Fixture" not in summary
+    private = full._load(project["id"])["receipt_migration"]
+    assert private["source_provider"] == original_provider and private["target_provider"]["id"] == provider["id"]
 
 
 def test_provider_continuation_rejects_tampered_input_before_changing_binding(full_project, monkeypatch):
@@ -709,9 +765,12 @@ def test_large_map_and_summary_publish_lossless_pages_with_matching_roles(full_p
     domains = []
     for domain in range(4):
         domains.append("### 领域" + str(domain) + "\n\n" + "\n\n".join(
-            "唯一业务事实" + str(domain) + "-" + str(fact) + "：" + "规则条件" * 50 + f" [[module:{module_id}|关联业务]]"
+            "唯一业务事实" + str(domain) + "-" + str(fact) + "：" + "规则条件" * 50 + " [[01-Wiki/完整赛事/规则/订单知识|订单知识]]"
             for fact in range(15)))
     run["synthesis"]["overview_body"] = "# 完整业务地图\n\n## 业务域与职责\n\n" + "\n\n".join(domains)
+    run["synthesis"]["summary_body"] = "# 业务梳理总结\n\n## 口径待确认\n\n" + "\n\n".join("待确认口径第" + str(index) + "项：" + "业务范围尚待确认。" * 5 for index in range(450))
+    from business_projection_fixture import seal
+    seal(run["synthesis"])
     run["exclusions"] = [{"repository_id": "front", "path": "排除材料" + str(index) + ".bin", "reason": "outside_source_scope"} for index in range(450)]
     full._save(run)
     assert full.analyze(project["id"])["status"] == "completed"
@@ -732,7 +791,8 @@ def test_large_map_and_summary_publish_lossless_pages_with_matching_roles(full_p
             assert all_map_parts.count("唯一业务事实" + str(domain) + "-" + str(fact) + "：") == 1
     all_summary_parts = "\n".join(service.store.read_note(value["path"])["content"] for key, value in state["notes"].items() if key.startswith("summary:part:"))
     for index in range(450):
-        assert all_summary_parts.count("排除材料" + str(index) + ".bin") == 1
+        assert all_summary_parts.count("待确认口径第" + str(index) + "项：") == 1
+    assert ".bin" not in all_summary_parts and "source://" not in all_summary_parts
 
 
 def test_orphan_running_state_offers_resume_without_starting_model(full_project, monkeypatch):

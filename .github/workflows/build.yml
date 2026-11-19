@@ -64,6 +64,8 @@ jobs:
         run: node scripts/test-backend.mjs
       - name: Desktop platform contracts
         run: npm run test:platform
+      - name: Business UI and provider contracts
+        run: npm run test:ui
       - name: Build desktop packages
         run: npm run package -- --${{ matrix.arch }}
       - name: Verify packaged desktop (Windows and macOS)

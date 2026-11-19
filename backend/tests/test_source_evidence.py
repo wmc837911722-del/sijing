@@ -309,45 +309,44 @@ def test_discovery_prioritizes_specific_implementation_paths_over_java_and_suffi
     assert "class McpAccessServiceImpl" in result["matches"][0]["content"]
 
 
-def test_real_discovery_pages_leave_exploration_budget_for_reading_implementation(source_store, monkeypatch):
+def test_private_discovery_remains_compact_and_business_exploration_never_reads_source(source_store, monkeypatch):
     import keyring
+    from businessmap.business_content import render_public_note
     from businessmap.tools_api import ToolsService
-    from businessmap.exploration import SOURCE_TOOLS
     monkeypatch.setattr(keyring, "get_keyring", lambda: (_ for _ in ()).throw(RuntimeError("locked")))
-    discovery_repository(source_store)
+    navigator = discovery_repository(source_store)
     _, store, repo = source_store
+    pages = [navigator.search("java"), navigator.search("public")]
+    assert all(len(page["matches"]) == 8 for page in pages)
+    assert all(len(json.dumps(page, ensure_ascii=False).encode()) <= 12000 for page in pages)
+    discovered = navigator.search("McpAccessService")
+    assert discovered["matches"][0]["path"] == "z-service/McpAccessServiceImpl.java"
+    receipt = navigator.read(discovered["matches"][0]["path"], 1, 3)
+    assert "保星卡免扣星" in receipt["content"] and receipt["reference"].startswith("source://")
     tools = ToolsService(store)
     provider = tools.providers.save({"name": "Fixture", "kind": "openai-compatible",
                                      "base_url": "http://127.0.0.1:1/v1", "model": "fixture"})
     tools.bind_model(repo["id"], provider["id"])
-    reference = f"source://{repo['id']}/{repo['commit']}/z-service/McpAccessServiceImpl.java#L1-L3"
-    steps = [("repository_search", {"query": "java"}),
-             ("repository_search", {"query": "public"}),
-             ("repository_search", {"query": "McpAccessService"}),
-             ("repository_read", {"path": "z-service/McpAccessServiceImpl.java", "line_start": 1, "line_end": 3}),
-             ("finish_answer", {"answer": "实现代码明确返回保星卡免扣星。", "kind": "answer", "citations": [reference]})]
+    path = "01-Wiki/赛事/规则/星数保护.md"
+    note = store.save_note(path, render_public_note("星数保护", "# 星数保护\n保护条件成立时，本次不扣星。"))
+    store.config_set(f"ai_analysis:{repo['id']}", {"vault_path": str(store.vault), "notes": {"rules": {
+        "path": path, "revision": note["revision"], "commit": repo["commit"],
+        "source_paths": [receipt["path"]], "source_evidence": [receipt], "stale": False, "conflict": False}}})
+    steps = [("knowledge_read", {"path": path}),
+             ("finish_answer", {"answer": "保护条件成立时，本次不扣星。", "kind": "answer", "citations": [path]})]
     requests = []
     def turn(system, messages, schemas, **kwargs):
         index = len(requests)
         assert index < len(steps)
-        names = {tool["function"]["name"] for tool in schemas}
-        if index <= 3:
-            assert "repository_read" in names, "Discovery payload consumed the budget before the implementation read"
-        requests.append({"messages": messages, "wire_bytes": len(json.dumps(messages, ensure_ascii=False).encode())})
+        assert not {"repository_read", "repository_search"} & {tool["function"]["name"] for tool in schemas}
+        requests.append(json.dumps(messages, ensure_ascii=False))
         name, arguments = steps[index]
-        call_id = f"call-{index}"
-        return {"text": "", "tool_calls": [{"id": call_id, "name": name, "arguments": arguments}],
-                "assistant_message": {"role": "assistant", "content": "", "tool_calls": [{"id": call_id, "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}]},
-                "usage": {"input_tokens": (4500, 5000, 6500, 7000, 7000)[index], "output_tokens": 100}}
+        return {"text": "", "tool_calls": [{"id": str(index), "name": name, "arguments": arguments}],
+                "assistant_message": {"role": "assistant", "content": ""},
+                "usage": {"input_tokens": 100, "output_tokens": 10}}
     monkeypatch.setattr(tools.providers, "tool_turn", turn)
-    result = tools.chat("McpAccessService的扣星逻辑如何实现？", repository_id=repo["id"])
-    print(f"Exploration transcript bytes before each model turn: {[request['wire_bytes'] for request in requests]}")
-    assert len(requests) == 5 and result["completion"] == "complete"
-    assert result["sources"][0]["kind"] == "code" and result["sources"][0]["path"] == reference
-    first_pages = [json.loads(item["content"]) for item in requests[2]["messages"]
-                   if item["role"] == "tool"][:2]
-    assert len(first_pages) == 2 and all(len(page["matches"]) == 8 for page in first_pages)
-    assert "保星卡免扣星" in json.dumps(requests[-1]["messages"], ensure_ascii=False)
-    search_schema = next(tool for tool in SOURCE_TOOLS if tool["function"]["name"] == "repository_search")
-    assert search_schema["function"]["parameters"]["properties"]["query"]["maxLength"] == 500
+    result = tools.chat("保护条件下会扣星吗？", repository_id=repo["id"])
+    assert len(requests) == 2 and result["completion"] == "complete"
+    assert result["sources"] == [{"path": path, "title": "星数保护"}]
+    public = json.dumps([result, requests], ensure_ascii=False)
+    assert not any(value in public for value in ("source://", "McpAccessServiceImpl", repo["commit"], "source_path"))

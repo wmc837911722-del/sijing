@@ -45,29 +45,35 @@ def test_distinct_business_terms_outrank_common_identifiers_in_code_paths(indexe
 
 
 @pytest.mark.parametrize("query", ["Capability042", "Capability042.java", "arena-mcp/src/main/java/example/Capability042.java"])
-def test_code_identifiers_still_locate_files_but_are_explicitly_index_only(indexed_store, query):
+def test_code_identifiers_never_reveal_source_files_in_business_search(indexed_store, query):
     result = KnowledgeNavigator(indexed_store).call("knowledge_search", {"query": query})
 
-    assert [note["path"] for note in result["notes"]] == ["代码索引/arena/042.md"]
-    assert result["notes"][0]["index_only"] is True
-    assert "不提供业务结论" in result["notes"][0]["excerpt"]
-    assert "天梯赛事" not in result["notes"][0]["excerpt"]
+    assert result["notes"] == []
+    assert result["total"] == 0
 
 
 def test_search_reports_accessible_total_and_exposes_stable_pages(indexed_store):
+    business = indexed_store.vault / "业务知识"
+    business.mkdir()
+    for number in range(500):
+        (business / f"{number:03d}.md").write_text(f"# 业务说明 {number}\n共同业务条件：需要审批。\n")
     nav = KnowledgeNavigator(indexed_store, allowed=lambda note: int(note["path"].split("/")[-1][:-3]) % 2 == 0)
 
-    first = nav.call("knowledge_search", {"query": "Capability"})
+    first = nav.call("knowledge_search", {"query": "共同业务条件"})
     assert first["total"] == 250
     assert first["offset"] == 0 and first["next_offset"] == 8 and first["truncated"]
-    second = nav.call("knowledge_search", {"query": "Capability", "offset": first["next_offset"]})
+    second = nav.call("knowledge_search", {"query": "共同业务条件", "offset": first["next_offset"]})
     assert second["total"] == 250
     assert {n["path"] for n in first["notes"]}.isdisjoint(n["path"] for n in second["notes"])
-    last = nav.call("knowledge_search", {"query": "Capability", "offset": 248})
+    last = nav.call("knowledge_search", {"query": "共同业务条件", "offset": 248})
     assert len(last["notes"]) == 2 and last["next_offset"] is None and not last["truncated"]
 
 
 def test_excerpt_centers_distinct_business_evidence_instead_of_shared_context(indexed_store):
+    # Source indexes no longer enter the business search corpus. Establish the
+    # genuinely common term using public business documents instead.
+    for number in range(30):
+        (indexed_store.vault / f"背景{number}.md").write_text("# 业务背景\nMCP 通用业务说明。\n")
     indexed_store.save_note("业务/访问限制.md", "# MCP 概览\nMCP 通用说明。" + "背景。" * 1000
                             + "\n权限组拒绝空值和未知代码。\n")
 

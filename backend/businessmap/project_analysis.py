@@ -6,9 +6,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-import yaml
-
-from .analysis_output import AnalysisOutputError, normalize_markdown, prepare_file, render_excerpt, verify_sources
+from .analysis_output import AnalysisOutputError, normalize_markdown, prepare_file, verify_sources
 from .business_projects import BusinessProjects
 from .core import CoreError, now
 from .providers import ToolError, parse_json_answer, provider_destination
@@ -250,7 +248,7 @@ class ProjectAnalysis:
         return FullProjectAnalysis(self.service).analyze(project_id, task_id=task_id, expected_snapshot=expected_snapshot)
 
     def analyze_sampled(self, project_id, task_id=None, expected_snapshot=None):
-        from .content_layout import project_business_paths, project_summary_path
+        from .content_layout import CATEGORY_NAMES, public_project_paths, public_topic_path
         from .tools_api import ANALYSIS_SYSTEM, _ANALYSIS_LOCK
         snapshot = expected_snapshot or self.snapshot(project_id)
         with _ANALYSIS_LOCK, self._status(project_id, snapshot) as status:
@@ -259,16 +257,13 @@ class ProjectAnalysis:
             selected, identities, scope = self._sample(snapshot)
             status["scope"] = scope
             self.store.config_set(f"project_analysis_status:{project_id}", status)
-            paths = project_business_paths(project_id)
-            output_paths = {**paths, "summary": project_summary_path(project_id)}
-            before = {}
-            for key, path in output_paths.items():
-                try:
-                    before[key] = self.store.read_note(path)
-                except CoreError as error:
-                    if error.status_code != 404:
-                        raise
-                    before[key] = None
+            paths = {**public_project_paths(project["name"]),
+                     **{key: public_topic_path(project["name"], key, label) for key, label in CATEGORY_NAMES.items()}}
+            self.store.refresh()
+            # Titles arrive from the model. Freeze existing path revisions now,
+            # so a concurrent note at a newly chosen title is never overwritten.
+            with self.store._lock:
+                before_paths = {path: dict(note) for path, note in self.store._cache.items()}
             state = self.store.config_get(f"project_analysis:{project_id}", {})
             if state.get("vault_path") != snapshot["vault_path"]:
                 state = {}
@@ -302,6 +297,11 @@ class ProjectAnalysis:
                 sources = [{**source, **identities[source["path"]]} for source in checked]
                 prepared[note["key"]] = {"title": note["title"][:160], "body": normalize_markdown(note["content"]).strip(),
                                           "sources": sources}
+            for key, note in prepared.items():
+                if key != "overview":
+                    paths[key] = public_topic_path(project["name"], key, note["title"])
+            output_paths = dict(paths)
+            before = {key: before_paths.get(path) for key, path in output_paths.items()}
             self.guard(snapshot)
             result = self._publish(snapshot, state, paths, output_paths, before, prepared, scope)
             result.update(usage=response.get("usage", {}), provider=response.get("provider"))
@@ -312,16 +312,15 @@ class ProjectAnalysis:
             return result
 
     def _document(self, snapshot, scope, key, title, body, sources):
+        from .business_content import render_public_note, validate_public_business_text
         role = "business_map" if key == "overview" else "analysis_summary" if key == "summary" else "business_knowledge"
-        metadata = {"title": title, "type": "business", "content_role": role, "tags": ["AI生成", "联合业务分析"],
-                    "project_id": snapshot["project"]["id"], "project_revision": snapshot["project"]["revision"],
-                    "source_repositories": self._sources(snapshot), "generated_key": key, "scope_limited": scope["truncated"],
-                    "source_paths": list(dict.fromkeys(source["repository_id"] + "/" + source["path"] for source in sources))}
-        content = "---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False) + "---\n\n" + body.strip()
-        if sources:
-            content += "\n\n## 代码依据\n\n" + "\n".join(render_excerpt(source, source["commit"], source["repository_id"], include_excerpt=key in {"entities", "flows", "rules", "data"}) for source in sources)
-        content += "\n\n> 证据边界：仅核验原文和位置；已导入全部成员仓库不等于已读完代码，跨端调用关系需两端实际代码匹配，未读范围与业务语义仍待核验。\n"
-        return content, metadata["source_paths"]
+        private_sources = list(dict.fromkeys(source["repository_id"] + "/" + source["path"] for source in sources))
+        forbidden = [snapshot["project"]["id"], *private_sources]
+        for source in sources:
+            forbidden.extend(source.get(field, "") for field in ("repository_id", "commit", "path"))
+            forbidden.extend(source.get("commit", "")[:size] for size in (7, 8, 10, 12))
+        validate_public_business_text(title + "\n" + body, forbidden)
+        return render_public_note(title, body, content_role=role, tags=["业务知识"]), private_sources
 
     def _candidate(self, snapshot, key, path, content, current, source_paths):
         return {"id": "project-" + snapshot["project"]["id"] + "-" + key, "project_id": snapshot["project"]["id"],
@@ -337,6 +336,9 @@ class ProjectAnalysis:
         created = updated = 0
         sources_snapshot = self._sources(snapshot)
         vault = Path(snapshot["vault_path"])
+        # Validate all prospective public material before the first file write.
+        for key, note in prepared.items():
+            self._document(snapshot, scope, key, note["title"], note["body"], note["sources"])
         # SQLite's write lock prevents another local service process from changing
         # membership, commits or policy between the final guard and publication.
         with self.store._lock, self.store._db() as db:
@@ -385,23 +387,19 @@ class ProjectAnalysis:
             allowed_links = {paths[key][:-3] for key in written}
             body = _rewrite_links(overview["body"], {}, replace_link=lambda match:
                 match.group() if match[1].split("|", 1)[0].removesuffix(".md") in allowed_links else match[1].split("|", 1)[-1]) if overview else (
-                    f"# {snapshot['project']['name']} · 业务地图\n\n本地图归纳同一业务项目的前后端知识；跨端调用与流程关系仅在两端证据匹配时成立，未核实部分待确认。")
+                    f"# {snapshot['project']['name']} · 业务地图\n\n按业务主题查阅相关知识；尚未核实的流程和关系保留为待确认。")
             body += "\n\n## 业务知识导航\n\n" + (navigation or "本次没有成功保存的业务知识卡；更新建议不计入已确认知识。")
             map_sources = [*all_sources, *(overview["sources"] if overview else [])]
             content, source_paths = self._document(snapshot, scope, "overview", overview["title"] if overview else snapshot["project"]["name"] + " · 业务地图", body, map_sources)
             map_saved = publish("overview", content, source_paths)
-            summary = f"# {snapshot['project']['name']} · 联合分析总结\n\n## 各端版本与实际覆盖\n\n"
-            labels = {"frontend": "前端", "backend": "后端", None: "未指定角色"}
-            for repository in scope["repositories"]:
-                summary += (f"- {repository['name']}（{labels.get(repository['role'], '未指定角色')}）：commit `{repository['commit']}`；"
-                            f"本次提供 {repository['files']} / {repository['total_files']} 个安全源码文件、{repository['line_count']} 行。\n")
-            summary += "\n已导入全部成员仓库不代表已完整阅读；本次为有界采样，未提供的页面、接口、实现和测试仍需补充。\n\n## 本次已保存知识\n\n" + (navigation or "无成功保存卡片。")
+            summary = f"# {snapshot['project']['name']} · 业务梳理总结\n\n本次整理范围有限，未确认的业务内容不能据此推断。\n\n## 本次已保存知识\n\n" + (navigation or "无成功保存卡片。")
             if map_saved:
                 summary += f"\n\n业务地图：[[{paths['overview'][:-3]}|业务地图]]。"
-            summary += "\n\n## 待确认\n\n- 跨端连线需两端路由、方法、字段及实现的实际依据；同名或共属一个项目不能证明调用关系。\n- 代码引用核验不等于业务语义或真实运行验收。"
+            summary += "\n\n## 待确认\n\n- 业务之间的关系需分别核实；同名或属于同一项目不能证明业务闭环。\n- 文档归纳不代替业务实际运行与验收。"
             missing = [key for key in self.KEYS[1:] if key not in written]
             if missing:
-                summary += "\n- 本次未保存主题：" + "、".join(missing) + "；不能据此认定业务不存在。"
+                from .content_layout import CATEGORY_NAMES
+                summary += "\n- 本次未保存主题：" + "、".join(CATEGORY_NAMES[key] for key in missing) + "；不能据此认定业务不存在。"
             if conflicts:
                 summary += f"\n- {len(conflicts)} 篇文档存在人工修改或并发变化，已保留并建立独立更新建议。"
             content, source_paths = self._document(snapshot, scope, "summary", snapshot["project"]["name"] + " · 分析总结", summary, map_sources)

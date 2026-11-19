@@ -19,6 +19,7 @@
     "test:packaged": "node scripts/smoke-packaged.mjs",
     "test:packaged:all": "node scripts/smoke-packaged.mjs --all",
     "test:platform": "node --test scripts/test-desktop-platforms.mjs",
+    "test:ui": "node --test scripts/test-provider-form.mjs scripts/test-business-privacy.mjs",
     "test:backend": "node scripts/test-backend.mjs"
   },
   "build": {

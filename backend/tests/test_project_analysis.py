@@ -58,16 +58,17 @@ def test_analysis_preserves_repository_identity_for_same_paths(project_tools, mo
     result = analysis.analyze_sampled(project["id"])
     assert result["notes_created"] == 3
     assert {item["path"] for item in requests[0][1]["files"]} == {"front/src/rules.py", "back/src/rules.py"}
-    from businessmap.content_layout import project_business_paths, project_summary_path
-    path = project_business_paths(project["id"])["rules"]
+    from businessmap.content_layout import public_project_paths
+    path = "01-Wiki/天梯赛事/规则/支付规则.md"
     content = tools.store.read_note(path)["content"]
-    assert "source://front/" + "a" * 40 + "/src/rules.py#L1-L1" in content
-    assert "source://back/" + "b" * 40 + "/src/rules.py#L1-L1" in content
+    assert "source://" not in content and "src/" not in content
     meta = yaml.safe_load(content.split("---", 2)[1])
-    assert meta["project_id"] == project["id"] and "repository_id" not in meta
-    assert meta["source_repositories"] == [{"repository_id": "front", "commit": "a" * 40}, {"repository_id": "back", "commit": "b" * 40}]
-    summary = tools.store.read_note(project_summary_path(project["id"]))["content"]
-    assert "1 / 3" in summary and "front" in summary and "back" in summary
+    assert meta["generated"] is True and not ({"project_id", "source_repositories", "source_paths"} & set(meta))
+    state = tools.store.config_get("project_analysis:" + project["id"])
+    assert state["source_repositories"] == [{"repository_id": "front", "commit": "a" * 40}, {"repository_id": "back", "commit": "b" * 40}]
+    assert set(state["notes"]["rules"]["source_paths"]) == {"front/src/rules.py", "back/src/rules.py"}
+    summary = tools.store.read_note(public_project_paths(project["name"])["summary"])["content"]
+    assert "front" not in summary and "back" not in summary and "commit" not in summary
     for repo_id in project["repository_ids"]:
         assert tools.store.config_get(f"ai_analysis:{repo_id}", {}).get("auto_enabled") is False
     assert analysis.status(project["id"])["status"] == "completed"
@@ -124,8 +125,8 @@ def test_member_model_binding_must_share_exact_destination(project_tools, monkey
 
 def test_human_edit_and_concurrent_creation_preserved_with_separate_candidate(project_tools, monkeypatch):
     analysis, tools, project, provider = project_tools
-    from businessmap.content_layout import project_business_paths
-    path = project_business_paths(project["id"])["rules"]
+    from businessmap.content_layout import public_project_paths
+    path = "01-Wiki/天梯赛事/规则/支付规则.md"
     fake_model(monkeypatch, tools)
     analysis.analyze_sampled(project["id"])
     note = tools.store.read_note(path)
@@ -135,14 +136,14 @@ def test_human_edit_and_concurrent_creation_preserved_with_separate_candidate(pr
     assert tools.store.read_note(path)["content"] == human
     candidates = tools.store.config_get("project_analysis_candidates", [])
     assert any(item["path"] == path and item["project_id"] == project["id"] for item in candidates)
-    overview = tools.store.read_note(project_business_paths(project["id"])["overview"])["content"]
+    overview = tools.store.read_note(public_project_paths(project["name"])["overview"])["content"]
     assert "[[" + path[:-3] not in overview
 
 
 def test_replaced_candidate_is_cas_rejected_before_write(project_tools, monkeypatch):
     analysis, tools, project, provider = project_tools
-    from businessmap.content_layout import project_business_paths
-    path = project_business_paths(project["id"])["rules"]
+    from businessmap.content_layout import public_project_paths
+    path = "01-Wiki/天梯赛事/规则/支付规则.md"
     fake_model(monkeypatch, tools)
     analysis.analyze_sampled(project["id"])
     saved = tools.store.read_note(path)
@@ -164,25 +165,23 @@ def test_replaced_candidate_is_cas_rejected_before_write(project_tools, monkeypa
     assert "更新的建议" in next(item for item in analysis.candidates() if item["id"] == candidate["id"])["content"]
 
 
-def test_map_and_summary_link_sources_while_cards_keep_exact_code(project_tools, monkeypatch):
+def test_map_summary_and_cards_keep_all_source_evidence_private(project_tools, monkeypatch):
     analysis, tools, project, provider = project_tools
-    from businessmap.content_layout import project_business_paths, project_summary_path
+    from businessmap.content_layout import public_project_paths
     fake_model(monkeypatch, tools)
     analysis.analyze_sampled(project["id"])
-    paths = project_business_paths(project["id"])
-    card = tools.store.read_note(paths["rules"])["content"]
-    assert "```text\nfront_payment = True\n```" in card
-    assert "```text\nback_payment = True\n```" in card
-    for path in (paths["overview"], project_summary_path(project["id"])):
+    paths = {**public_project_paths(project["name"]), "rules": "01-Wiki/天梯赛事/规则/支付规则.md"}
+    for path in paths.values():
         content = tools.store.read_note(path)["content"]
-        assert "source://front/" in content and "source://back/" in content
-        assert "front_payment = True" not in content and "back_payment = True" not in content
+        assert "source://" not in content and "```" not in content and "src/" not in content
+    state = tools.store.config_get("project_analysis:" + project["id"])
+    assert state["notes"]["rules"]["source_paths"]
 
 
 def test_candidate_application_uses_current_note_revision_and_preserves_other_vault_candidates(project_tools, monkeypatch):
     analysis, tools, project, provider = project_tools
-    from businessmap.content_layout import project_business_paths
-    path = project_business_paths(project["id"])["rules"]
+    from businessmap.content_layout import public_project_paths
+    path = "01-Wiki/天梯赛事/规则/支付规则.md"
     fake_model(monkeypatch, tools)
     analysis.analyze_sampled(project["id"])
     original = tools.store.read_note(path)

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from businessmap.core import CoreError, Store
+from businessmap.core import CoreError, Store, revision
 
 
 @pytest.fixture
@@ -17,31 +17,51 @@ def store(tmp_path):
     instance.close()
 
 
+def legacy_read(store, path):
+    content = (store.vault / path).read_text(encoding="utf-8-sig")
+    return {"path": path, "content": content, "revision": revision(content)}
+
+
+def legacy_write(store, path, content, *_prior_revision):
+    # Simulate bytes left by an older build/human editor. Public save/read APIs
+    # correctly refuse technical documents; migration still owns private CAS.
+    target = store.vault / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+    store.refresh()
+    return legacy_read(store, path)
+
+
 def test_business_graph_excludes_source_material_and_does_not_dangle_edges(store):
     # Including raw/source nodes turns a code-file inventory into a business map.
-    store.save_note("代码索引/repo/版本-abc.md", "# 代码索引\n\n[[业务/规则]]\n")
-    store.save_note("00-Inbox/代码资料/repo/source.md", "---\ntype: code\n---\n# Source\n")
-    store.save_note("资料.md", "---\ntype: raw\n---\n# Raw\n")
-    store.save_note("业务/规则.md", "# 规则\n\n[[业务/流程]] [[00-Inbox/代码资料/repo/source]]\n")
-    store.save_note("业务/流程.md", "# 流程\n")
+    legacy_write(store, "代码索引/repo/版本-abc.md", "# 代码索引\n\n[[业务/规则]]\n")
+    legacy_write(store, "00-Inbox/代码资料/repo/source.md", "---\ntype: code\n---\n# Source\n")
+    legacy_write(store, "资料.md", "---\ntype: raw\n---\n# Raw\n")
+    legacy_write(store, "业务/规则.md", "# 规则\n\n[[业务/流程]] [[资料]]\n")
+    legacy_write(store, "业务/流程.md", "# 流程\n")
     graph = store.graph()
     assert {node["id"] for node in graph["nodes"]} == {"业务/规则.md", "业务/流程.md"}
     assert graph["edges"] == [{"source": "业务/规则.md", "target": "业务/流程.md"}]
     assert store.workspace()["stats"] == {
-        "notes": 5, "business_notes": 2, "source_documents": 3,
+        "notes": 2, "business_notes": 2, "source_documents": 0,
         "links": 1, "repositories": 0, "projects": 0,
     }
+    for path in ("代码索引/repo/版本-abc.md", "00-Inbox/代码资料/repo/source.md", "资料.md"):
+        assert (store.vault / path).exists()
+        with pytest.raises(CoreError) as error:
+            store.read_note(path)
+        assert error.value.status_code == 404
 
 
 def legacy_content(store, *, edited=False, conflict=False):
     repo = {"id": "repo", "name": "Arena", "vault_path": str(store.vault), "commit": "abc"}
     with store._db() as db:
         db.execute("INSERT INTO repositories VALUES (?,?)", ("repo", json.dumps(repo)))
-    source = store.save_note("代码索引/repo/source.md", "---\ntype: code\n---\n# Service.java\n")
-    business = store.save_note("业务地图/repo/overview.md", "---\ntype: business\n---\n# 地图\n\n[[代码索引/repo/source|代码]] [[业务地图/repo/rules]]\n")
-    rules = store.save_note("业务地图/repo/rules.md", "---\ntype: business\n---\n# 规则\n\n[[业务地图/repo/overview]]\n")
-    store.save_note("代码索引/repo/版本-abc.md", "# 无已知 revision 的旧清单\n")
-    store.save_note("人工笔记.md", "# 人工说明\n\n[[业务地图/repo/overview]]\n")
+    source = legacy_write(store, "代码索引/repo/source.md", "---\ntype: code\n---\n# Service.java\n")
+    business = legacy_write(store, "业务地图/repo/overview.md", "---\ntype: business\n---\n# 地图\n\n[[代码索引/repo/source|代码]] [[业务地图/repo/rules]]\n")
+    rules = legacy_write(store, "业务地图/repo/rules.md", "---\ntype: business\n---\n# 规则\n\n[[业务地图/repo/overview]]\n")
+    legacy_write(store, "代码索引/repo/版本-abc.md", "# 无已知 revision 的旧清单\n")
+    legacy_write(store, "人工笔记.md", "# 人工说明\n\n[[业务地图/repo/overview]]\n")
     with store._db() as db:
         db.execute("INSERT INTO managed_notes VALUES (?,?,?,?,?)", ("repo", "Service.java", source["path"], "blob", source["revision"]))
     state = {"vault_path": str(store.vault), "last_analyzed_commit": "abc", "auto_enabled": False,
@@ -49,27 +69,27 @@ def legacy_content(store, *, edited=False, conflict=False):
                        "rules": {"path": rules["path"], "revision": rules["revision"], "commit": "abc"}}}
     store.config_set("ai_analysis:repo", state)
     if edited:
-        store.save_note(source["path"], source["content"] + "人工补充\n", source["revision"])
+        legacy_write(store, source["path"], source["content"] + "人工补充\n", source["revision"])
     if conflict:
-        store.save_note("02-Areas/业务地图/repo/业务地图.md", "# 人工先创建的地图\n")
+        legacy_write(store, "02-Areas/业务地图/repo/业务地图.md", "# 人工先创建的地图\n")
     return source, business, rules
 
 
 def test_layout_migration_moves_only_owned_content_and_keeps_database_revisions_consistent(store):
     # Moving bytes without updating managed metadata loses future edit protection.
     source, business, rules = legacy_content(store)
-    human = store.read_note("人工笔记.md")["content"]
+    human = legacy_read(store, "人工笔记.md")["content"]
     result = store.migrate_content_layout()
     assert result["moved"] == 3
-    new_source = store.read_note("00-Inbox/代码资料/repo/source.md")
-    new_map = store.read_note("02-Areas/业务地图/repo/业务地图.md")
-    new_rules = store.read_note("01-Wiki/业务知识/repo/rules.md")
+    new_source = legacy_read(store, "00-Inbox/代码资料/repo/source.md")
+    new_map = legacy_read(store, "02-Areas/业务地图/repo/业务地图.md")
+    new_rules = legacy_read(store, "01-Wiki/业务知识/repo/rules.md")
     assert new_source["content"] == source["content"]
     assert "[[00-Inbox/代码资料/repo/source|代码]]" in new_map["content"]
     assert "[[01-Wiki/业务知识/repo/rules]]" in new_map["content"]
     assert "[[02-Areas/业务地图/repo/业务地图]]" in new_rules["content"]
-    assert store.read_note("人工笔记.md")["content"] == human
-    assert store.read_note("代码索引/repo/版本-abc.md")
+    assert legacy_read(store, "人工笔记.md")["content"] == human
+    assert legacy_read(store, "代码索引/repo/版本-abc.md")
     for old in (source, business, rules):
         assert not (store.vault / old["path"]).exists()
     with sqlite3.connect(store.db_path) as db:
@@ -86,14 +106,14 @@ def test_layout_migration_moves_only_owned_content_and_keeps_database_revisions_
 
 def test_layout_migration_preserves_human_changes_and_existing_destinations(store):
     source, business, rules = legacy_content(store, edited=True, conflict=True)
-    edited = store.read_note(source["path"])["content"]
+    edited = legacy_read(store, source["path"])["content"]
     result = store.migrate_content_layout()
     assert result["moved"] == 1
     assert {item["path"] for item in result["skipped"]} == {source["path"], business["path"]}
-    assert store.read_note(source["path"])["content"] == edited
-    assert store.read_note(business["path"])["content"] == business["content"]
-    assert store.read_note("02-Areas/业务地图/repo/业务地图.md")["content"] == "# 人工先创建的地图\n"
-    assert "[[业务地图/repo/overview]]" in store.read_note("01-Wiki/业务知识/repo/rules.md")["content"]
+    assert legacy_read(store, source["path"])["content"] == edited
+    assert legacy_read(store, business["path"])["content"] == business["content"]
+    assert legacy_read(store, "02-Areas/业务地图/repo/业务地图.md")["content"] == "# 人工先创建的地图\n"
+    assert "[[业务地图/repo/overview]]" in legacy_read(store, "01-Wiki/业务知识/repo/rules.md")["content"]
     assert not (store.vault / "00-Inbox/代码资料/repo/source.md").exists()
 
 
@@ -125,7 +145,7 @@ def test_layout_migration_resumes_after_interrupted_file_and_database_phases(sto
     assert len(list((store.data_dir / "layout-migrations").glob("*/*/manifest.json"))) == 1
     with sqlite3.connect(store.db_path) as db:
         assert db.execute("SELECT note_path,revision FROM managed_notes").fetchone() == (
-            "00-Inbox/代码资料/repo/source.md", store.read_note("00-Inbox/代码资料/repo/source.md")["revision"])
+            "00-Inbox/代码资料/repo/source.md", legacy_read(store, "00-Inbox/代码资料/repo/source.md")["revision"])
     assert not (store.vault / "代码索引/repo/source.md").exists()
     assert not (store.vault / "业务地图/repo/overview.md").exists()
     assert not (store.vault / "业务地图/repo/rules.md").exists()
@@ -181,12 +201,12 @@ def test_layout_migration_does_not_recreate_a_user_deleted_original_after_interr
 def test_layout_migration_keeps_literal_code_examples_unchanged(store):
     _, business, _ = legacy_content(store)
     examples = "\n`[[业务地图/repo/rules]]`\n\n```md\n[[业务地图/repo/rules]]\n```\n"
-    saved = store.save_note(business["path"], business["content"] + examples, business["revision"])
+    saved = legacy_write(store, business["path"], business["content"] + examples, business["revision"])
     state = store.config_get("ai_analysis:repo")
     state["notes"]["overview"]["revision"] = saved["revision"]
     store.config_set("ai_analysis:repo", state)
     store.migrate_content_layout()
-    migrated = store.read_note("02-Areas/业务地图/repo/业务地图.md")["content"]
+    migrated = legacy_read(store, "02-Areas/业务地图/repo/业务地图.md")["content"]
     assert "[[01-Wiki/业务知识/repo/rules]]" in migrated
     assert examples in migrated
 
@@ -227,7 +247,7 @@ def test_layout_migration_aborts_when_a_target_is_deleted_during_the_same_attemp
     assert error.value.status_code == 409
     assert deleted
     for original in (source, business, rules):
-        assert store.read_note(original["path"])["content"] == original["content"]
+        assert legacy_read(store, original["path"])["content"] == original["content"]
     assert store.config_get("ai_analysis:repo")["notes"]["overview"]["path"] == business["path"]
     assert (store.data_dir / "layout-migrations").exists()
 
@@ -241,11 +261,11 @@ def test_layout_migration_aborts_when_a_target_is_deleted_during_the_same_attemp
 def test_layout_migration_preserves_long_closing_or_unclosed_fenced_evidence(store, evidence):
     _, business, _ = legacy_content(store)
     content = business["content"] + "\n" + evidence
-    saved = store.save_note(business["path"], content, business["revision"])
+    saved = legacy_write(store, business["path"], content, business["revision"])
     state = store.config_get("ai_analysis:repo")
     state["notes"]["overview"]["revision"] = saved["revision"]
     store.config_set("ai_analysis:repo", state)
     store.migrate_content_layout()
-    migrated = store.read_note("02-Areas/业务地图/repo/业务地图.md")["content"]
+    migrated = legacy_read(store, "02-Areas/业务地图/repo/业务地图.md")["content"]
     assert "[[01-Wiki/业务知识/repo/rules]]" in migrated
     assert evidence in migrated

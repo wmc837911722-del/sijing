@@ -118,13 +118,20 @@ class KnowledgeNavigator:
         return deepcopy(KNOWLEDGE_TOOLS)
 
     def _snapshot(self):
+        vault, epoch = str(self.store.vault), self.store._vault_epoch
         self.store.refresh()
         # Use Store's parsed Markdown cache atomically. read_note computes the
         # complete backlink graph for every note, which discovery does not need.
         with self.store._lock:
             notes = {path: dict(note) for path, note in self.store._cache.items()}
             version = self.store.version
-        visible = {path: note for path, note in notes.items() if self.allowed(note)}
+        owners = self.store.business_owner_index()
+        if str(self.store.vault) != vault or self.store._vault_epoch != epoch:
+            raise CoreError(409, "知识库已切换，请重新读取业务资料")
+        for note in notes.values():
+            note["_business_owners"] = self.store.business_note_owners(note, owners)
+        visible = {path: note for path, note in notes.items()
+                   if self.store.current_business_note(note) and self.allowed(note)}
         return notes, visible, version
 
     @staticmethod

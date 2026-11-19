@@ -20,7 +20,7 @@ const NEW_CHAT = '__new__';
 const MESSAGE_LIMIT = 8000;
 const DEFAULT_SELECTION: Selection = { mode: 'knowledge', provider_id: '', repository_id: '', project_id: '', datasource_id: '' };
 const SUGGESTIONS = {
-  knowledge: [ ['梳理业务', '这个系统有哪些核心业务流程？'], ['理解规则', '订单退款需要满足哪些条件？'], ['追溯代码', '订单状态如何流转，对应哪些代码？'] ],
+  knowledge: [ ['梳理业务', '这个系统有哪些核心业务流程？'], ['理解规则', '订单退款需要满足哪些条件？'], ['理解流程', '订单状态如何流转，各阶段可以做什么？'] ],
   data: [ ['汇总数据', '按渠道统计订单数量和金额'], ['分析趋势', '最近 7 天每天的订单数量是多少？'], ['查看分布', '各订单状态分别有多少条记录？'] ],
 };
 
@@ -312,11 +312,11 @@ export default function Chat({ settings, repositories, projects, datasources, no
 
       <div className="bm-chat-composer-area">
         {scopeId && <div className="bm-chat-repository-policy" role="status">
-          <span>{currentPolicy?.error ? `无法读取${scopeLabel}模型绑定：${currentPolicy.error}` : !policy ? `正在读取${scopeLabel}允许的模型…` : policy.status === 'ready' ? `${scopeLabel}绑定：${policy.provider_name || '已配置模型'} · ${policy.model} · ${policy.base_url}` : policy.status === 'changed' ? `${scopeLabel}的模型配置或成员已变化，请重新确认绑定。` : policy.status === 'missing' ? '绑定的模型已移除，请重新绑定。' : `此${scopeLabel}尚未绑定模型；绑定后可进行 AI 问答。`}{!provider && ' 当前使用本地检索，不会发送代码。'}</span>
+          <span>{currentPolicy?.error ? `无法读取${scopeLabel}模型绑定：${currentPolicy.error}` : !policy ? `正在读取${scopeLabel}允许的模型…` : policy.status === 'ready' ? `${scopeLabel}绑定：${policy.provider_name || '已配置模型'} · ${policy.model} · ${policy.base_url}` : policy.status === 'changed' ? `${scopeLabel}的模型配置或成员已变化，请重新确认绑定。` : policy.status === 'missing' ? '绑定的模型已移除，请重新绑定。' : `此${scopeLabel}尚未绑定模型；绑定后可进行 AI 问答。`}{!provider && ' 当前使用本地业务知识检索。'}</span>
           {policy?.status === 'ready' && policy.provider_id !== effectiveProviderId ? <button type="button" className="bm-chat-text-button" disabled={busy || creating} onClick={() => updateSelection({ provider_id: policy.provider_id || '' })}>使用绑定模型</button> : policy && policy.status !== 'ready' ? <button type="button" className="bm-chat-text-button" onClick={onRepositories}>前往项目与仓库绑定</button> : null}
         </div>}
         <form className="bm-chat-composer" onSubmit={event => { event.preventDefault(); void send(); }}>
-          <label className="bm-chat-input-label" htmlFor="bm-chat-input">{selection.mode === 'data' ? '描述你想查询的业务数据' : '询问业务规则、流程或代码'}</label>
+          <label className="bm-chat-input-label" htmlFor="bm-chat-input">{selection.mode === 'data' ? '描述你想查询的业务数据' : '询问业务规则、流程或数据口径'}</label>
           <textarea id="bm-chat-input" ref={input} placeholder={busy ? '继续写下一个问题，当前回答完成后发送…' : selection.mode === 'data' ? '例如：按渠道统计最近一个月的订单金额…' : '例如：订单退款需要满足哪些条件？'} value={text} rows={3} maxLength={20000} aria-invalid={exceedsLimit || undefined} aria-describedby={messageLength > 7000 ? 'bm-chat-input-limit' : undefined} disabled={creating} onChange={event => setDraft(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void send(); } }}/>
           {messageLength > 7000 && <p id="bm-chat-input-limit" className={`bm-chat-input-limit${exceedsLimit ? ' is-invalid' : ''}`} role={exceedsLimit ? 'alert' : undefined}>{messageLength.toLocaleString()} / {MESSAGE_LIMIT.toLocaleString()} 字符{exceedsLimit ? ' · 请缩短问题后发送，当前文字已保留。' : ''}</p>}
           <div className="bm-chat-composer-bottom"><div className="bm-chat-controls">
