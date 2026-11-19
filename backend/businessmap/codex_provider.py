@@ -227,16 +227,19 @@ def request_input_bytes(messages, *, max_output, output_schema):
     return len(prompt.encode()) + len(schema_wire.encode())
 
 
-def complete(messages, model, *, max_output, before_send, timeout=None, output_schema=None, absolute_deadline=None):
+def complete(messages, model, *, max_output, before_send, timeout=None, output_schema=None, absolute_deadline=None,
+             execution_timeout=None):
     with _codex_dispatch.native_attempt() as dispatch:
         return _complete(messages, model, max_output=max_output, before_send=before_send, timeout=timeout,
-                         output_schema=output_schema, absolute_deadline=absolute_deadline, dispatch=dispatch)
+                         output_schema=output_schema, absolute_deadline=absolute_deadline,
+                         execution_timeout=execution_timeout, dispatch=dispatch)
 
 
-def _complete(messages, model, *, max_output, before_send, timeout, output_schema, absolute_deadline, dispatch):
+def _complete(messages, model, *, max_output, before_send, timeout, output_schema, absolute_deadline,
+              execution_timeout, dispatch):
     if not isinstance(max_output, int) or isinstance(max_output, bool) or not 1 <= max_output <= 16000:
         raise _codex_error("config", "Codex 输出额度无效。", 400)
-    for value in (timeout, absolute_deadline):
+    for value in (timeout, absolute_deadline, execution_timeout):
         if value is not None and (type(value) not in (int, float) or value <= 0
                                   or not math.isfinite(value)):
             raise _codex_error("timeout", "Codex 调用已达到时间限制。", 408)
@@ -282,7 +285,13 @@ def _complete(messages, model, *, max_output, before_send, timeout, output_schem
             prompt_input.write(prompt.encode())
             prompt_input.seek(0)
             dispatch.check_control(before_send)
-            if time.monotonic() >= deadline:
+            ready = time.monotonic()
+            if execution_timeout is not None:
+                # Only the semantic execution window starts after local admission.
+                # An explicit caller deadline or timeout still includes preparation.
+                process_deadline = ready + min(execution_timeout, ceiling)
+                deadline = process_deadline if timeout is None and absolute_deadline is None else min(deadline, process_deadline)
+            if ready >= deadline:
                 raise _codex_error("timeout", "Codex 调用已达到时间限制。", 408)
             environment = _environment()
             # Once process creation is attempted, zero dispatch is no longer proven.

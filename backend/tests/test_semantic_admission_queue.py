@@ -201,15 +201,15 @@ def test_waiter_observes_controls_without_claim_or_receipt_change(semantic_case,
         assert running.result(3)[0] == []
 
 
-def test_queue_wait_precedes_original_deadline_creation(semantic_case, monkeypatch):
+def test_queue_wait_preserves_complete_stage_execution_budget(semantic_case, monkeypatch):
     holder, entered, release = held_call(semantic_case)
     waiting = threading.Event()
     current = runtime(semantic_case, holder.service, identity='waiter', guard=waiting.set)
-    clock, deadlines = [1000.], []
+    clock, windows = [1000.], []
     monkeypatch.setattr(sem, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
     original = holder.service.providers.complete
     def complete(*args, **kwargs):
-        deadlines.append(kwargs['_deadline'])
+        windows.append((clock[0], kwargs['_codex_execution_timeout']))
         return original(*args, **kwargs)
     holder.service.providers.complete = complete
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -222,7 +222,7 @@ def test_queue_wait_precedes_original_deadline_creation(semantic_case, monkeypat
         release.set()
         assert first.result(3)[0] == second.result(3)[0] == []
     # Catalogue retains 180, while the structured review/proposal policy remains 360.
-    assert deadlines == [1180., 9180.]
+    assert windows == [(1000., 180), (9000., 180)]
     assert sem.budget_profile(current._snapshot)['stages']['proposal']['timeout_seconds'] == 360
 
 

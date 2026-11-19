@@ -87,7 +87,11 @@ def test_trailing_bytes_after_candidate_are_rejected(monkeypatch):
     assert stopped == [True]
 
 
-def test_initial_guard_expiry_never_spawns(monkeypatch):
+@pytest.mark.parametrize("limits", [
+    {"absolute_deadline": 1.0},
+    {"timeout": 1.0, "execution_timeout": 360, "output_schema": {"type": "object"}},
+], ids=["absolute", "relative-with-execution-window"])
+def test_initial_guard_expiry_never_spawns(monkeypatch, limits):
     clock = [0.0]
     monkeypatch.setattr(c, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     monkeypatch.setattr(c, "status", lambda: {"status": "ready", "version": "fixture"})
@@ -95,8 +99,8 @@ def test_initial_guard_expiry_never_spawns(monkeypatch):
     monkeypatch.setattr(c, "_text_only_catalog", lambda *_: "{}")
     monkeypatch.setattr(c.subprocess, "Popen", lambda *a, **k: pytest.fail("spawned after deadline"))
     with pytest.raises(ToolError) as error:
-        c.complete([], "default", max_output=64, before_send=lambda: clock.__setitem__(0, 1.0), absolute_deadline=1.0)
-    assert error.value.codex_reason == "timeout"
+        c.complete([], "default", max_output=64, before_send=lambda: clock.__setitem__(0, 1.0), **limits)
+    assert error.value.status_code == 408 and error.value.codex_reason == "timeout"
 
 
 @pytest.mark.parametrize("raw,exit_code,reason", [
@@ -137,7 +141,8 @@ def test_final_guard_can_revoke_timely_candidate(monkeypatch):
     assert stopped == [True]
 
 
-def test_service_absolute_deadline_includes_first_guard(service, cli, monkeypatch):
+@pytest.mark.parametrize("execution_window", [{}, {"_codex_execution_timeout": 360}])
+def test_service_absolute_deadline_includes_first_guard(service, cli, monkeypatch, execution_window):
     selected = save(service)
     clock = [10.0]
     monkeypatch.setattr(c, "time", SimpleNamespace(monotonic=lambda: clock[0]))
@@ -147,6 +152,6 @@ def test_service_absolute_deadline_includes_first_guard(service, cli, monkeypatc
     monkeypatch.setattr(c.subprocess, "Popen", lambda *a, **k: pytest.fail("expired guard spawned"))
     with pytest.raises(ToolError) as error:
         service.complete("system", "user", provider_id=selected["id"], _deadline=11.0,
-                         before_send=lambda: clock.__setitem__(0, 11.0))
+                         before_send=lambda: clock.__setitem__(0, 11.0), **execution_window)
     assert error.value.codex_reason == "timeout"
     assert service.usage()["requests"] == 0

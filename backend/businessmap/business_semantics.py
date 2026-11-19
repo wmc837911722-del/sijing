@@ -2802,7 +2802,7 @@ class BusinessSemanticIntegration:
         dispatch = _codex_dispatch.CodexDispatch()
         try:
             if structured:
-                structured["_deadline"] = time.monotonic() + limits["timeout_seconds"]
+                structured["_codex_execution_timeout"] = limits["timeout_seconds"]
             try:
                 with dispatch.observe():
                     response = self.service.providers.complete(system, wire, provider_id=self._snapshot["provider"]["id"],

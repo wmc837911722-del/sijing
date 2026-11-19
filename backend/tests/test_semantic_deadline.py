@@ -15,6 +15,70 @@ SCHEMA = {"type": "object", "properties": {"decision": {"type": "string"},
           "checks": {"type": "object"}, "issues": {"type": "array"}},
           "required": ["decision", "checks", "issues"], "additionalProperties": False}
 
+@pytest.mark.parametrize("execution_seconds", [359, 360])
+def test_review_execution_budget_after_slow_first_admission(semantic_case, service, cli, monkeypatch, execution_seconds):
+    from types import SimpleNamespace
+    from test_business_semantics import review
+
+    selected = save(service)
+    semantic_case[1]["provider"] = selected
+    setup = build_case(semantic_case)
+    runtime = setup[0]
+    fake_other_stages = runtime.service.providers.complete
+    validate_history = runtime._raise_cached_failure
+    clock = [1000.]
+    active_review = []
+    launches = []
+
+    def history():
+        validate_history()
+        if active_review and not launches:
+            clock[0] += 400
+
+    def complete(system, text, **kwargs):
+        payload = json.loads(text)
+        if payload["stage"] != "review":
+            return fake_other_stages(system, text, **kwargs)
+        active_review.append(payload)
+        return service.complete(system, text, **kwargs)
+
+    def spawn(*args, stdout, **kwargs):
+        launches.append(clock[0])
+        clock[0] += execution_seconds
+        answer = json.dumps({"answer": review(active_review[0])})
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": answer}},
+            {"type": "turn.completed", "usage": {}},
+        ]
+        stdout.write("".join(json.dumps(event) + "\n" for event in events).encode())
+        stdout.flush()
+        return SimpleNamespace(returncode=0, poll=lambda: 0)
+
+    monkeypatch.setattr(runtime, "_raise_cached_failure", history)
+    runtime.service.providers.complete = complete
+    timer = SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr(semantics, "time", timer)
+    monkeypatch.setattr(codex_provider, "time", timer)
+    monkeypatch.setattr(codex_provider, "status", lambda: {"status": "ready", "version": "fixture"})
+    monkeypatch.setattr(codex_provider, "_text_only_catalog", lambda *_: "{}")
+    monkeypatch.setattr(codex_provider.subprocess, "Popen", spawn)
+    monkeypatch.setattr(codex_provider, "_stop", lambda _: None)
+
+    if execution_seconds < 360:
+        execute(setup)
+    else:
+        with pytest.raises(semantics.SemanticValidationError) as failure:
+            execute(setup)
+        assert failure.value.reason_code == "model_call"
+    assert launches == [1400.]
+    row = next(row for row in checkpoint_rows(semantic_case[0]).values() if row["stage"] == "review")
+    if execution_seconds < 360:
+        assert row["status"] == "accepted" and service.usage()["requests"] == 1
+    else:
+        assert row["status"] == "needs_review" and row["data"]["result"] is None
+        assert row["data"]["diagnostic"]["codex_reason"] == "timeout" and service.usage()["requests"] == 0
+
+
 
 @pytest.mark.parametrize("structured,timeout,succeeds", [
     (True, 1, True), (True, None, False), (True, .1, False),
@@ -40,14 +104,16 @@ def test_delayed_complete_result_requires_explicit_structured_extension(service,
     assert not Path(call["cwd"]).exists()
 
 
-def test_structured_extension_cannot_exceed_fixed_ceiling(service, cli, monkeypatch):
+@pytest.mark.parametrize("window", ["absolute", "execution"])
+def test_structured_extension_cannot_exceed_fixed_ceiling(service, cli, monkeypatch, window):
     monkeypatch.setattr(codex_provider, "TIMEOUT_SECONDS", .1)
     monkeypatch.setattr(codex_provider, "STRUCTURED_TIMEOUT_SECONDS", .2, raising=False)
     (cli / "mode").write_text("delayed-structured")
     selected = save(service)
     started = time.monotonic()
+    options = {"_deadline": started + 100} if window == "absolute" else {"_codex_execution_timeout": 100}
     with pytest.raises(ToolError) as failure:
-        service.complete("规则", "资料", provider_id=selected["id"], output_schema=SCHEMA, _deadline=started + 100)
+        service.complete("规则", "资料", provider_id=selected["id"], output_schema=SCHEMA, **options)
     assert failure.value.status_code == 408 and time.monotonic() - started < 1
 
 
@@ -96,10 +162,11 @@ def test_extended_structured_call_still_runs_streaming_guards_and_cleanup(servic
 
 @pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -float("inf"), 0, -1, True, "360"])
 @pytest.mark.parametrize("structured", [False, True])
-def test_invalid_timeout_is_controlled_before_any_process(service, cli, timeout, structured):
+@pytest.mark.parametrize("field", ["timeout", "execution_timeout"])
+def test_invalid_timeout_is_controlled_before_any_process(service, cli, timeout, structured, field):
     options = {"output_schema": SCHEMA} if structured else {}
     with pytest.raises(ToolError) as failure:
-        codex_provider.complete([], "default", max_output=6000, before_send=lambda: None, timeout=timeout, **options)
+        codex_provider.complete([], "default", max_output=6000, before_send=lambda: None, **{field: timeout}, **options)
     assert failure.value.status_code == 408 and failure.value.codex_reason == "timeout"
     assert not (cli / "invocation.json").exists()
 
@@ -124,13 +191,15 @@ def test_fixed_stage_duration_is_ephemeral_argument_and_resume_has_zero_sends(se
         assert {stage: limits["timeout_seconds"] for stage, limits in profile["stages"].items()} == {
             "catalogue": 180, "subdivide": 180, "proposal": 360, "review": 360, "partition_review": 360}
     for stage, options in observed:
+        assert "_deadline" not in options
         if local:
-            assert options["_deadline"] == 1000 + (180 if stage in {"catalogue", "subdivide"} else 360)
+            assert options["_codex_execution_timeout"] == (180 if stage in {"catalogue", "subdivide"} else 360)
         else:
-            assert "_deadline" not in options
+            assert "_codex_execution_timeout" not in options
             assert "timeout_seconds" not in profile["stages"][stage]
     before = checkpoint_rows(semantic_case[0])
     assert "_deadline" not in json.dumps(before)
+    assert "_codex_execution_timeout" not in json.dumps(before)
     clock[0] = 5000.
     replay = execute(setup)
     assert replay["semantic_input_hash"] == projection["semantic_input_hash"]

@@ -415,7 +415,8 @@ class ProviderService:
 
     def complete(self, system, user, history=None, provider_id=None, max_output=2200, context=None,
                  expected_destination=None, before_send=None, _connection_test=False,
-                 _tool_messages=None, _tools=None, _deadline=None, json_mode=False, output_schema=None):
+                 _tool_messages=None, _tools=None, _deadline=None, json_mode=False, output_schema=None,
+                 _codex_execution_timeout=None):
         provider = self.get(provider_id)
         if not provider:
             raise ToolError("尚未配置并启用模型。", 409)
@@ -440,6 +441,8 @@ class ProviderService:
                 if before_send is not None:
                     before_send()
             structured = {"output_schema": output_schema} if output_schema is not None else {}
+            if _codex_execution_timeout is not None:
+                structured["execution_timeout"] = _codex_execution_timeout
             absolute = {"absolute_deadline": _deadline} if _deadline is not None else {}
             result = complete(messages, provider["model"], max_output=max_output, before_send=guard,
                               timeout=None, **absolute, **structured)
