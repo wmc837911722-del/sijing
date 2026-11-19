@@ -14,6 +14,45 @@ EVIDENCE_FIELDS = frozenset(('checked_at local_owner_pids local_processes_draine
 RECEIPT_FIELDS = PLAN_FIELDS | AUTH_FIELDS | {'authorization_ref', 'reconciliation_evidence'}
 
 
+def _plan_fields(value):
+    return PLAN_FIELDS | ({'prior_bundle_id'} if 'prior_bundle_id' in value else set())
+
+
+def _receipt_fields(value):
+    if 'prior_bundle_id' in value:
+        return RECEIPT_FIELDS | {'prior_bundle_id', 'authorization_path', 'authorization_raw'}
+    return RECEIPT_FIELDS
+
+
+def _authorization(authorization, plan):
+    """Keep the exact, private operator grant for restartable post-bundle claims."""
+    from hashlib import sha256
+    from .semantic_proposal_recovery import _check_grant, _private_evidence_bytes
+    auth = _check_grant(authorization, plan)
+    if 'prior_bundle_id' in plan:
+        raw = _private_evidence_bytes(authorization)
+        s._require(sha256(raw).hexdigest() == auth['authorization_ref'], 'cache_invalid')
+        auth['authorization_raw'] = raw.decode('utf-8')
+    return auth
+
+
+def _live_review_selection(receipt, allowlist):
+    if 'prior_bundle_id' not in receipt:
+        return (receipt['parent_stage_hash'], receipt['child_stage_hash']) in allowlist
+    from .semantic_proposal_recovery import _private_evidence_bytes
+    from .semantic_recovery import _evidence_json
+    import time
+    event = receipt.get('authority_event')
+    path, raw = ((event['authorization_path'], event['grant_raw']) if event
+                 else (receipt['authorization_path'], receipt['authorization_raw']))
+    grant = _evidence_json(raw.encode('utf-8'))
+    evidence = event['evidence_raw'] if event else receipt['reconciliation_evidence']
+    return (grant.get('authorization_path') == path
+            and _private_evidence_bytes(path) == raw.encode('utf-8')
+            and _private_evidence_bytes(grant['reconciliation_ref']) == evidence.encode('utf-8')
+            and grant['authorized_at'] <= time.time() < grant['expires_at'])
+
+
 def _require_allowances(value):
     s._require(all(type(value.get(key)) is int and value[key]==expected for key,expected in (
         ('logical_draft_maximum',2),('physical_maximum_calls',5),('replacement_allowance',1))), 'cache_invalid')
@@ -33,7 +72,7 @@ def _eligible(row, snapshot):
 
 
 def _plan(snapshot, run, parent_stage_hash, *, read_checkpoint, baseline=None,
-          atomic_budget_chains=(), whole_histories=(), partition_repair_pairs=()):
+          atomic_budget_chains=(), whole_histories=(), partition_repair_pairs=(), prior_bundle_id=None):
     from .semantic_proposal_recovery import _without_packet, _packet_binding, _source_material
     try:
         s._require(all(callable(getattr(read_checkpoint,name,None)) for name in
@@ -63,10 +102,23 @@ def _plan(snapshot, run, parent_stage_hash, *, read_checkpoint, baseline=None,
                 and len({tuple(item) for item in group})==len(group) and list(map(tuple,group))==sorted(map(tuple,group)), 'cache_invalid')
         atomic_budget_chains,whole_histories,partition_repair_pairs=(tuple(map(tuple,group)) for group in groups)
         if baseline is None:
-            scoped=_without_packet(read_checkpoint,identity,context['packet_hash'])
+            from .semantic_review_exception import _bundle_if_present, _proof_parts
+            bundle = _bundle_if_present(snapshot, identity, read_checkpoint)
+            if bundle is None:
+                scoped = _without_packet(read_checkpoint, identity, context['packet_hash'])
+                omitted_timeout = None
+            else:
+                predecessor, _, _ = _proof_parts(bundle, read_checkpoint, snapshot, identity)
+                from .semantic_review_exception import _completed_member_packets
+                packets = _completed_member_packets(predecessor, read_checkpoint)
+                s._require(context['packet_hash'] not in packets, 'cache_invalid')
+                prior_bundle_id = predecessor['bundle_id']
+                # v2 can only authenticate against a complete physical inventory.
+                scoped, omitted_timeout = read_checkpoint, parent_stage_hash
             materialized=s.SemanticCheckpointRows(scoped.task_rows(identity));materialized.read_checkpoint=scoped
-            s.semantic_task_inventory(materialized,snapshot=snapshot,expected_input_hash=identity,
-                atomic_budget_chains=atomic_budget_chains,whole_histories=whole_histories,partition_repair_pairs=partition_repair_pairs)
+            s._semantic_task_inventory(materialized,snapshot=snapshot,expected_input_hash=identity,
+                atomic_budget_chains=atomic_budget_chains,whole_histories=whole_histories,partition_repair_pairs=partition_repair_pairs,
+                _selected_review_timeout=omitted_timeout)
         source,forest,packet,dependencies=_packet_binding(snapshot,run,subject,read_checkpoint,
             atomic_budget_chains=atomic_budget_chains,whole_histories=whole_histories,partition_repair_pairs=partition_repair_pairs)
         candidate=subject['data']['result'];proposal_context=subject['data']['context']
@@ -92,6 +144,8 @@ def _plan(snapshot, run, parent_stage_hash, *, read_checkpoint, baseline=None,
             'partition_repair_pairs':[list(x) for x in partition_repair_pairs]}
         s._require(plan['parent_failure_digest'] is not None and plan['subject_proposal_digest'] is not None
             and snapshot['project']['revision']==run['project_revision'],'cache_invalid')
+        if prior_bundle_id is not None:
+            plan['prior_bundle_id'] = prior_bundle_id
         plan['recovery_id']=s._hash({k:v for k,v in plan.items() if k!='inventory_digest'})
         plan['child_stage_hash']=s._hash({'policy':POLICY,'recovery_id':plan['recovery_id'],'parent_stage_hash':parent_stage_hash})
         plan['plan_hash']=s._hash(plan)
@@ -118,12 +172,25 @@ def authenticate_review_timeout_recovery(row, *, snapshot, expected_input_hash, 
         matches=[item for item in read_checkpoint.recovery_receipts(expected_input_hash) if item['child_stage_hash']==row['stage_hash']]
         s._require(len(matches)==1,'cache_invalid')
         receipt=matches[0]
-        s._require(set(receipt) in (RECEIPT_FIELDS|{'consumed_at','dispatch_id'}, RECEIPT_FIELDS|{'consumed_at','dispatch_id','authority_event'}) and receipt['policy']==POLICY,'cache_invalid')
+        expected = _receipt_fields(receipt) | {'consumed_at', 'dispatch_id'}
+        s._require(set(receipt) in (expected, expected | {'authority_event'}) and receipt['policy']==POLICY,'cache_invalid')
+        if 'prior_bundle_id' in receipt:
+            from hashlib import sha256
+            from pathlib import Path
+            from .semantic_recovery import _evidence_json
+            from ._frozen_routing import FrozenReader
+            raw = receipt['authorization_raw'].encode('utf-8')
+            s._require(len(raw) <= 16384 and sha256(raw).hexdigest() == receipt['authorization_ref']
+                and _evidence_json(raw) == {k: receipt[k] for k in AUTH_FIELDS | {'authorization_path'}}
+                and Path(receipt['authorization_path']).is_absolute()
+                and type(read_checkpoint) is FrozenReader
+                and receipt['prior_bundle_id'] == read_checkpoint._FrozenReader__prior_bundle_id
+                and type(receipt['prior_bundle_id']) is str, 'cache_invalid')
         _require_allowances(receipt)
         run={key:receipt[key] for key in ('run_id','snapshot_id','project_revision')};run['semantic_input_hash']=expected_input_hash
-        plan=_plan(snapshot,run,receipt['parent_stage_hash'],read_checkpoint=read_checkpoint,baseline=receipt['inventory_digest'],
+        plan=_plan(snapshot,run,receipt['parent_stage_hash'],read_checkpoint=read_checkpoint,baseline=receipt['inventory_digest'], prior_bundle_id=receipt.get('prior_bundle_id'),
             atomic_budget_chains=receipt['atomic_budget_chains'],whole_histories=receipt['whole_histories'],partition_repair_pairs=receipt['partition_repair_pairs'])
-        s._require({key:receipt[key] for key in PLAN_FIELDS}==plan and receipt['operator_id']=='root'
+        s._require({key:receipt[key] for key in _plan_fields(receipt)}==plan and receipt['operator_id']=='root'
             and receipt['authorization_source']=='user-fix-and-continue' and type(receipt['max_uses']) is int and receipt['max_uses']==1
             and type(receipt['authorized_at']) is int and type(receipt['expires_at']) is int
             and receipt['expires_at']-receipt['authorized_at']==3600
@@ -171,7 +238,7 @@ def _prepare_authorization(service, snapshot, run, plan, *, source_material):
     """Validate complete current semantics outside the writer and seal one attempt."""
     from ._prepared_mutation import _capture_dynamic, _scope, _mutation_stamp, _PreparedMutation, _SEAL
     from ._source_material import bind_source_material
-    s._require(set(plan) == PLAN_FIELDS and plan['policy'] == POLICY, 'cache_invalid')
+    s._require(set(plan) == _plan_fields(plan) and plan['policy'] == POLICY, 'cache_invalid')
     _require_allowances(plan)
     service.project_analysis.guard(snapshot)
     with service.store._db() as db:
@@ -184,7 +251,7 @@ def _prepare_authorization(service, snapshot, run, plan, *, source_material):
     reader = records.read_checkpoint
     found = [item for item in reader.recovery_receipts(plan['input_hash']) if item['parent_stage_hash'] == plan['parent_stage_hash']]
     if found:
-        s._require(len(found) == 1 and {key:found[0][key] for key in PLAN_FIELDS} == plan, 'cache_invalid')
+        s._require(len(found) == 1 and {key:found[0][key] for key in _plan_fields(found[0])} == plan, 'cache_invalid')
         authenticate_review_timeout_recovery(reader(plan['child_stage_hash']), snapshot=snapshot,
             expected_input_hash=plan['input_hash'], read_checkpoint=reader)
         s.semantic_task_inventory(records, snapshot=snapshot, expected_input_hash=plan['input_hash'],
@@ -204,10 +271,9 @@ def authorize_review_timeout_recovery(service, snapshot, run, plan, *, authoriza
     from copy import deepcopy
     import json
     from . import semantic_recovery as r
-    from .semantic_proposal_recovery import _check_grant
     from ._prepared_mutation import _consume_prepared, _assert_authorization_delta, _fresh_packet_occupied, _AuthorizationPeerDrift
     from ._source_material import prepare_source_material
-    s._require(set(plan) == PLAN_FIELDS and plan['policy'] == POLICY, 'cache_invalid')
+    s._require(set(plan) == _plan_fields(plan) and plan['policy'] == POLICY, 'cache_invalid')
     _require_allowances(plan)
     if source_material is None:
         with service.store._db() as db:
@@ -222,7 +288,7 @@ def authorize_review_timeout_recovery(service, snapshot, run, plan, *, authoriza
         service.project_analysis.guard(snapshot)
         controls = service._controls(run)
         s._require(controls.get('paused') is True and controls.get('cancelled', False) is False, 'cache_invalid')
-        auth = _check_grant(authorization, plan)
+        auth = _authorization(authorization, plan)
         with service.store._lock, service.store._db() as db:
             db.execute('BEGIN IMMEDIATE')
             try:
@@ -254,7 +320,9 @@ def authorize_review_timeout_recovery(service, snapshot, run, plan, *, authoriza
             if found:
                 s._require(len(found)==1, 'cache_invalid')
                 receipt={**json.loads(found[0][0]),'consumed_at':found[0][1],'dispatch_id':found[0][2]}
-                s._require({key:receipt[key] for key in PLAN_FIELDS}==plan and receipt['authorization_ref']==auth['authorization_ref'], 'cache_invalid')
+                s._require({key:receipt[key] for key in _plan_fields(receipt)}==plan and receipt['authorization_ref']==auth['authorization_ref'], 'cache_invalid')
+                if 'prior_bundle_id' in receipt:
+                    s._require(all(receipt[k] == auth[k] for k in ('authorization_path', 'authorization_raw')), 'cache_invalid')
             else:
                 db.execute('''CREATE TABLE IF NOT EXISTS business_semantic_recoveries (
                     recovery_id TEXT PRIMARY KEY, parent_stage_hash TEXT NOT NULL UNIQUE,
@@ -278,7 +346,7 @@ def authorize_review_timeout_recovery(service, snapshot, run, plan, *, authoriza
             _bind_raw_source(source_material, snapshot, run, db=db)
             service.project_analysis.guard(snapshot)
             r._database_controls(db, run, paused=True)
-            s._require(_check_grant(authorization,plan)==auth, 'cache_invalid')
+            s._require(_authorization(authorization,plan)==auth, 'cache_invalid')
     if created: r.log_event('authorized',receipt)
     return receipt
 
@@ -316,7 +384,8 @@ def _reauthorization_inventory(capture, input_hash):
     tables = []
     for name, content in capture._DynamicCapture__tables:
         tables.append([name, None if content is None else [list(content[0]), [[cell(v) for v in row] for row in content[1]]]])
-    s._require([v[0] for v in tables] == ['business_semantic_tasks','business_semantic_recoveries','business_semantic_supersessions'], 'cache_invalid')
+    required = ['business_semantic_tasks','business_semantic_recoveries','business_semantic_supersessions']
+    s._require([v[0] for v in tables] in (required, required + ['business_semantic_d2_attempts']), 'cache_invalid')
     return s._hash({'tables': tables})
 
 
@@ -345,7 +414,7 @@ def review_authority_reauthorization_plan(snapshot, run, child_stage_hash, *, re
         tasks=dict(dynamic_capture._DynamicCapture__tables).get('business_semantic_tasks')
         s._require(tasks is not None and sum(item == read_checkpoint.raw_checkpoint_row(child_stage_hash) for item in tasks[1])==1,'cache_invalid')
         raw=original_row[4].encode('utf-8'); old=_evidence_json(raw)
-        s._require(type(old) is dict and set(old)==RECEIPT_FIELDS and original_row[:4]==tuple(old[k] for k in
+        s._require(type(old) is dict and set(old)==_receipt_fields(old) and original_row[:4]==tuple(old[k] for k in
             ('recovery_id','parent_stage_hash','child_stage_hash','input_hash')) and old['child_stage_hash']==child_stage_hash, 'cache_invalid')
         child=read_checkpoint(child_stage_hash)
         checked=authenticate_review_timeout_recovery(child,snapshot=snapshot,expected_input_hash=run['semantic_input_hash'],read_checkpoint=read_checkpoint)
@@ -375,12 +444,16 @@ AUTHORITY_EVENT_FIELDS = frozenset(('version plan original_row original_row_dige
     'grant_raw evidence_raw authorization_ref event_hash').split())
 
 
-def _reauthorization_grant(raw_grant, raw_evidence, plan, *, fresh):
+def _reauthorization_grant(raw_grant, raw_evidence, plan, *, fresh, authorization_path=None):
     import hashlib, os, time
     from pathlib import Path
     from .semantic_recovery import _evidence_json
     grant=_evidence_json(raw_grant); evidence=_evidence_json(raw_evidence)
-    s._require(len(raw_grant)<=16384 and len(raw_evidence)<=16384 and type(grant) is dict and set(grant)==AUTH_FIELDS
+    fields = AUTH_FIELDS
+    if authorization_path is not None:
+        fields = fields | {'authorization_path'}
+        s._require(grant.get('authorization_path') == authorization_path and Path(authorization_path).is_absolute(), 'cache_invalid')
+    s._require(len(raw_grant)<=16384 and len(raw_evidence)<=16384 and type(grant) is dict and set(grant)==fields
         and type(evidence) is dict and set(evidence)==REAUTH_EVIDENCE_FIELDS
         and all(grant[k]==plan[k] for k in ('policy','plan_hash','parent_stage_hash','run_id'))
         and grant['operator_id']=='root' and grant['authorization_source']=='user-fix-and-continue'
@@ -415,8 +488,11 @@ def _resolved_review_authority(receipt, *, snapshot, expected_input_hash, read_c
             return {'version':1,'authorization_ref':receipt['authorization_ref'],'authorized_at':receipt['authorized_at'],
                 'expires_at':receipt['expires_at'],'reconciliation_ref':receipt['reconciliation_ref'],
                 'reconciliation_hash':receipt['reconciliation_hash'],'reconciliation_evidence':receipt['reconciliation_evidence'],'event_hash':None}
-        event=receipt['authority_event'];s._require(type(event) is dict and set(event)==AUTHORITY_EVENT_FIELDS
+        event=receipt['authority_event'];s._require(type(event) is dict and set(event)==AUTHORITY_EVENT_FIELDS | ({'authorization_path'} if 'prior_bundle_id' in receipt else set())
             and type(event['version']) is int and event['version']==1 and event['event_hash']==s._hash({k:v for k,v in event.items() if k!='event_hash'}),'cache_invalid')
+        if 'prior_bundle_id' in receipt:
+            from pathlib import Path
+            s._require(type(event['authorization_path']) is str and Path(event['authorization_path']).is_absolute(), 'cache_invalid')
         plan=event['plan'];row=event['original_row']
         s._require(type(plan) is dict and set(plan)==REAUTH_PLAN_FIELDS and plan['policy']==REAUTH_POLICY
             and plan['plan_hash']==s._hash({k:v for k,v in plan.items() if k!='plan_hash'})
@@ -425,7 +501,7 @@ def _resolved_review_authority(receipt, *, snapshot, expected_input_hash, read_c
             and len(row[4].encode('utf-8'))<=262144 and event['original_row_digest']==s._hash(row)==plan['original_row_digest']
             and event['original_data_digest']==hashlib.sha256(row[4].encode('utf-8')).hexdigest()==plan['original_data_digest'],'cache_invalid')
         old=_evidence_json(row[4].encode('utf-8'))
-        s._require(type(old) is dict and set(old)==RECEIPT_FIELDS and all(s._json(receipt[k])==s._json(old[k]) for k in RECEIPT_FIELDS)
+        s._require(type(old) is dict and set(old)==_receipt_fields(old) and all(s._json(receipt[k])==s._json(old[k]) for k in _receipt_fields(old))
             and row[:4]==[old[k] for k in ('recovery_id','parent_stage_hash','child_stage_hash','input_hash')]
             and event['original_evidence']==old['reconciliation_evidence'] and plan['original_receipt_hash']==receipt_hash(old)
             and all(plan[k]==old[k] for k in ('run_id','snapshot_id','project_id','project_revision','input_hash','parent_stage_hash','child_stage_hash','recovery_id','source_packet_digest','source_dependency_digest'))
@@ -437,7 +513,7 @@ def _resolved_review_authority(receipt, *, snapshot, expected_input_hash, read_c
         run={'run_id':plan['run_id'],'snapshot_id':plan['snapshot_id'],'project_revision':plan['project_revision'],'semantic_input_hash':plan['input_hash']}
         s._require(plan['scope_digest']==_reauthorization_scope(snapshot,run) and type(event['grant_raw']) is str and type(event['evidence_raw']) is str,'cache_invalid')
         raw_grant=event['grant_raw'].encode('utf-8');raw_evidence=event['evidence_raw'].encode('utf-8')
-        grant,evidence=_reauthorization_grant(raw_grant,raw_evidence,plan,fresh=False)
+        grant,evidence=_reauthorization_grant(raw_grant,raw_evidence,plan,fresh=False, authorization_path=event.get('authorization_path'))
         s._require(event['authorization_ref']==hashlib.sha256(raw_grant).hexdigest() and grant['authorized_at']>=old['expires_at']
             and grant['reconciliation_ref']!=old['reconciliation_ref'] and event['authorization_ref']!=old['authorization_ref'],'cache_invalid')
         return {'version':2,'authorization_ref':event['authorization_ref'],'authorized_at':grant['authorized_at'],
@@ -503,7 +579,8 @@ def reauthorize_expired_unused_review_recovery(service, snapshot, run, plan, *, 
         grant_raw=_private_evidence_bytes(authorization);grant=_evidence_json(grant_raw)
         s._require(type(grant) is dict and 'reconciliation_ref' in grant,'cache_invalid')
         evidence_raw=_private_evidence_bytes(grant['reconciliation_ref'])
-        parsed,_=_reauthorization_grant(grant_raw,evidence_raw,plan,fresh=True)
+        parsed,_=_reauthorization_grant(grant_raw,evidence_raw,plan,fresh=True,
+            authorization_path=str(Path(authorization).resolve()) if 'prior_bundle_id' in old else None)
         paths=(str(Path(authorization)),parsed['reconciliation_ref'],old['reconciliation_ref'])
         s._require(all(Path(p).is_absolute() for p in paths) and len(set(paths))==3
             and hashlib.sha256(grant_raw).hexdigest()!=old['authorization_ref'],'cache_invalid')
@@ -519,8 +596,9 @@ def reauthorize_expired_unused_review_recovery(service, snapshot, run, plan, *, 
             except _AuthorizationPeerDrift:
                 raise s.SemanticValidationError('cache_invalid') from None
             r._database_controls(db,run,paused=True);service.project_analysis.guard(snapshot)
-            s._require((plan['parent_stage_hash'],plan['child_stage_hash']) in s.BusinessSemanticIntegration.review_timeout_recovery_allowlist,'cache_invalid')
             row=_selected_receipt_row(db,plan['child_stage_hash']);old=_evidence_json(row[4].encode('utf-8'))
+            selected = (plan['parent_stage_hash'],plan['child_stage_hash'])
+            s._require('prior_bundle_id' in old or selected in s.BusinessSemanticIntegration.review_timeout_recovery_allowlist,'cache_invalid')
             s._require(row[5:]==(None,None) and s._hash(list(row))==plan['original_row_digest'] and time.time()>=old['expires_at'],'cache_invalid')
             latest=db.execute('SELECT id FROM full_analysis_runs WHERE project_id=? AND snapshot_id=? ORDER BY updated_at DESC,rowid DESC LIMIT 1',(snapshot['project']['id'],run['snapshot_id'])).fetchone()
             s._require(latest==(run['run_id'],) and 2<=_fresh_packet_occupied(db,run['semantic_input_hash'],old['packet_hash'])<=5,'cache_invalid')
@@ -529,6 +607,8 @@ def reauthorize_expired_unused_review_recovery(service, snapshot, run, plan, *, 
                 'original_data_digest':plan['original_data_digest'],'original_evidence':old['reconciliation_evidence'],
                 'grant_raw':grant_raw.decode('utf-8'),'evidence_raw':evidence_raw.decode('utf-8'),
                 'authorization_ref':hashlib.sha256(grant_raw).hexdigest()}
+            if 'prior_bundle_id' in old:
+                event['authorization_path'] = grant['authorization_path']
             event['event_hash']=s._hash(event);new_data=s._json({**old,'authority_event':event})
             s._require(len(new_data.encode('utf-8'))<=524288,'cache_invalid')
             updated=db.execute('UPDATE business_semantic_recoveries SET data=? WHERE recovery_id=? AND parent_stage_hash=? AND child_stage_hash=? AND input_hash=? AND data=? AND consumed_at IS NULL AND dispatch_id IS NULL',(new_data,*row[:4],row[4])).rowcount
@@ -543,5 +623,5 @@ def reauthorize_expired_unused_review_recovery(service, snapshot, run, plan, *, 
                 s._require(new_table[1]==expected,'cache_invalid')
             _bind_raw_source(source_material,snapshot,run,db=db);r._database_controls(db,run,paused=True);service.project_analysis.guard(snapshot)
             s._require(read_grant(old)==(grant_raw,evidence_raw,grant) and time.time()>=old['expires_at']
-                and (plan['parent_stage_hash'],plan['child_stage_hash']) in s.BusinessSemanticIntegration.review_timeout_recovery_allowlist,'cache_invalid')
+                and ('prior_bundle_id' in old or selected in s.BusinessSemanticIntegration.review_timeout_recovery_allowlist),'cache_invalid')
     return {**old,'authority_event':event,'consumed_at':None,'dispatch_id':None}

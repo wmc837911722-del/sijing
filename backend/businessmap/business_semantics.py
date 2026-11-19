@@ -1265,7 +1265,7 @@ def semantic_task_inventory(task_rows, *, snapshot, expected_input_hash, allow_r
 
 def _semantic_task_inventory(task_rows, *, snapshot, expected_input_hash, allow_running=(), profile=None,
                              partition_repair_pairs=(), atomic_budget_chains=(), whole_histories=(),
-                             _authorization_baseline=None):
+                             _authorization_baseline=None, _selected_review_timeout=None):
     """Shared validator; only v2 preparation supplies sealed baseline provenance."""
     try:
         current = {}
@@ -1369,6 +1369,10 @@ def _semantic_task_inventory(task_rows, *, snapshot, expected_input_hash, allow_
             if status == "running" and key not in allow_running and key not in interrupted_parents and key not in repair_running and baseline.get(key) != 'running':
                 raise SemanticValidationError("interrupted")
             if status == "needs_review":
+                if key == _selected_review_timeout:
+                    from .semantic_review_recovery import _eligible
+                    _eligible(row, snapshot)
+                    continue
                 if baseline.get(key) == 'model_call' and data.get('failure_code') == 'model_call':
                     continue
                 if key in repair_reviews or key in repair_blocked:
@@ -2630,7 +2634,8 @@ class BusinessSemanticIntegration:
                     _require((receipt["parent_stage_hash"], receipt["child_stage_hash"]) in self.proposal_timeout_recovery_allowlist, "cache_invalid")
                 from .semantic_review_recovery import POLICY as REVIEW_POLICY
                 if receipt["policy"] == REVIEW_POLICY and records.read_checkpoint(receipt["child_stage_hash"])["status"] == "planned":
-                    _require((receipt["parent_stage_hash"], receipt["child_stage_hash"]) in self.review_timeout_recovery_allowlist, "cache_invalid")
+                    from .semantic_review_recovery import _live_review_selection
+                    _require(_live_review_selection(receipt, self.review_timeout_recovery_allowlist), "cache_invalid")
                 recovery = receipt
                 key = receipt["child_stage_hash"]
                 break
@@ -2771,6 +2776,9 @@ class BusinessSemanticIntegration:
         admission_lock = threading.Lock()
         def live_send_guard():
             self.guard()
+            if recovery is not None and 'prior_bundle_id' in recovery and not dispatch.launch_attempted:
+                from .semantic_review_recovery import _live_review_selection
+                _require(_live_review_selection(recovery, self.review_timeout_recovery_allowlist), 'cache_invalid')
             # Paid calls drain without waiting for another local admission.
             # Every callback still checks external pause/auth/snapshot state.
             if d2_audit is not None:

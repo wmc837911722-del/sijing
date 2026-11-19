@@ -370,6 +370,7 @@ def _assert_authorization_delta(prepared, db, *, task_row, receipt_row):
     _require(new_receipts is not None and new_receipts[0]==expected_columns
         and (old_receipts is None or old_receipts[0]==expected_columns)
         and new_receipts[1]==(() if old_receipts is None else old_receipts[1])+(receipt_row,))
+    _require(before.get('business_semantic_d2_attempts') == after.get('business_semantic_d2_attempts'))
     _require(before['business_semantic_supersessions']==after['business_semantic_supersessions'])
 
 
@@ -390,6 +391,7 @@ def _assert_bundle_authorization_delta(prepared, db, *, task_rows, receipt_rows)
 def _assert_proposal_consumption_delta(prepared, db, *, child, stamp, dispatch):
     before=dict(prepared._PreparedMutation__dynamic._DynamicCapture__tables)
     after=dict(_capture_dynamic(db,prepared._PreparedMutation__dynamic._DynamicCapture__input)._DynamicCapture__tables)
+    _require(before.get('business_semantic_d2_attempts') == after.get('business_semantic_d2_attempts'))
     _require(before['business_semantic_supersessions']==after['business_semantic_supersessions'])
     for table in ('business_semantic_tasks','business_semantic_recoveries'):
         a,b=before[table],after[table]
@@ -414,6 +416,7 @@ def _assert_postwrite_closure(prepared, db, *, snapshot, run, child, status, dat
     _require(prepared._PreparedMutation__stamp==_mutation_stamp(legacy=legacy))
     before=dict(prepared._PreparedMutation__dynamic._DynamicCapture__tables)
     after=dict(_capture_dynamic(db,run['semantic_input_hash'])._DynamicCapture__tables)
+    _require(before.get('business_semantic_d2_attempts') == after.get('business_semantic_d2_attempts'))
     changes={}
     for table in ('business_semantic_tasks','business_semantic_recoveries','business_semantic_supersessions'):
         old,new=before[table],after[table]

@@ -144,7 +144,7 @@ class FrozenReader:
     __slots__ = ('__reader', '__route', '__sealed', '_catalogue_frontiers',
                  'catalogue_source', 'catalogue_runs', 'task_rows', 'supersession_receipts',
                  'raw_digest', 'raw_checkpoint_row', 'raw_error_code', 'recovery_receipts',
-                 'd2_retry_rows', '__view_root', '__hidden', '__views', '_source_capture', '__material', '_dynamic_capture', '__v2_proofs')
+                 'd2_retry_rows', '__view_root', '__hidden', '__views', '_source_capture', '__material', '_dynamic_capture', '__v2_proofs', '__prior_bundle_id')
 
     def __init__(self, reader):
         from .business_semantics import semantic_checkpoint_rows
@@ -156,6 +156,7 @@ class FrozenReader:
         object.__setattr__(self, '_FrozenReader__reader', reader)
         object.__setattr__(self, '_source_capture', None)
         object.__setattr__(self, '_FrozenReader__material', None)
+        object.__setattr__(self, '_FrozenReader__prior_bundle_id', None)
         for name, value in reader.__dict__.items():
             object.__setattr__(self, name, value)
         object.__setattr__(self, '_FrozenReader__view_root', self)
@@ -204,17 +205,20 @@ class FrozenReader:
             and capture._DynamicCapture__input == input_hash and self._dynamic_capture is capture)
         return capture
 
-    def _v2_history_view(self, ancestry):
+    def _v2_history_view(self, ancestry, *, original_receipts_only=False):
         from .semantic_review_exception import _V2Ancestry
         from ._prepared_mutation import _SEAL, _require
         _require(type(self) is FrozenReader and self.__view_root is self
             and type(ancestry) is _V2Ancestry and ancestry._V2Ancestry__seal is _SEAL
             and ancestry._V2Ancestry__capture is self._dynamic_capture)
         hidden = ancestry._V2Ancestry__hidden
+        if original_receipts_only:
+            hidden = hidden | ancestry._V2Ancestry__later_children
         view = object.__new__(FrozenReader)
         for slot in FrozenReader.__slots__:
             name = '_FrozenReader' + slot if slot.startswith('__') else slot
             object.__setattr__(view, name, getattr(self,name))
+        object.__setattr__(view,'_FrozenReader__prior_bundle_id',ancestry._V2Ancestry__bundle_id)
         object.__setattr__(view,'_FrozenReader__hidden',hidden)
         object.__setattr__(view,'_FrozenReader__reader',self)
         object.__setattr__(view,'_catalogue_frontiers',{})
@@ -252,6 +256,7 @@ class FrozenReader:
         object.__setattr__(view, '_source_capture', self._source_capture)
         object.__setattr__(view, '_dynamic_capture', root._dynamic_capture)
         object.__setattr__(view, '_FrozenReader__material', self.__material)
+        object.__setattr__(view, '_FrozenReader__prior_bundle_id', self.__prior_bundle_id)
         object.__setattr__(view, '_catalogue_frontiers', {})
         for name in ('catalogue_source', 'catalogue_runs', 'raw_digest', 'raw_checkpoint_row',
                      'raw_error_code', 'supersession_receipts'):

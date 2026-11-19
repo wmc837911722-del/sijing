@@ -288,7 +288,12 @@ def _check_grant(authorization, plan):
     try:
         raw = _private_evidence_bytes(authorization)
         auth = r._evidence_json(raw)
-        s._require(set(auth) == r.AUTH_FIELDS and all(auth[k] == plan[k] for k in
+        fields = r.AUTH_FIELDS
+        if 'prior_bundle_id' in plan:
+            from pathlib import Path
+            fields = fields | {'authorization_path'}
+            s._require(auth.get('authorization_path') == str(Path(authorization).resolve()), 'cache_invalid')
+        s._require(set(auth) == fields and all(auth[k] == plan[k] for k in
             ('policy', 'plan_hash', 'parent_stage_hash', 'run_id')) and auth['operator_id'] == 'root'
             and auth['authorization_source'] == 'user-fix-and-continue' and type(auth['max_uses']) is int and auth['max_uses'] == 1
             and type(auth['authorized_at']) is int and type(auth['expires_at']) is int

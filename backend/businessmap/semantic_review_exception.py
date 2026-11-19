@@ -329,12 +329,13 @@ def _live_authority(path, plan, *, expected_pin, fresh):
 
 
 class _V2RawMembers:
-    __slots__ = ('__capture','__encoded','__seal')
-    def __init__(self, capture, plan, receipts, *, _seal=None):
+    __slots__ = ('__capture','__encoded','__later_children','__seal')
+    def __init__(self, capture, plan, receipts, later_children, *, _seal=None):
         from ._prepared_mutation import _SEAL
         _require(_seal is _SEAL)
         object.__setattr__(self,'_V2RawMembers__capture',capture)
         object.__setattr__(self,'_V2RawMembers__encoded',s._json([plan,receipts]))
+        object.__setattr__(self,'_V2RawMembers__later_children', frozenset(later_children))
         object.__setattr__(self,'_V2RawMembers__seal',_SEAL)
     def __setattr__(self,name,value):
         raise AttributeError('sealed raw members')
@@ -343,13 +344,15 @@ class _V2RawMembers:
 
 
 class _V2Ancestry:
-    __slots__ = ('__capture','__members','__hidden','__seal')
-    def __init__(self, capture, members, hidden, *, _seal=None):
+    __slots__ = ('__capture','__members','__hidden','__bundle_id','__later_children','__seal')
+    def __init__(self, capture, members, hidden, bundle_id, *, _seal=None):
         from ._prepared_mutation import _SEAL
         _require(_seal is _SEAL and type(members) is _V2RawMembers and members._V2RawMembers__capture is capture)
         object.__setattr__(self,'_V2Ancestry__capture',capture)
         object.__setattr__(self,'_V2Ancestry__members',members)
         object.__setattr__(self,'_V2Ancestry__hidden',frozenset(hidden))
+        object.__setattr__(self,'_V2Ancestry__bundle_id',bundle_id)
+        object.__setattr__(self,'_V2Ancestry__later_children',members._V2RawMembers__later_children)
         object.__setattr__(self,'_V2Ancestry__seal',_SEAL)
     def __setattr__(self,name,value):
         raise AttributeError('sealed ancestry')
@@ -370,6 +373,19 @@ class _V2BundleProof:
         raise AttributeError('sealed bundle proof')
     def __reduce__(self):
         raise TypeError('bundle proof cannot be serialized')
+
+
+def _completed_member_packets(plan, reader):
+    """Ordinary recovery may follow only after both selected packets passed review."""
+    rows = reader.task_rows(plan['input_hash'])
+    for member in plan['members']:
+        child = member['child_stage_hash']
+        _require(any(row['stage'] == 'review' and row['status'] == 'accepted'
+                     and row['data']['context'].get('packet_hash') == member['packet_hash']
+                     and (row['stage_hash'] == child or (row['attempt'] == 2
+                          and row['data']['context']['revision'].get('parent_failure_hash') == child))
+                     for row in rows))
+    return {member['packet_hash'] for member in plan['members']}
 
 
 def _bootstrap_members(snapshot, *, input_hash, raw_capture, read_checkpoint):
@@ -437,7 +453,22 @@ def _bootstrap_members(snapshot, *, input_hash, raw_capture, read_checkpoint):
             _require(s.BusinessSemanticIntegration._review(child['data']['result'],set(context['input_ids']),set(context['operation_ids']),subject['data']['result']) == child['data']['result'])
     for protected in plan['protected_task_raw']:
         _require(protected['stage_hash'] in raws and s._hash(list(raws[protected['stage_hash']])) == protected['raw8_digest'])
-    legacy = [row for row in raw_receipts if row[0] not in {member['recovery_id'] for member in plan['members']}]
+    protected_ids = {item['recovery_id'] for item in plan['protected_receipt_raw']}
+    selected_ids = {member['recovery_id'] for member in plan['members']}
+    legacy = [row for row in raw_receipts if row[0] in protected_ids]
+    later = [row for row in raw_receipts if row[0] not in protected_ids | selected_ids]
+    if later:
+        from .semantic_review_recovery import POLICY as ORDINARY_REVIEW
+        member_packets = _completed_member_packets(plan, read_checkpoint)
+        packets = set()
+        for row in later:
+            receipt = json.loads(row[4])
+            _require(receipt.get('policy') == ORDINARY_REVIEW and receipt.get('prior_bundle_id') == plan['bundle_id']
+                and s._json(receipt) == row[4] and tuple(receipt[key] for key in ('recovery_id','parent_stage_hash','child_stage_hash','input_hash')) == row[:4]
+                and receipt['packet_hash'] not in member_packets | packets)
+            child = read_checkpoint(receipt['child_stage_hash'])
+            _require(child is not None and child['data'].get('recovery_id') == receipt['recovery_id'])
+            packets.add(receipt['packet_hash'])
     _require(plan['protected_receipt_raw'] == [{'recovery_id':row[0],'sql7_digest':s._hash(list(row))} for row in legacy]
         and plan['base_receipt_set_digest'] == s._hash([list(row) for row in legacy]))
     for binding in plan['old_task_bindings']:
@@ -449,7 +480,7 @@ def _bootstrap_members(snapshot, *, input_hash, raw_capture, read_checkpoint):
             allowed = {'planned':{'running','received','proposed','accepted','needs_review'},
                 'running':{'received','proposed','accepted','needs_review'},'received':{'proposed','accepted','needs_review'}}
             _require(row[1] in {'proposal','review'} and row[3] in allowed.get(binding['baseline_status'],set()))
-    return _V2RawMembers(raw_capture,plan,candidates,_seal=_SEAL)
+    return _V2RawMembers(raw_capture,plan,candidates,(row[2] for row in later),_seal=_SEAL)
 
 
 def _bootstrap_d2(snapshot, *, raw_members, raw_capture, read_checkpoint):
@@ -502,7 +533,7 @@ def _bootstrap_d2(snapshot, *, raw_members, raw_capture, read_checkpoint):
             if review['status'] in {'received','accepted'}:
                 _require(s.BusinessSemanticIntegration._review(review['data']['result'],set(context['input_ids']),set(context['operation_ids']),candidate) == review['data']['result'])
         hidden.update(row['stage_hash'] for row in extras)
-    return _V2Ancestry(raw_capture,raw_members,hidden,_seal=_SEAL)
+    return _V2Ancestry(raw_capture,raw_members,hidden,plan['bundle_id'],_seal=_SEAL)
 
 
 def authenticate_review_exception_bundle(*, snapshot, expected_input_hash, read_checkpoint):
@@ -527,9 +558,11 @@ def authenticate_review_exception_bundle(*, snapshot, expected_input_hash, read_
         outside_keys = {item['stage_hash'] for item in plan['outside_input_task_raw']}
         outside = tuple(row for row in _raw_all_task_rows(capture,input_hash=expected_input_hash) if row[0] in outside_keys)
         legacy = tuple(row for row in _raw_recovery_rows(capture,input_hash=expected_input_hash)
-            if row[0] not in {member['recovery_id'] for member in plan['members']})
+            if row[0] in {item['recovery_id'] for item in plan['protected_receipt_raw']})
         run = {key:plan[key] for key in ('run_id','snapshot_id','project_revision')};run['semantic_input_hash']=expected_input_hash
-        rebuilt = _reconstruct_plan(snapshot,run,read_checkpoint=history,raw_tasks=old,raw_receipts=legacy,raw_outside_tasks=outside,
+        original = (read_checkpoint._v2_history_view(ancestry, original_receipts_only=True)
+                    if ancestry._V2Ancestry__later_children else history)
+        rebuilt = _reconstruct_plan(snapshot,run,read_checkpoint=original,raw_tasks=old,raw_receipts=legacy,raw_outside_tasks=outside,
             case_binding=_case(plan),dynamic_digest=plan['base_dynamic_digest'],baseline_bindings=plan['old_task_bindings'])
         _require(rebuilt == plan)
         for row in history.task_rows(expected_input_hash):

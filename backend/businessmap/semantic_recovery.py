@@ -188,6 +188,8 @@ def receipt_hash(receipt):
         return s._hash({key:receipt[key] for key in EXCEPTION_FIELDS})
     fields = REVIEW_RECEIPT_FIELDS if receipt.get('policy') == REVIEW_POLICY else (PROPOSAL_RECEIPT_FIELDS if receipt.get('policy') == PROPOSAL_POLICY else RECEIPT_FIELDS)
     body={key:receipt[key] for key in fields}
+    if receipt.get('policy') == REVIEW_POLICY and 'prior_bundle_id' in receipt:
+        body.update({k: receipt[k] for k in ('prior_bundle_id', 'authorization_path', 'authorization_raw')})
     if receipt.get('policy') == REVIEW_POLICY and 'authority_event' in receipt:
         body['authority_event']=receipt['authority_event']
     return s._hash(body)
@@ -331,7 +333,7 @@ def _consume_proposal_recovery(db, snapshot, run, child_stage_hash, *, source_ma
         from .semantic_review_recovery import _reauthorization_grant
         from .semantic_proposal_recovery import _private_evidence_bytes
         event=receipt['authority_event']
-        grant,evidence=_reauthorization_grant(event['grant_raw'].encode('utf-8'),event['evidence_raw'].encode('utf-8'),event['plan'],fresh=False)
+        grant,evidence=_reauthorization_grant(event['grant_raw'].encode('utf-8'),event['evidence_raw'].encode('utf-8'),event['plan'],fresh=False, authorization_path=event.get('authorization_path'))
         _require(_private_evidence_bytes(grant['reconciliation_ref'])==event['evidence_raw'].encode('utf-8'))
         for pid in evidence['local_owner_pids']:
             try: os.kill(pid,0)
@@ -361,7 +363,7 @@ def _consume_proposal_recovery(db, snapshot, run, child_stage_hash, *, source_ma
 def _consume_review_recovery(db, snapshot, run, child_stage_hash, *, source_material, prepared_mutation):
     import json
     from ._prepared_mutation import _consume_prepared, _fresh_packet_occupied
-    from .semantic_review_recovery import POLICY as REVIEW_POLICY
+    from .semantic_review_recovery import POLICY as REVIEW_POLICY, _live_review_selection
     _require(source_material is not None and prepared_mutation is not None)
     runtime=prepared_mutation._PreparedMutation__runtime if hasattr(prepared_mutation,'_PreparedMutation__runtime') else None
     _require(runtime is not None and child_stage_hash in runtime._task_bindings)
@@ -380,7 +382,7 @@ def _consume_review_recovery(db, snapshot, run, child_stage_hash, *, source_mate
     _require(row[:4]==('review',run['semantic_input_hash'],'planned',1) and receipt['policy']==REVIEW_POLICY
         and receipt['child_stage_hash']==child_stage_hash and receipt['input_hash']==run['semantic_input_hash']
         and all(receipt[k]==run[k] for k in ('run_id','snapshot_id','project_revision'))
-        and (receipt['parent_stage_hash'],child_stage_hash) in runtime.review_timeout_recovery_allowlist
+        and _live_review_selection(receipt, runtime.review_timeout_recovery_allowlist)
         and data.get('recovery_id')==receipt['recovery_id'] and data.get('logical_task_hash')==receipt['logical_task_hash']
         and receipt['consumed_at'] is None and receipt['dispatch_id'] is None
         and 2 <= _fresh_packet_occupied(db,run['semantic_input_hash'],receipt['packet_hash']) < 5)
@@ -388,7 +390,7 @@ def _consume_review_recovery(db, snapshot, run, child_stage_hash, *, source_mate
         from .semantic_review_recovery import _reauthorization_grant
         from .semantic_proposal_recovery import _private_evidence_bytes
         event=receipt['authority_event']
-        grant,evidence=_reauthorization_grant(event['grant_raw'].encode('utf-8'),event['evidence_raw'].encode('utf-8'),event['plan'],fresh=False)
+        grant,evidence=_reauthorization_grant(event['grant_raw'].encode('utf-8'),event['evidence_raw'].encode('utf-8'),event['plan'],fresh=False, authorization_path=event.get('authorization_path'))
         _require(_private_evidence_bytes(grant['reconciliation_ref'])==event['evidence_raw'].encode('utf-8'))
         for pid in evidence['local_owner_pids']:
             try: os.kill(pid,0)
@@ -418,7 +420,9 @@ def _consume_review_recovery(db, snapshot, run, child_stage_hash, *, source_mate
             try: os.kill(pid,0)
             except ProcessLookupError: continue
             _require(False)
-        _require(authorized_at<=time.time()<expires_at and (receipt['parent_stage_hash'],child_stage_hash) in runtime.review_timeout_recovery_allowlist)
+    if 'authority_event' in receipt or 'prior_bundle_id' in receipt:
+        _require(_live_review_selection(receipt, runtime.review_timeout_recovery_allowlist)
+                 and authorized_at <= time.time() < expires_at)
     return {**receipt,'consumed_at':stamp,'dispatch_id':dispatch_id}
 
 def log_event(status, receipt):
