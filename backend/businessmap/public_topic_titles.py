@@ -1,5 +1,6 @@
 """Render topic names from a verified semantic projection without changing its receipts."""
 from collections import defaultdict, deque
+from os.path import commonprefix
 import re
 import unicodedata
 
@@ -28,10 +29,13 @@ def _title_parts(name):
     return [part.strip() for part in re.split(r"以及|[、，,；;：:（）()【】与及和]", name) if part.strip()]
 
 
+_QUALIFIED = re.compile(r"[0-9０-９]|仅|只|未|不|无|须|禁止|除|最[多少]|至[多少]|前|后|时|以上|以下")
+
+
 def _scope_in_purpose(part, purpose, summary, claims):
     # Compare complete business objects, actions and qualifiers. These tests can
     # select a whole reviewed purpose; none of them supplies words for a title.
-    if re.search(r"[0-9０-９]|仅|只|未|不|无|须|禁止|除|最[多少]|至[多少]|前|后|时|以上|以下", part):
+    if _QUALIFIED.search(part):
         return False
     clauses = [clause.removeprefix("并且").removeprefix("并") for clause in re.split(r"[，、；。]", purpose)]
     for claim in claims:
@@ -84,6 +88,66 @@ def _scope_in_purpose(part, purpose, summary, claims):
     return False
 
 
+def _scope_heading(op, claims, visible, excluded, named):
+    """List all reviewed scope labels, only for one evidenced catalogue category."""
+    scopes = list(dict.fromkeys(claim["scope"] for claim in claims))
+    if (len(scopes) < 2 or any(not scope or _short_heading(scope) != scope or "、" in scope for scope in scopes)
+            or _QUALIFIED.search(op["purpose"])):
+        return None
+    raw_purpose = op["purpose"]
+    purpose = _short_heading(raw_purpose)
+    if not purpose or purpose != (raw_purpose[:-1] if raw_purpose.endswith(("。", ".")) else raw_purpose):
+        return None
+    labels = "、".join(scopes)
+    heading = purpose + "（" + labels + "）"
+    if _short_heading(heading) != heading or not all(part in labels for part in named):
+        return None
+
+    # The shared tail is taken from the actual labels; it is not a lexicon.
+    # Every subject preceding it has to occur in the purpose, in reading order.
+    common = commonprefix([scope[::-1] for scope in scopes])[::-1]
+    if not common or any(scope == common for scope in scopes):
+        return None
+    # A shorter catalogue alias can account for the shared suffix on the old
+    # title. Each whole remaining item must be publicly retained or explicitly
+    # private; an unaccounted qualifier cannot be dropped.
+    title = op["title"]
+    for alias in [title, *op["aliases"]]:
+        if not alias or not title.startswith(alias):
+            continue
+        tail = title[len(alias):]
+        if not common.endswith(tail):
+            continue
+        category = common.removesuffix(tail) if tail else common
+        parts = _title_parts(alias)
+        retained = [p for p in parts if any(p in text for text in visible)]
+        removed = [p for p in parts if p not in retained]
+        if (category and any(p.endswith(category) for p in retained)
+                and all(p in labels for p in retained)
+                and removed and all(any(p in text for text in excluded) and p not in heading for p in removed)):
+            enumeration = re.fullmatch(r"(?:说明|明确)(.+)的" + re.escape(category) + r"要求", purpose)
+            if enumeration is None:
+                continue
+            entries = re.split(r"以及|[、与及和]", enumeration[1])
+            subjects = [(part, scope) for scope in scopes
+                        for part in re.split(r"以及|[、与及和]", scope.removesuffix(common))]
+            if len(entries) != len(subjects):
+                continue
+            for entry, (part, scope) in zip(entries, subjects):
+                if not part or _QUALIFIED.search(part) or not entry.startswith(part):
+                    break
+                rows = [c for c in claims if c["scope"] == scope]
+                # Authorization and personal-identity wording can reverse the
+                # actor and object. Require the exact subject in its own prose.
+                directed = "授权" in part or "本人" in part
+                if any(entry not in c["text"] and (directed or entry != part or
+                       any(condition not in heading for condition in c["conditions"])) for c in rows):
+                    break
+            else:
+                return heading
+    return None
+
+
 def _reviewed_names(op, claims, coverage):
     excluded = []
     visible = [op["purpose"], op["summary"]]
@@ -128,7 +192,8 @@ def _reviewed_names(op, claims, coverage):
     purpose = _short_heading(op["purpose"])
     if purpose and all(part in purpose or _scope_in_purpose(part, purpose, op["summary"], claims) for part in named):
         return [purpose]
-    return []
+    scope_heading = _scope_heading(op, claims, visible, excluded, named)
+    return [scope_heading] if scope_heading else []
 
 
 def public_topic_presentation(projection, project_name):

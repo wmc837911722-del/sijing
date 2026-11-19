@@ -203,3 +203,89 @@ def test_heading_requires_positive_evidence_for_the_specific_measure_or_edit(par
     with pytest.raises(ToolError) as exc:
         titles.public_topic_presentation(make_projection((op, claims, data)), "业务项目")
     assert exc.value.status_code == 409
+
+
+def scoped_topic():
+    op, _, data = topic("operation:one", title="办理资格与资料保存说明")
+    op.update(aliases=["办理资格与资料保存"], purpose="说明申请登记、变更办理和异地办理的资格要求。",
+              summary="登记及异地办理有各自的授权条件。")
+    data["inputs"][op["fact_ids"][1]]["text"] = "资料保存用于对照内部来源。"
+    fid = op["support_ids"][0]
+    claims = [{"operation_id": op["id"], "section": "conditions", "support_ids": [fid],
+               "conditions": ["仅授权门店可办理"], "scope": scope, "text": statement}
+              for scope, statement in [("申请登记资格说明", "申请登记的办理资格须核对申请人身份。"),
+                                       ("变更及异地办理资格说明", "变更办理及异地办理仅向授权门店开放。")]]
+    return op, claims, data
+
+
+def test_all_reviewed_scope_labels_name_the_topic_in_original_claim_order():
+    op, claims, data = scoped_topic()
+    projection = make_projection((op, claims + [claims[0]], data))
+    original = copy.deepcopy(projection)
+    docs, overview, summary = titles.public_topic_presentation(projection, "业务项目")
+    expected = "说明申请登记、变更办理和异地办理的资格要求（申请登记资格说明、变更及异地办理资格说明）"
+    assert docs[0]["title"] == expected
+    assert docs[0]["body"].count("仅授权门店可办理") == 3
+    assert op["purpose"] in docs[0]["body"]
+    assert expected + "：" + op["purpose"] in overview
+    assert expected + "：" + op["summary"] in summary and projection == original
+
+
+@pytest.mark.parametrize("problem", ["incomplete", "unrelated", "reverse", "opposite", "lost_old_public",
+                                    "unknown_old_item", "private_name", "ambiguous_alias", "long", "deny", "suspend", "other_action"])
+def test_scope_heading_rejects_unproven_or_contradictory_multi_claim_inputs(problem):
+    op, claims, data = scoped_topic()
+    if problem == "incomplete":
+        claims[1]["scope"] = ""
+    elif problem == "unrelated":
+        claims[1]["scope"] = "合同签署资格说明"
+    elif problem == "reverse":
+        claims[1]["scope"] = "门店授权总部办理资格说明"
+        op["purpose"] = "说明申请登记和总部授权门店办理的资格要求。"
+    elif problem == "opposite":
+        op["purpose"] = "禁止申请登记、变更办理和异地办理。"
+    elif problem == "deny":
+        op["purpose"] = "拒绝申请登记、变更办理和异地办理的资格要求。"
+    elif problem == "suspend":
+        op["purpose"] = "暂停受理申请登记、变更办理和异地办理的资格要求。"
+    elif problem == "other_action":
+        op["purpose"] = "说明申请登记、变更拒办和异地办理的资格要求。"
+    elif problem == "lost_old_public":
+        op.update(title="办理资格、总部复核与资料保存说明", aliases=["办理资格、总部复核与资料保存"])
+        claims[0]["text"] += "总部复核需要独立记录。"
+    elif problem == "unknown_old_item":
+        op.update(title="办理资格、新增事项与资料保存说明", aliases=["办理资格、新增事项与资料保存"])
+    elif problem == "private_name":
+        # A public scope contains the apparently private part, so the original
+        # catalogue name must be protected.
+        claims[0]["scope"] = "资料保存申请登记资格说明"
+        docs, _, _ = titles.public_topic_presentation(make_projection((op, claims, data)), "业务项目")
+        assert docs[0]["title"] == op["title"]
+        return
+    elif problem == "ambiguous_alias":
+        op["aliases"] = ["办理资格与资料"]
+    elif problem == "long":
+        claims[0]["scope"] = "甲" * 60 + "资格说明"
+    with pytest.raises(ToolError) as error:
+        titles.public_topic_presentation(make_projection((op, claims, data)), "业务项目")
+    assert error.value.status_code == 409
+
+
+def test_scoped_heading_keeps_an_approved_action_limitation_verbatim():
+    op, claims, data = scoped_topic()
+    op["purpose"] = "说明申请登记暂停、变更办理和异地办理的资格要求。"
+    claims[0]["text"] += "申请登记暂停属于本项限制。"
+    docs, _, _ = titles.public_topic_presentation(make_projection((op, claims, data)), "业务项目")
+    assert docs[0]["title"] == "说明申请登记暂停、变更办理和异地办理的资格要求（申请登记资格说明、变更及异地办理资格说明）"
+
+
+@pytest.mark.parametrize(("requested", "opposite"), [("甲方授权乙方", "乙方授权甲方"), ("监护人本人查询", "查询监护人本人")])
+@pytest.mark.parametrize("conditions", [[], ["仅授权门店可办理"]])
+def test_explicitly_reversed_subject_in_the_same_reviewed_claim_blocks_scope_heading(requested, opposite, conditions):
+    op, claims, data = scoped_topic()
+    claims[0].update(scope=requested + "资格说明", text="办理资格由" + opposite + "后核对。", conditions=conditions)
+    claims[1].update(scope="异地办理资格说明")
+    op.update(purpose="说明" + requested + "和异地办理的资格要求。", summary="各事项适用条件由相应方核对。")
+    with pytest.raises(ToolError) as error:
+        titles.public_topic_presentation(make_projection((op, claims, data)), "业务项目")
+    assert error.value.status_code == 409
