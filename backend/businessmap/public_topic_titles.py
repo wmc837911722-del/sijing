@@ -28,6 +28,62 @@ def _title_parts(name):
     return [part.strip() for part in re.split(r"以及|[、，,；;：:（）()【】与及和]", name) if part.strip()]
 
 
+def _scope_in_purpose(part, purpose, summary, claims):
+    # Compare complete business objects, actions and qualifiers. These tests can
+    # select a whole reviewed purpose; none of them supplies words for a title.
+    if re.search(r"[0-9０-９]|仅|只|未|不|无|须|禁止|除|最[多少]|至[多少]|前|后|时|以上|以下", part):
+        return False
+    clauses = [clause.removeprefix("并且").removeprefix("并") for clause in re.split(r"[，、；。]", purpose)]
+    for claim in claims:
+        scope, conditions = claim["scope"], claim["conditions"]
+        if part not in scope:
+            continue
+        # Keep an affirmative predicate and its object in the same statement.
+        statements = re.split(r"[，,；;。]", claim["text"])
+        for action in ("查询", "查看"):
+            if part.endswith(action):
+                obj = part.removesuffix(action)
+                phrase = action + obj
+                offered = statements[0]
+                if (obj and phrase in clauses and offered.startswith(obj + "支持") and action in offered
+                        and not re.search(r"未|不|无|禁止|除|待确定|待确认", offered) and part not in claim["text"]
+                        and any(c.removesuffix("时") == phrase for c in conditions)):
+                    return True
+        # Some scopes qualify a catalogue action with its business object, e.g.
+        # a subject followed by the name of a measure or constrained operation.
+        subject = scope.partition(part)[0].removesuffix("预期").removesuffix("的")
+        if not subject:
+            continue
+        if part.endswith("统计"):
+            dimension = part.removesuffix("统计")
+            series = subject + dimension
+            for clause in clauses:
+                mode, match, metric = clause.partition(series)
+                if (not dimension or not match or mode not in {"查看", "统计", "展示", "计算", "汇总"}
+                        or metric not in {"比例", "占比", "数量", "总数", "次数", "金额", "均值", "比率"}):
+                    continue
+                defined = (dimension + metric + "按", dimension + metric + "以")
+                if not any(line.startswith(defined) for line in re.split(r"[，、；。]", summary)):
+                    continue
+                for statement in statements:
+                    text = statement.removeprefix("各")
+                    if text.startswith((series + metric + "按", series + metric + "以")):
+                        return True
+                    if (metric in {"比例", "占比", "比率"}
+                            and re.match(re.escape(series) + r"(?:比例|占比|比率)以.+为分母", text)):
+                        return True
+        if part.startswith("受限"):
+            action = part.removeprefix("受限")
+            for clause in clauses:
+                if action and clause.endswith(action + subject):
+                    qualifier = clause.removesuffix(action + subject)
+                    if qualifier.startswith("按") and qualifier.endswith("范围"):
+                        bound = qualifier.removeprefix("按").removesuffix("范围")
+                        if bound in {"允许", "许可", "获准"} and any(c.startswith("按" + bound + action) for c in conditions):
+                            return True
+    return False
+
+
 def _reviewed_names(op, claims, coverage):
     excluded = []
     visible = [op["purpose"], op["summary"]]
@@ -65,8 +121,14 @@ def _reviewed_names(op, claims, coverage):
     # The operation-level purpose was reviewed against all its claims. A claim
     # scope alone may describe an actor or a single detail rather than the topic.
     candidates = [op["purpose"], op["summary"]]
-    return list(dict.fromkeys(name for text in candidates if (name := _short_heading(text))
-                              and all(part in name for part in named)))
+    exact = list(dict.fromkeys(name for text in candidates if (name := _short_heading(text))
+                               and all(part in name for part in named)))
+    if exact:
+        return exact
+    purpose = _short_heading(op["purpose"])
+    if purpose and all(part in purpose or _scope_in_purpose(part, purpose, op["summary"], claims) for part in named):
+        return [purpose]
+    return []
 
 
 def public_topic_presentation(projection, project_name):
@@ -89,7 +151,8 @@ def public_topic_presentation(projection, project_name):
     # Prefer the whole reviewed purpose over its summary. If two topics offer
     # exactly the same descriptions there is no evidence they distinguish them.
     preferred = {oid: tuple(reversed(names)) for oid, names in choices.items()}
-    if len(set(preferred.values())) != len(preferred):
+    nonempty = [names for names in preferred.values() if names]
+    if len(set(nonempty)) != len(nonempty):
         raise ToolError("多个主题的已复核说明完全相同，无法区分公开文档名称。", 409)
 
     owner, assigned = {}, {}
