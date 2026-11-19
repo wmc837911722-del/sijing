@@ -242,7 +242,8 @@ public类别仅entities|flows|rules|data；title是非空且不超过60字的中
 仅输出JSON：{"assignments":[{"fact_id":"f0","disposition":"public","category":"rules","title":"业务主题"},{"fact_id":"f1","disposition":"internal","classification":"technical|test|configuration","reason":"内部分类理由"}]}。
 同一业务主题使用相同title与category；每条输入独立保留。不要输出任何其他字段。"""
 
-    def __init__(self, service):
+    def __init__(self, service, *, public_content_revision=None):
+        self.public_content_revision = public_content_revision
         self.service, self.store = service, service.store
         self.project_analysis = ProjectAnalysis(service)
         with self.store._lock, self.store._db() as db:
@@ -541,7 +542,8 @@ public类别仅entities|flows|rules|data；title是非空且不超过60字的中
             context = {**run, "semantic_input_hash": semantic_input_hash(snapshot, run, chunks, addenda)}
             batches = self._batches(snapshot, units, 0)
             assignments = [item for result in self._level_results(snapshot, context, batches, 0, usage) for item in result["assignments"]]
-            projection = BusinessSemanticIntegration(self.service, guard=lambda: self._guard(snapshot, run)).build(
+            projection = BusinessSemanticIntegration(self.service, guard=lambda: self._guard(snapshot, run),
+                public_content_revision=self.public_content_revision).build(
                 snapshot, context, units=units, routing=assignments, addenda=addenda)
             projection["usage"] = {key: usage[key] + projection.get("usage", {}).get(key, 0) for key in usage}
             return projection

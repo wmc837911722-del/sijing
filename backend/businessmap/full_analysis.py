@@ -142,7 +142,8 @@ class FullProjectAnalysis:
 仅输出JSON：{"title":"模块主题","summary":"本批内容概述","findings":[{"text":"具体且有条件的业务事实","evidence_ids":["实际ID"]}],"unknowns":["待确认事项"]}。
 标题不超过40字，summary不超过150字；最多8条findings，每条不超过90字、最多4个证据ID；unknowns最多4条，每条不超过100字。覆盖本批不同业务，不重复整段代码。不支持的业务结论必须省略。"""
 
-    def __init__(self, service):
+    def __init__(self, service, *, public_content_revision=None):
+        self.public_content_revision = public_content_revision
         from .project_analysis import ProjectAnalysis
         self.service, self.store = service, service.store
         self.project_analysis = ProjectAnalysis(service)
@@ -807,8 +808,20 @@ class FullProjectAnalysis:
         if not lock.acquire(blocking=False):
             raise ToolError("此业务项目完整分析已在运行。", 409)
         try:
-            self._plan(project_id, snapshot)
+            if self.public_content_revision is None:
+                self._plan(project_id, snapshot)
             run = self._load(project_id, self._snapshot_id(snapshot))
+            if self.public_content_revision is not None:
+                from .analysis_addenda import AnalysisAddenda
+                from .business_semantics import public_revision_parent, semantic_checkpoint_reader, semantic_input_hash, SemanticValidationError
+                selected = self.public_content_revision
+                if (not run or type(selected) is not tuple or len(selected) != 2 or selected[0] != run["run_id"]):
+                    raise SemanticValidationError("cache_invalid")
+                self._verify_coverage(run)
+                addenda = AnalysisAddenda(self.service, guard=lambda: self.project_analysis.guard(snapshot)).accepted(snapshot, run)
+                identity = semantic_input_hash(snapshot, run, self._chunks(run), addenda)
+                with self.store._db() as db:
+                    public_revision_parent(snapshot, identity, selected[1], semantic_checkpoint_reader(db))
             controls = self._controls(run)
             run["paused"], run["cancelled"] = controls.get("paused", False), controls.get("cancelled", False)
             if run["cancelled"] or run["paused"]:
@@ -898,7 +911,7 @@ class FullProjectAnalysis:
                     current_input_hash = semantic_input_hash(snapshot, run, self._chunks(run), addenda)
                     if (not run.get("synthesis", {}).get("complete") or run.get("synthesis_version") != FullBusinessSynthesis.VERSION
                             or run["synthesis"].get("semantic_input_hash") != current_input_hash):
-                        run["synthesis"] = FullBusinessSynthesis(self.service).build(snapshot, run, self._chunks(run))
+                        run["synthesis"] = FullBusinessSynthesis(self.service, public_content_revision=self.public_content_revision).build(snapshot, run, self._chunks(run))
                         run["synthesis_version"] = FullBusinessSynthesis.VERSION
                     if not run["synthesis"].get("complete"):
                         raise AnalysisOutputError("业务域综合尚未完整完成。", "format")

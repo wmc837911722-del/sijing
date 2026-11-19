@@ -904,6 +904,9 @@ def _revision_payload_primitive(snapshot, parent, failure):
 
 def semantic_revision_payload(snapshot, parent, failure, *, read_checkpoint=None):
     """Authenticate the exact parent/review before reconstructing a D2 send."""
+    if _ordinary_public_rejection(failure):
+        signed = public_revision_parent(snapshot, parent["input_hash"], parent["stage_hash"], read_checkpoint)
+        _require(signed == parent == failure, "cache_invalid")
     if _structured_output(snapshot) and failure["stage"] == "review":
         rows = {row["stage_hash"]: row for row in (parent, failure)}
         for row in rows.values():
@@ -1166,11 +1169,41 @@ def _validate_bounded_catalogue(row, *, snapshot, expected_input_hash, read_chec
     _require(used == set(parents), "cache_invalid")
 
 
+def _public_rewrite_feedback():
+    return {"reason_code": "public_content", "instruction":
+        "请根据本包原始材料重新拟写完整业务稿。公开文字只写业务角色、操作、条件、结果和待确认事项，"
+        "保留证据支持的范围与限制。不要写入源码位置、实现标识、联系方式、凭据或其他私有资料。"}
+
+
+def _ordinary_public_rejection(row):
+    data = row["data"]
+    return (row["stage"] == "proposal" and row["attempt"] == 1 and row["status"] == "needs_review"
+        and data.get("failure_code") == "public_content"
+        and set(data) == {"context", "diagnostic", "failure_code", "request", "request_hash", "result", "result_hash"}
+        and data["diagnostic"] == {} and data["result"] is None
+        and data["request"].get("proposal_format") == GRAPH_FORMAT
+        and set(data["request"]) == {"stage", "project", "items", "operations", "matching_receipts",
+            "budget", "partition_review_hashes", "membership_hash", "proposal_format"}
+        and data["request"]["stage"] == "proposal" and data["context"]["revision"] == _revision_context())
+
+
+def public_revision_parent(snapshot, identity, key, reader):
+    """Verify a local normalization failure against both durable representations."""
+    _require(_structured_output(snapshot) and callable(getattr(reader, "raw_checkpoint_row", None)), "cache_invalid")
+    parent = _checkpoint_record(key, snapshot=snapshot, expected_input_hash=identity, read_checkpoint=reader)
+    _require(_ordinary_public_rejection(parent) and _hash(parent["data"]["request"]) == parent["data"]["context"]["packet_hash"]
+        and reader.raw_checkpoint_row(key)[:7] == (key, "proposal", identity, "needs_review", 1,
+            _json(parent["data"]), "public_content"), "cache_invalid")
+    return parent
+
+
 def _failure_feedback(row, proposal):
     data, context = row["data"], row["data"]["context"]
     _require(row["status"] == "needs_review" and row["attempt"] == 1, "cache_invalid")
     feedback = data.get("feedback")
     if not feedback:
+        if row == proposal and _ordinary_public_rejection(row):
+            return _public_rewrite_feedback()
         return None
     reason = data.get("failure_code")
     _require(feedback.get("reason_code") == reason, "cache_invalid")
@@ -1334,6 +1367,9 @@ def _semantic_task_inventory(task_rows, *, snapshot, expected_input_hash, allow_
         if retry_rows:
             _require(bundle is not None and retry_rows[0]['plan']['case']['parent_stage_hash'] in current, 'cache_invalid')
         retry_packet = retry_rows[0]['plan']['packet_hash'] if retry_rows else None
+        public_rewrites = {r["data"]["context"]["revision"]["parent_failure_hash"] for r in current.values()
+            if r["stage"] == "proposal" and r["attempt"] == 2
+            and r["data"]["request"].get("revision_feedback") == _public_rewrite_feedback()}
         occupied, slots, packet_occupied = len(retry_rows), {}, {retry_packet:1} if retry_rows else {}
         for key, row in current.items():
             _checkpoint_record(key, snapshot=snapshot, expected_input_hash=expected_input_hash, read_checkpoint=reader)
@@ -1380,7 +1416,9 @@ def _semantic_task_inventory(task_rows, *, snapshot, expected_input_hash, allow_
                 if key in recovered_parents:
                     continue
                 parent = row if stage == "proposal" else current.get(data["context"].get("proposal_hash"))
-                if row["attempt"] == 1 and stage in {"proposal", "review"} and _failure_feedback(row, parent):
+                if (row["attempt"] == 1 and stage in {"proposal", "review"}
+                        and (data.get("failure_code") != "public_content" or key in public_rewrites)
+                        and _failure_feedback(row, parent)):
                     continue
                 raise SemanticValidationError(data.get("failure_code", "needs_review"), **_controlled_diagnostic(data.get("diagnostic")))
         packet_allowances = set(recovered_packets)
@@ -2103,8 +2141,9 @@ class BusinessSemanticIntegration:
     CANDIDATE_MEMBER_OVERHEAD = 420
     CANDIDATE_OPERATION_OVERHEAD = 500
 
-    def __init__(self, service, *, guard):
+    def __init__(self, service, *, guard, public_content_revision=None):
         self.service, self.store, self.guard = service, service.store, guard
+        self.public_content_revision = public_content_revision
         self.partition_repair_allowlist = set(type(self).partition_repair_allowlist)
         self.atomic_budget_allowlist = set(type(self).atomic_budget_allowlist)
         self.whole_operation_allowlist = set(type(self).whole_operation_allowlist)
@@ -2576,9 +2615,57 @@ class BusinessSemanticIntegration:
         chains = [tuple(item['stage_hash'] for item in p['lineage']['history']) for p in atomic_plans]
         has_whole = self.whole_operation_allowlist or any('whole_operation' in row['data']['context'] for row in rows)
         whole_plans = self._whole_plans_from(rows, repairs=plans) if has_whole else []
-        return semantic_task_inventory(rows, snapshot=self._snapshot,
+        inventory = semantic_task_inventory(rows, snapshot=self._snapshot,
             expected_input_hash=self._input_hash, allow_running=set(self._owned_slots), profile=self._profile(),
             partition_repair_pairs=pairs, atomic_budget_chains=chains, whole_histories=self._whole_histories(whole_plans))
+        for draft in rows:
+            if (draft["stage"] == "proposal" and draft["attempt"] == 2
+                    and draft["data"]["request"].get("revision_feedback") == _public_rewrite_feedback()
+                    and self.public_content_revision != (self._run["run_id"],
+                        draft["data"]["context"]["revision"]["parent_failure_hash"])):
+                _require(any(r["stage"] == "review" and r["status"] in {"received", "accepted"}
+                    and r["data"]["context"]["proposal_hash"] == draft["stage_hash"] for r in rows), "public_content")
+        return inventory
+
+    def _plan_public_rewrite(self, selection):
+        """Only trusted, run-scoped operator selection may register this single D2."""
+        _require(type(selection) is tuple and len(selection) == 2 and selection[0] == self._run["run_id"]
+            and isinstance(selection[1], str) and HEX.fullmatch(selection[1]), "cache_invalid")
+        self.guard()
+        with self.store._lock, self.store._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            reader = semantic_checkpoint_reader(db)
+            parent = public_revision_parent(self._snapshot, self._input_hash, selection[1], reader)
+            request = parent["data"]["request"]
+            _require(request["project"] == self._snapshot["project"]["name"]
+                and request["matching_receipts"] == self._matching
+                and all(parent["data"]["context"]["input_ids"].get(item["fact_id"]) in self._units
+                    and self._wire_fact(self._units[parent["data"]["context"]["input_ids"][item["fact_id"]]],
+                        item["fact_id"]) == item for item in request["items"]), "cache_invalid")
+            _public(request["project"], self._forbidden)
+            for op in request["operations"]:
+                _public(op["title"], self._forbidden)
+            for item in request["items"]:
+                # This exact private source was already sent to this destination.
+                # Source-specific identifiers remain forbidden in the new output.
+                _public(item["text"])
+            context = {**parent["data"]["context"], "revision": _revision_context(2, proposal=parent,
+                failure=parent, snapshot=self._snapshot, read_checkpoint=reader)}
+            payload = semantic_revision_payload(self._snapshot, parent, parent, read_checkpoint=reader)
+            key = semantic_task_identity_hash(self._snapshot, self._input_hash, "proposal", payload, context)
+            # Validate any previously registered slot before allowing normal replay.
+            if reader(key) is not None:
+                semantic_attempt_chain(key, snapshot=self._snapshot, expected_input_hash=self._input_hash, read_checkpoint=reader)
+                return
+            _require(not any(r["stage_hash"] != parent["stage_hash"] and
+                r["data"]["context"].get("packet_hash") == context["packet_hash"]
+                for r in reader.task_rows(self._input_hash)), "cache_invalid")
+            _require(self._request_bytes("proposal", semantic_stage_system(self._snapshot, "proposal"), payload)
+                <= semantic_stage_limits(self._profile(), "proposal")["input_bytes"], "input_limit")
+            data = {"request": payload, "context": context, "request_hash": key, "result": None, "result_hash": _hash(None)}
+            self.guard()
+            db.execute("INSERT INTO business_semantic_tasks VALUES (?,?,?,?,?,?,?,?)",
+                (key, "proposal", self._input_hash, "planned", 2, _json(data), None, now()))
 
     def _raise_cached_failure(self):
         self._current_inventory()
@@ -2684,6 +2771,16 @@ class BusinessSemanticIntegration:
                 or chain in self.atomic_budget_allowlist, 'cache_invalid')
             _require(request_fits, 'input_limit')
         attempt = context.get("revision", {}).get("draft_index", 1)
+        public_parent = None
+        if attempt == 2:
+            parent_hash = context["revision"]["parent_failure_hash"]
+            parent = records.read_checkpoint(parent_hash)
+            if parent is not None and _ordinary_public_rejection(parent):
+                public_parent = parent_hash
+                existing = records.read_checkpoint(key)
+                if existing is None or existing["status"] == "planned":
+                    _require(self.public_content_revision == (self._run["run_id"], public_parent),
+                             "public_content")
         proposal_recovery = False
         if recovery:
             from .semantic_proposal_recovery import POLICY as PROPOSAL_POLICY
@@ -2783,6 +2880,9 @@ class BusinessSemanticIntegration:
         admission_lock = threading.Lock()
         def live_send_guard():
             self.guard()
+            if public_parent is not None:
+                _require(self.public_content_revision == (self._run["run_id"], public_parent),
+                         "public_content")
             if recovery is not None and 'prior_bundle_id' in recovery and not dispatch.launch_attempted:
                 from .semantic_review_recovery import _live_review_selection
                 _require(_live_review_selection(recovery, self.review_timeout_recovery_allowlist), 'cache_invalid')
@@ -3621,6 +3721,9 @@ class BusinessSemanticIntegration:
         self._catalogue_tasks, self.plans, self._task_bindings, self._partitions = [], [], {}, []
         self._catalogue_terminal = None
         self._owned_slots = set()
+        selection = self.public_content_revision
+        if selection is not None:
+            self._plan_public_rewrite(selection)
         self._raise_cached_failure()
         operations = self._catalogue(routing) if units else []
         _require(not getattr(self, '_catalogue_preview_only', False), 'cache_invalid')
