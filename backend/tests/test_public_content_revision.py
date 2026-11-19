@@ -6,6 +6,7 @@ import pytest
 from businessmap.business_semantics import SemanticValidationError
 from test_business_semantics import build_case, candidate, execute, semantic_case
 from test_full_analysis import full_project
+from test_proposal_timeout_recovery import source_timeout
 from test_semantic_integration import REAL_STORED_VALIDATOR, REAL_SYNTHESIS_BUILD
 
 
@@ -279,3 +280,50 @@ def test_unspent_slots_require_selection_and_settled_review_replays_freely(seman
     resumed[0].public_content_revision = (selected[3]["run_id"], parent)
     assert execute(resumed)["complete"]
     assert [p["stage"] for p in resumed[1]] == (["proposal", "review"] if paused_stage == "planned" else ["review"])
+
+@pytest.mark.parametrize("source_timeout", ["two-packets-public-rejection"], indirect=True)
+@pytest.mark.parametrize("draft_received", [False, True])
+def test_selected_public_rewrite_goes_first_and_keeps_catalogue_order(source_timeout, draft_received):
+    from businessmap.business_semantics import _hash
+    from test_business_semantics import independent_candidate, review
+
+    c = source_timeout
+    assert c.parent["data"]["failure_code"] == "public_content"
+    runtime = c.runtime
+    runtime.CONCURRENCY = 1
+    runtime.public_content_revision = (c.run["run_id"], c.parent["stage_hash"])
+    target = c.parent["data"]["context"]["packet_hash"]
+    calls = []
+    paused = False
+    def guard():
+        if paused:
+            raise InterruptedError("paused after receiving the selected draft")
+    def complete(system, user, **kwargs):
+        nonlocal paused
+        kwargs["before_send"]()
+        payload = json.loads(user)
+        calls.append(payload)
+        paused = draft_received and len(calls) == 1
+        value = independent_candidate(payload) if payload["stage"] == "proposal" else review(payload)
+        return {"text": json.dumps(value), "usage": {}}
+    runtime.guard = guard
+    runtime.service.providers.complete = complete
+    if draft_received:
+        runtime._plan_public_rewrite(runtime.public_content_revision)
+        with pytest.raises(InterruptedError):
+            runtime._integrate_packet(c.packets[-1])
+        assert calls[0]["revision_feedback"]["reason_code"] == "public_content"
+        paused = False
+    initial = len(calls)
+    projection = runtime.build(c.snapshot, c.run, units=c.units, routing=c.routing)
+    expected = ["review", "proposal", "review"] if draft_received else ["proposal", "review", "proposal", "review"]
+    assert [p["stage"] for p in calls[initial:]] == expected
+    assert calls[0]["revision_feedback"]["reason_code"] == "public_content"
+    assert calls[1]["packet_hash"] == target
+    assert projection["verification"]["packet_hashes"] == [_hash(runtime._packet(p)[0]) for p in c.packets]
+    assert projection["verification"]["packet_hashes"][-1] == target
+    seen = list(calls)
+    schedule = runtime._run_packets
+    runtime._run_packets = lambda packets: schedule(packets)
+    replay = runtime.build(c.snapshot, c.run, units=c.units, routing=c.routing)
+    assert replay["verification"] == projection["verification"] and calls == seen

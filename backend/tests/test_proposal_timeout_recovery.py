@@ -49,7 +49,8 @@ def source_timeout(tmp_path, request):
     run = {**original_run, 'project_id': snapshot['project']['id'], 'modules': [{'id': 'module'}]}
     chunks = [{'id': 'source', 'module_id': 'module', 'status': 'completed', 'result': {'summary': '',
         'findings': [{'text': '办理业务需要核对门店权限。', 'evidence_ids': []}, {'text': '办理业务需要核对适用范围。', 'evidence_ids': []}], 'unknowns': []}}]
-    multiple_packets = getattr(request, 'param', None) == 'two-packets'
+    scenario = getattr(request, 'param', None)
+    multiple_packets = scenario in ('two-packets', 'two-packets-public-rejection')
     if multiple_packets:
         findings = chunks[0]['result']['findings']
         findings.extend({'text': item['text'].replace('办理业务', '提交申请'), 'evidence_ids': []} for item in findings[:])
@@ -78,6 +79,11 @@ def source_timeout(tmp_path, request):
         kwargs['before_send']()
         payload = json.loads(user)
         if payload['stage'] == 'proposal':
+            if scenario == 'two-packets-public-rejection':
+                from test_business_semantics import independent_candidate
+                result = independent_candidate(payload)
+                result['operations'][0]['purpose'] = '源路径为 src/private/Fixture.java'
+                return {'text': json.dumps(result), 'usage': {}}
             error = ToolError('timeout', 408)
             error.codex_reason = 'timeout'
             raise error

@@ -2656,7 +2656,7 @@ class BusinessSemanticIntegration:
             # Validate any previously registered slot before allowing normal replay.
             if reader(key) is not None:
                 semantic_attempt_chain(key, snapshot=self._snapshot, expected_input_hash=self._input_hash, read_checkpoint=reader)
-                return
+                return key, context["packet_hash"]
             _require(not any(r["stage_hash"] != parent["stage_hash"] and
                 r["data"]["context"].get("packet_hash") == context["packet_hash"]
                 for r in reader.task_rows(self._input_hash)), "cache_invalid")
@@ -2666,6 +2666,7 @@ class BusinessSemanticIntegration:
             self.guard()
             db.execute("INSERT INTO business_semantic_tasks VALUES (?,?,?,?,?,?,?,?)",
                 (key, "proposal", self._input_hash, "planned", 2, _json(data), None, now()))
+        return key, context["packet_hash"]
 
     def _raise_cached_failure(self):
         self._current_inventory()
@@ -3722,8 +3723,7 @@ class BusinessSemanticIntegration:
         self._catalogue_terminal = None
         self._owned_slots = set()
         selection = self.public_content_revision
-        if selection is not None:
-            self._plan_public_rewrite(selection)
+        selected_rewrite = self._plan_public_rewrite(selection) if selection is not None else None
         self._raise_cached_failure()
         operations = self._catalogue(routing) if units else []
         _require(not getattr(self, '_catalogue_preview_only', False), 'cache_invalid')
@@ -3751,8 +3751,13 @@ class BusinessSemanticIntegration:
             remaining += 0 if any(row["stage"] == "review" and row["status"] == "accepted" for row in members) else max(0, 4 + allowance - len(members))
         self._preflight("semantics", remaining)
         from .semantic_review_recovery import pending_review_priority
-        pending_reviews = {r['packet_hash'] for r in recoveries if pending_review_priority(r, run, self.review_timeout_recovery_allowlist)}
-        priority = {index for index, packet_hash in enumerate(packet_hashes) if packet_hash in pending_reviews}
+        pending_packets = {r['packet_hash'] for r in recoveries if pending_review_priority(r, run, self.review_timeout_recovery_allowlist)}
+        if selected_rewrite is not None:
+            draft_hash, packet_hash = selected_rewrite
+            if not any(row["stage"] == "review" and row["data"]["context"].get("proposal_hash") == draft_hash
+                       and row["status"] != "planned" for row in rows.values()):
+                pending_packets.add(packet_hash)
+        priority = {index for index, packet_hash in enumerate(packet_hashes) if packet_hash in pending_packets}
         results = self._run_packets(packets, priority) if priority else self._run_packets(packets)
         claims = [claim for result in results for claim in result["claims"]]
         catalogue = [operation for result in results for operation in result["catalogue"]]
