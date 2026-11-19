@@ -4,9 +4,48 @@ import json
 import pytest
 
 from test_full_analysis import full_project, model
+from test_semantic_integration import semantic_pipeline
 from businessmap.codex_provider import _codex_error
 from businessmap.full_synthesis import FullBusinessSynthesis
 from businessmap.providers import ToolError
+
+
+def test_public_proposal_failure_is_explained_on_analysis_and_historical_status(full_project, monkeypatch):
+    from businessmap.business_semantics import REASONS
+
+    full, service, project, calls = semantic_pipeline(full_project, monkeypatch)
+    complete = service.providers.complete
+
+    def proposal_with_private_content(system, user, **settings):
+        response = complete(system, user, **settings)
+        if json.loads(user).get("stage") == "proposal":
+            candidate = json.loads(response["text"])
+            candidate["operations"][0]["summary"] = "来源位于 src/private/Example.java"
+            response["text"] = json.dumps(candidate)
+        return response
+
+    monkeypatch.setattr(service.providers, "complete", proposal_with_private_content)
+    project_id = project["id"]
+    result = full.analyze(project_id)
+    message = REASONS["public_content"]
+    assert result["status"] == "failed" and result["error"] == message
+    assert result["synthesis_failure"] == {"status_code": 422, "reason_code": "public_content"}
+    assert calls.count("proposal") == 1 and "review" not in calls
+    sent = list(calls)
+
+    run = full._load(project_id)
+    run["error"] = "旧版综合提示"
+    full._save(run)
+    assert full.status(project_id)["error"] == message
+    full.set_paused(project_id, True)
+    paused = full.status(project_id)
+    assert paused["status"] == "paused" and paused["error"] == message
+    assert full._load(project_id)["error"] == run["error"]
+
+    run["synthesis_failure"]["reason_code"] = "unknown-local-diagnostic"
+    full._save(run)
+    assert full.status(project_id)["error"] == run["error"]
+    assert calls == sent
 
 
 def synthesis_boundary(full, service, project, monkeypatch, failure):

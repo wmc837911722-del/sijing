@@ -384,7 +384,13 @@ class FullProjectAnalysis:
                    (401, "模型凭据或访问权限不可用（HTTP 401），请检查模型配置和权限后继续；已成功片段已保留。"),
                    (403, "模型凭据或访问权限不可用（HTTP 403），请检查模型配置和权限后继续；已成功片段已保留。"),
                    (429, "模型请求受到限流（HTTP 429），请稍后继续完整分析；已成功片段已保留。"))
-        return next((message for code, message in actions if code in codes), None)
+        for code, message in actions:
+            if code in codes:
+                return message
+        if isinstance(synthesis_failure, dict) and synthesis_failure.get("reason_code") == "public_content":
+            from .business_semantics import REASONS
+            return REASONS["public_content"]
+        return None
 
     def status(self, project_id):
         self.project_analysis.projects.get(project_id)
