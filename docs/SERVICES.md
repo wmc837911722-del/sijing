@@ -17,7 +17,7 @@
 
 ## 咨询入口
 
-仓库公开后，可通过[企业服务咨询表](https://github.com/wmc837911722-del/sijing/issues/new?template=service-inquiry.yml)描述问题。**当前私有阶段，外部用户无法访问该入口。** 暂不以此页面承诺响应时限。
+如需讨论部署、技术支持或定制开发，请用公开议题描述需求。[填写企业服务咨询表](https://github.com/wmc837911722-del/sijing/issues/new?template=service-inquiry.yml)
 
 首次咨询只需提供可公开的信息：希望解决的问题、系统技术栈及部署类型、期望交付物和主要限制。请勿提交 API Key、账号密码、客户数据、未脱敏源码或内部地址；详细材料应在约定适当渠道及授权后交换。
 
